@@ -1,0 +1,68 @@
+# Isolated, single-Gateway Stage 2 experiment. Not the future multi-user supervisor.
+name: personal-agent-stage2
+services:
+  gateway:
+    image: ${OPENCLAW_LAB_IMAGE:?Run python3 init_env.py in lab/openclaw}
+    init: true
+    restart: unless-stopped
+    # Keep the upstream startup entrypoint so Doctor retains migration ownership.
+    command: ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789"]
+    environment:
+      HOME: /home/node
+      OPENCLAW_HOME: /home/node
+      OPENCLAW_STATE_DIR: /home/node/.openclaw
+      OPENCLAW_CONFIG_PATH: /home/node/.openclaw/openclaw.json
+      OPENCLAW_CONFIG_DIR: /home/node/.openclaw
+      OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw/workspace
+      OPENCLAW_GATEWAY_PORT: "18789"
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:?Run python3 init_env.py}
+      OPENCLAW_DISABLE_BONJOUR: "1"
+    volumes:
+      - state:/home/node/.openclaw
+      - workspace:/home/node/.openclaw/workspace
+      - auth_secrets:/home/node/.config/openclaw
+    ports:
+      - "127.0.0.1:${OPENCLAW_LAB_PORT:-18789}:18789"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [NET_RAW, NET_ADMIN]
+    pids_limit: 256
+    mem_limit: ${OPENCLAW_LAB_MEMORY:-2g}
+    cpus: ${OPENCLAW_LAB_CPUS:-1.0}
+    healthcheck:
+      test: ["CMD", "node", "dist/docker-healthcheck.js"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  cli:
+    image: ${OPENCLAW_LAB_IMAGE:?Run python3 init_env.py in lab/openclaw}
+    profiles: ["manual"]
+    network_mode: "service:gateway"
+    init: true
+    entrypoint: ["node", "dist/index.js"]
+    environment:
+      HOME: /home/node
+      OPENCLAW_HOME: /home/node
+      OPENCLAW_STATE_DIR: /home/node/.openclaw
+      OPENCLAW_CONFIG_PATH: /home/node/.openclaw/openclaw.json
+      OPENCLAW_CONFIG_DIR: /home/node/.openclaw
+      OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw/workspace
+      OPENCLAW_GATEWAY_PORT: "18789"
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:?Run python3 init_env.py}
+      OPENCLAW_DISABLE_BONJOUR: "1"
+    volumes:
+      - state:/home/node/.openclaw
+      - workspace:/home/node/.openclaw/workspace
+      - auth_secrets:/home/node/.config/openclaw
+    depends_on:
+      - gateway
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [NET_RAW, NET_ADMIN]
+
+volumes:
+  state:
+  workspace:
+  auth_secrets:
