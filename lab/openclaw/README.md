@@ -20,16 +20,15 @@ df -h
 Команды на Debian 12, из временного рабочего каталога, не внутри рабочего проекта Open WebUI:
 
 ```bash
-mkdir -p "$HOME/openclaw-src-stage2"
-git clone https://github.com/openclaw/openclaw.git "$HOME/openclaw-src-stage2/openclaw"
-cd "$HOME/openclaw-src-stage2/openclaw"
-git checkout --detach 7c12438929e5d198616fe8f602d896e011647d39
-test "$(git rev-parse HEAD)" = "7c12438929e5d198616fe8f602d896e011647d39"
-sudo docker build \
-  --build-arg "GIT_COMMIT=$(git rev-parse HEAD)" \
-  --build-arg "OPENCLAW_BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  -t openclaw-stage2:7c12438929e5 .
+LAB_DIR="$HOME/agent-platform/lab/openclaw"
+SOURCE_DIR="$HOME/openclaw-src-stage2/openclaw"
+mkdir -p "$HOME/openclaw-src-stage2" &&
+git clone https://github.com/openclaw/openclaw.git "$SOURCE_DIR" &&
+git -C "$SOURCE_DIR" checkout --detach 7c12438929e5d198616fe8f602d896e011647d39 &&
+bash "$LAB_DIR/build_image.sh" "$SOURCE_DIR"
 ```
+
+Цепочка `&&` останавливается при ошибке clone/checkout. `build_image.sh` дополнительно проверяет точный SHA и чистоту исходного дерева, включая untracked-файлы, и не вызывает Docker при отказе. Если каталог уже существует, clone завершится ошибкой: не удаляйте его автоматически. Для осознанной повторной сборки проверенного checkout можно отдельно вызвать `bash "$LAB_DIR/build_image.sh" "$SOURCE_DIR"`. Даже чистый checkout не гарантирует побайтовой воспроизводимости зависимостей.
 
 Проверьте полученный image ID; не путать с успешным запуском Gateway:
 
@@ -43,14 +42,20 @@ sudo docker image inspect openclaw-stage2:7c12438929e5 \
 Команды из клона **своего** проекта (в каталоге `lab/openclaw/` после копирования файлов пакета):
 
 ```bash
-cd "$HOME/agent-platform/lab/openclaw"
-python3 -m unittest discover -s tests -v
-python3 init_env.py
-stat -c '%a %n' .env    # ожидается 600 .env
-sudo docker compose config --quiet
+cd "$HOME/agent-platform/lab/openclaw" &&
+python3 -m unittest discover -s tests -v &&
+python3 init_env.py &&
+stat -c '%a %n' .env &&
+python3 validate_compose.py
 ```
 
-`init_env.py` создаёт случайный токен Gateway. Не публикуйте `.env` и результаты `docker compose config` без `--quiet` (значения могут содержать токен). Простой запуск `init_env.py` второй раз не перезаписывает секреты. Не выполняйте `docker compose down -v`: это удаляет лабораторные volumes.
+`stat` на Debian должен показать `600 .env`. Если `.env` уже существует, не удаляйте его ради повторного запуска блока: пропустите только `python3 init_env.py`, затем повторите проверку прав и `python3 validate_compose.py`.
+
+`init_env.py` создаёт случайный токен Gateway. Не публикуйте `.env` и результаты `docker compose config` без `--quiet` (значения могут содержать токен). Повторный запуск генератора не перезаписывает секреты. Не выполняйте `docker compose down -v`: это удаляет лабораторные volumes.
+
+`validate_compose.py` вызывает настоящий `docker compose config --format json` и проверяет разобранную структуру: набор сервисов, закреплённый образ, loopback-порт, сети, dedicated volumes, запрет bind mounts/privileged/добавления capabilities, обязательные ограничения и согласованность токенов. Результат Compose и его диагностика не печатаются: они могут содержать секреты. Контейнеры не запускаются, YAML-библиотеки устанавливать не нужно. Это проверка перечисленных инвариантов, не полный аудит OpenClaw или доказательство изоляции.
+
+Локально без Docker выполняются unit-тесты на явно обозначенных JSON-фикстурах и проверки build guard с тестовыми Git/Docker-функциями. Настоящий рендеринг Compose при отсутствии Docker пропускается, POSIX-права на Windows также пропускаются. На Debian с Docker обе проверки должны выполняться; `skipped` не считать успешной интеграционной проверкой.
 
 **Перед запуском** создать минимальную конфигурацию штатной CLI закреплённого образа (без onboarding модели):
 
@@ -62,7 +67,7 @@ sudo docker compose run --rm --no-deps --entrypoint node gateway \
 
 Это экспериментальный bootstrap без модели: если закреплённый upstream отклонит такой вариант начальной конфигурации, сохранить точную ошибку и проверить штатные опции `onboard --help`, не отключая авторизацию и не выдавая ошибку за успешный запуск.
 
-`lan` — интерфейс **внутри контейнера**; с хоста порт публикуется **только** на `127.0.0.1`. При нестандартном `OPENCLAW_LAB_PORT` из `.env` также скорректируйте Control UI origins. Не делайте конфигурацию read-only: startup Doctor и последующие изменения OpenClaw могут требовать атомарной записи, это отдельный проверяемый аспект этапа.
+`lan` — интерфейс **внутри контейнера**; с хоста порт публикуется **только** на `127.0.0.1`. При нестандартном `OPENCLAW_LAB_PORT` из `.env` скорректируйте Control UI origins в bootstrap выше, переменную `LAB_PORT` для host-side curl ниже и удалённый порт SSH-туннеля. Внутренний порт Gateway/CLI остаётся 18789. Не делайте конфигурацию read-only: startup Doctor и последующие изменения OpenClaw могут требовать атомарной записи, это отдельный проверяемый аспект этапа.
 
 ## 3. Старт и фактические проверки
 
@@ -70,34 +75,72 @@ sudo docker compose run --rm --no-deps --entrypoint node gateway \
 sudo docker compose up -d gateway
 sudo docker compose ps
 sudo docker compose logs --tail=100 gateway
-curl -i http://127.0.0.1:18789/healthz
-curl -i http://127.0.0.1:18789/readyz
+LAB_PORT=18789    # тот же внешний порт, что OPENCLAW_LAB_PORT в .env
+curl -i "http://127.0.0.1:${LAB_PORT}/healthz"
+curl -i "http://127.0.0.1:${LAB_PORT}/readyz"
 sudo docker compose run --rm cli gateway health --port 18789
 sudo docker compose exec -T gateway node dist/index.js --version
 sudo docker stats --no-stream
 ```
 
-`/healthz` — liveness, `/readyz` — readiness. Их ответы и команда `gateway health` не являются проверкой модели или агентного чата. При отказе `gateway health` проверить в журналах авторизацию/pairing, но **не отключать** проверку токена ради зелёного статуса.
+`/healthz` — liveness, `/readyz` — readiness. Дождитесь готовности после старта; единичный отказ сразу после `up -d` ещё не доказывает ошибку конфигурации. Эти HTTP-ответы не доказывают авторизацию, работу модели или агентного чата. При отказе `gateway health` проверить в журналах авторизацию/pairing, но **не отключать** проверку токена ради зелёного статуса.
+
+### Отрицательная проверка авторизации
+
+После успешного подключения штатного CLI повторите защищённую операцию с заведомо неправильным токеном:
+
+```bash
+if sudo docker compose run --rm -e OPENCLAW_GATEWAY_TOKEN=invalid-stage2-test-token cli gateway health --port 18789; then
+  printf 'FAIL: операция с неправильным токеном завершилась успешно; разобраться в источниках credentials\n' >&2
+else
+  printf 'Проверить причину отказа: нужен именно отказ авторизации, а не сеть/парсер CLI/неготовый Gateway\n'
+fi
+```
+
+Это не автоматический security PASS по любому ненулевому exit code. Запишите причину отказа, сопоставьте с успешным контрольным запросом. Если CLI использовал сохранённую device identity/другой источник credentials вместо изменённого токена, такая проверка не изолирует token auth: нужен отдельный чистый клиент и проверка штатных параметров через `gateway health --help`. Нельзя засчитывать отказ из-за неизвестного флага, pairing либо недоступного сервера как доказательство отклонения неверного токена.
 
 Для доступа с ноутбука откройте отдельный SSH-туннель, не открывая порт Gateway в Интернет:
 
 ```bash
-ssh -N -L 18789:127.0.0.1:18789 VM_USER@VM_HOST
+LAB_PORT=18789    # внешний порт Gateway на ВМ; согласовать с .env и origins
+ssh -N -L "${LAB_PORT}:127.0.0.1:${LAB_PORT}" VM_USER@VM_HOST
 ```
 
-Потом `http://localhost:18789/`; при запросе токена в UI получите его **локально на ВМ** из `.env` (не присылайте в чат, логи или скриншоты). Pairing нового браузерного устройства может потребовать отдельного подтверждения — не воспринимать требование pairing как ошибку TLS или «отсутствие модели».
+Потом `http://localhost:18789/` (или выбранный `LAB_PORT`); при запросе токена в UI получите его **локально на ВМ** из `.env` (не присылайте в чат, логи или скриншоты). Pairing нового браузерного устройства может потребовать отдельного подтверждения — не воспринимать требование pairing как ошибку TLS или «отсутствие модели».
 
 ## 4. Проверка сохранения и работы при перезапуске
 
 ```bash
 sudo docker compose restart gateway
 sudo docker compose ps
-curl -i http://127.0.0.1:18789/readyz
+curl -i "http://127.0.0.1:${LAB_PORT}/readyz"
 sudo docker compose run --rm cli config get gateway.mode
 sudo docker compose run --rm cli config get gateway.auth.mode
 ```
 
 Дополнительно: проверка непустых/сохранённых `state`, `workspace`, `auth_secrets` после перезапуска, фактической работы `gateway health` с разрешённой identity, отсутствия опубликованных портов `0.0.0.0` и отсутствия Docker socket в контейнере. До запуска стенда сохранить имена и ID volumes для резервного копирования. Не публиковать `config get` для путей с токенами.
+
+### Сохранение при пересоздании, а не только restart
+
+`restart` сохраняет записываемый слой того же контейнера и не доказывает корректность volumes. Следующая проверка создаёт только собственные маркеры `.stage2-persistence-probe` в трёх лабораторных volumes. `flag: "wx"` запрещает перезапись существующего файла; если имя уже занято, остановитесь и разберитесь, не удаляя чужие данные.
+
+```bash
+sudo docker compose exec -T gateway node -e 'const fs=require("node:fs"); for (const d of ["/home/node/.openclaw","/home/node/.openclaw/workspace","/home/node/.config/openclaw"]) { fs.mkdirSync(d,{recursive:true}); fs.writeFileSync(d+"/.stage2-persistence-probe","stage2-persistence-check\n",{flag:"wx"}); }'
+```
+
+Только если создание маркеров завершилось успешно, пересоздать **лабораторный** Gateway, не удаляя volumes:
+
+```bash
+BEFORE=$(sudo docker compose ps -q gateway) &&
+test -n "$BEFORE" &&
+sudo docker compose up -d --force-recreate --no-deps gateway &&
+AFTER=$(sudo docker compose ps -q gateway) &&
+test -n "$AFTER" &&
+test "$BEFORE" != "$AFTER" &&
+sudo docker compose exec -T gateway node -e 'const fs=require("node:fs"); for (const d of ["/home/node/.openclaw","/home/node/.openclaw/workspace","/home/node/.config/openclaw"]) { if(fs.readFileSync(d+"/.stage2-persistence-probe","utf8")!=="stage2-persistence-check\n") throw Error("Persistence check failed"); } console.log("Stage 2 volume probes survived container recreation");'
+```
+
+Затем дождаться readiness, повторить авторизованный `gateway health` и чтение несекретной конфигурации. Убедиться, что собственные данные OpenClaw сохранились: маркеры подтверждают сохранение каталогов, но не заменяют проверку состояния приложения. Маркеры не содержат секретов и не требуют чтения содержимого credentials.
 
 ## Что сознательно не включено
 
@@ -107,6 +150,6 @@ sudo docker compose run --rm cli config get gateway.auth.mode
 - Имитация «готового Gateway»: только реальные `docker inspect`, `/readyz` и авторизованный CLI.
 - Read-only `openclaw.json`, так как Docker entrypoint вызывает Doctor и конфигурация штатно заменяется атомарно.
 
-**Критерий завершения этапа 2:** image ID и source SHA записаны, Gateway действительно стартует, соединение по токену (и pairing, если нужен) прошло, состояние пережило restart, зафиксированы журналы/метрики и отсутствие модели не смешано с ошибкой запуска. Пока этого нет, этап 2 *подготовлен, но не завершён*.
+**Критерий завершения этапа 2:** image ID и source SHA записаны, структурная проверка фактического Compose прошла, Gateway действительно стартует, разрешённое подключение (и pairing, если нужен) прошло, изолированная проверка неверных credentials дала именно отказ авторизации, состояние пережило restart и пересоздание контейнера, зафиксированы журналы/метрики и отсутствие модели не смешано с ошибкой запуска. Пока этого нет, этап 2 *подготовлен, но не завершён*.
 
 Документация, сверенная по этому commit: `docs/install/docker.md`, `docker-compose.yml`, `docker-entrypoint.mjs`. Документация текущей версии может отличаться: https://docs.openclaw.ai/docker
