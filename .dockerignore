@@ -1,0 +1,16 @@
+.git
+.venv
+__pycache__
+**/__pycache__
+.env
+.env.*
+!.env.example
+state
+instance
+secrets
+*.sqlite3
+*.sqlite3-*
+node_modules
+.cache
+.build
+artifacts

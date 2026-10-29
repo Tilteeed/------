@@ -1,0 +1,14 @@
+{
+  "openwebui": {
+    "version": "v0.12.5",
+    "commit": "f7ac7ee10962ddec0017f5c29b6740d9b9c5faca",
+    "image": "ghcr.io/open-webui/open-webui:v0.12.5-slim",
+    "manifest_digest": "sha256:9a4db3e6c8d6174d4ed8952304115e90dcc36e9a8b98c2f8984eab321f29505e",
+    "main_py_sha256": "c40fa80418d08771783c0158b65481793cc31fe8c92220027a669bdf5cf1b428"
+  },
+  "openclaw_theory_baseline": {
+    "commit": "7c12438929e5d198616fe8f602d896e011647d39",
+    "deployed": false
+  },
+  "integration_status": "source_and_contract_tests_only; full_image_build_pending"
+}

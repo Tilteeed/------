@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Персональный агент · Open WebUI</title>
+  <link rel="stylesheet" href="/agent-assets/styles.css">
+  <script type="module" src="/agent-assets/app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Перейти к содержимому</a>
+  <aside class="sidebar" aria-label="Рабочее пространство">
+    <a class="brand" href="/">Open WebUI<span>Рабочее пространство</span></a>
+    <nav aria-label="Основная навигация">
+      <a class="nav-link" href="/">Чат <span aria-hidden="true">↗</span></a>
+      <a class="nav-link active" href="/agent" aria-current="page">Персональный агент</a>
+    </nav>
+    <div class="sidebar-note"><span class="eyebrow">Дополнение</span><p>Настройки отдельно.<br>Авторизация — Open WebUI.</p></div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar"><span>Рабочее пространство <span aria-hidden="true">/</span> Агент</span><span id="identity">Учётная запись не проверена</span></header>
+    <main id="main" tabindex="-1" aria-busy="true">
+      <div class="page-heading"><div><p class="eyebrow">Личное пространство</p><h1>Персональный агент</h1><p class="subtitle">Задайте имя и инструкции. Подключение среды выполнения — отдельный шаг.</p></div><span class="badge" id="runtime-badge">Не подключён</span></div>
+      <div class="notice" id="notice" role="status" aria-live="polite" aria-atomic="true" data-state="loading"><p id="notice-text">Загружаем настройки…</p><a id="login" href="/auth?redirect=%2Fagent" hidden>Войти в Open WebUI →</a></div>
+      <noscript><p class="notice">Для загрузки и сохранения настроек необходим JavaScript. Войти можно через <a href="/auth?redirect=%2Fagent">Open WebUI</a>.</p></noscript>
+      <div class="dashboard">
+        <section class="panel settings" aria-labelledby="settings-title">
+          <div class="panel-heading"><div><p class="eyebrow">01 / Конфигурация</p><h2 id="settings-title">Настройки агента</h2></div><span class="tag">Черновик</span></div>
+          <form id="settings-form">
+            <fieldset id="settings-fields" disabled>
+              <label for="agent-name">Имя агента</label>
+              <input id="agent-name" name="name" required autocomplete="off" placeholder="Например, помощник по проекту" aria-describedby="name-help">
+              <p class="field-help" id="name-help">До 80 символов. Имя видно только в ваших настройках.</p>
+              <label for="instructions">Инструкции</label>
+              <textarea id="instructions" name="instructions" rows="9" placeholder="Опишите задачи, стиль ответов и ограничения агента…" aria-describedby="instructions-help"></textarea>
+              <p class="field-help" id="instructions-help">До 8000 символов. Не добавляйте пароли, токены и другие секреты.</p>
+              <div class="form-footer"><button class="primary" type="submit" id="save">Сохранить настройки</button><span id="revision" class="meta">Версия не загружена</span></div>
+            </fieldset>
+          </form>
+          <div class="panel-foot"><p>Сохранение записывает только настройки в БД. Оно не создаёт агента и не применяет инструкции к запущенной среде.</p><button type="button" id="reload" disabled>Перечитать с сервера</button></div>
+        </section>
+        <div class="right-column">
+          <section class="panel" aria-labelledby="runtime-title">
+            <p class="eyebrow">02 / Среда выполнения</p><h2 id="runtime-title">Подключение отсутствует</h2>
+            <p id="runtime-description">Docker и среда выполнения не подключены. Агент не создан и не запущен.</p>
+            <dl class="connection-list"><div><dt>Gateway</dt><dd>Не подключён</dd></div><div><dt>Модель</dt><dd>Не подключена</dd></div><div><dt>Метрики</dt><dd>Нет подключения</dd></div></dl>
+            <div class="lifecycle" role="group" aria-label="Управление агентом" aria-describedby="lifecycle-help"><button disabled>Создать</button><button disabled>Запустить</button><button disabled>Остановить</button><button disabled>Перезапустить</button><button disabled>Удалить</button></div>
+            <p class="field-help" id="lifecycle-help">Все действия недоступны до подключения Docker и среды выполнения. Чат с агентом пока не подключён; обычный чат Open WebUI доступен в меню.</p>
+          </section>
+          <section class="panel" aria-labelledby="telegram-title"><div class="panel-heading"><h2 id="telegram-title">Telegram</h2><span class="tag">Не подключён</span></div><p id="telegram-help">Интеграция пока недоступна. Добавлять токен бота не нужно.</p><button disabled aria-describedby="telegram-help">Подключить Telegram</button></section>
+        </div>
+        <section class="panel events" aria-labelledby="events-title"><div class="panel-heading"><div><p class="eyebrow">03 / История</p><h2 id="events-title">События настроек</h2></div><button type="button" id="refresh-events" disabled>Обновить события</button></div><p id="events-status" role="status" aria-live="polite">Ожидаем загрузку учётной записи.</p><ol id="events-list" aria-label="История событий"></ol></section>
+      </div>
+      <footer class="page-footer">Open WebUI <span aria-hidden="true">·</span> Персональные настройки, без подключённой среды выполнения</footer>
+    </main>
+  </div>
+</body>
+</html>

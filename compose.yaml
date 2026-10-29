@@ -1,0 +1,55 @@
+name: personal-agent-platform
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: personal-agent-platform-web:dev
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3000}:8080"
+    environment:
+      WEBUI_AUTH: "true"
+      WEBUI_SECRET_KEY: "${WEBUI_SECRET_KEY:?Generate .env with python scripts/init_env.py}"
+      ENABLE_LOGIN_FORM: "true"
+      ENABLE_SIGNUP: "true"
+      DEFAULT_USER_ROLE: user
+      # The first admin bootstrap disables signup in upstream.
+      # Re-enable it in Admin Settings, with default role user; see docs/deployment.md.
+      ENABLE_OPENAI_API: "false"
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_CODE_EXECUTION: "false"
+      ENABLE_CODE_INTERPRETER: "false"
+      ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS: "false"
+      OFFLINE_MODE: "true"
+      HF_HUB_OFFLINE: "1"
+      RAG_EMBEDDING_ENGINE: openai
+      RAG_EMBEDDING_MODEL_AUTO_UPDATE: "false"
+      WHISPER_MODEL_AUTO_UPDATE: "false"
+      DO_NOT_TRACK: "true"
+      ANONYMIZED_TELEMETRY: "false"
+      FORWARDED_ALLOW_IPS: "127.0.0.1"
+      AGENT_PLATFORM_PUBLIC_ORIGIN: "${AGENT_PLATFORM_PUBLIC_ORIGIN:-http://localhost:3000}"
+    volumes:
+      - webui_data:/app/backend/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: "${WEB_MEMORY_LIMIT:-2g}"
+    cpus: "${WEB_CPU_LIMIT:-2.0}"
+    networks:
+      - web
+
+volumes:
+  webui_data:
+
+networks:
+  web:
+    driver: bridge
+
+# Deliberately no Docker socket, host network, agent containers, or fake LLM.

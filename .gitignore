@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+*.sqlite3
+*.sqlite3-*
+instance/
+state/
+secrets/
+node_modules/
+.coverage
+htmlcov/
+.DS_Store
