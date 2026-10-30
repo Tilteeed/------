@@ -9,11 +9,13 @@ from open_webui.utils.auth import get_verified_user
 from .api import create_router
 from .pages import create_page_router
 from .store import DraftStore
+from .runtime import configured_client
 
 router = APIRouter()
 router.include_router(create_router(
     get_verified_user,
     DraftStore(Path(DATA_DIR) / "agent-platform.sqlite3"),
     public_origin=os.environ.get("AGENT_PLATFORM_PUBLIC_ORIGIN") or None,
+    runtime=configured_client(),
 ))
 router.include_router(create_page_router(Path(__file__).parent / "static"))

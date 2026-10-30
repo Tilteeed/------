@@ -84,7 +84,13 @@ Provider `observe()` должен быстро читать доверенный
 
 Ревизия draft — проверенный вызывающей службой snapshot, не блокировка отдельной DraftStore БД. До реального исполнения нужны согласованный snapshot настроек, повторная сверка профиля и свежий runtime admission. Сохранённый queued не является бессрочным разрешением на Docker create/start. Служебная аутентификация, host collector и quota/runtime executor по-прежнему отсутствуют.
 
-## Что ещё потребуется для supervisor/storage backend
+## Конфигурация запуска host-service
+
+`supervisor/runtime.example.json` перечисляет отдельные параметры службы и общие budgets. `scripts/configure_supervisor.py --prepare-host-config` при явном запуске оператором от root создаёт административный snapshot профиля и runtime.json вне user-writable checkout; источник deployment.local.json не переписывается. RuntimeStore закрепляет полный профиль для этого журнала: менять binding или удалять DB ради нового профиля нельзя, нужна отдельная миграция.
+
+Host-service и opt-in Compose bridge уже реализованы, но целевой прогон на ВМ ещё не принят. Полные команды, область привилегированных изменений и короткая функциональная приёмка — `docs/SUPERVISOR_RUN.md`. Disk bytes runtime XFS должны делиться на 1024; per-agent inode hard limit выводится технически из disk_bytes/4096 с минимумом 1024, а не берётся из браузера.
+
+## Более широкий контракт и оставшиеся задачи
 
 Следующая таблица описывает более широкий будущий контракт: сбор свежих метрик, численные системные/модельные резервы, служебные credentials, Docker/storage executor и проверки реального хоста ещё не реализованы/не подключены. Библиотечный coordinator уже соединяет профиль, чистую policy и атомарный registry, но не определяет мощность машины и не доказывает quota enforcement.
 

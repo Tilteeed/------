@@ -62,7 +62,15 @@ Read-only конфигурация в лабораторном профиле с
 
 ## Этап 3. Спроектировать границу управления и правила допуска
 
-**Статус: в работе.** Проект контракта записан в `docs/STAGE3_CONTRACT.md`. Реализованы политики, профиль, registry и библиотечный coordinator, объединяющий допуск с атомарным резервом. Свежий локальный прогон после добавления read-only XFS preflight: **70 supervisor-тестов и 15 lab/storage unit-тестов, OK**; 20 новых coordination-тестов включают SQLite lock, profile pinning, rollback и гонки. Это не приёмка Docker/storage integration.
+**Статус: сквозная реализация добавлена, приёмка на ВМ не завершена.**
+
+Реализованы host-service/приватная авторизация web → supervisor, сбор метрик, staged intents с durable бюджетами и retained data, XFS project provisioning и Docker create/start/stop/restart/remove-retain. Кабинет связан с ними через opt-in IPC bridge. Сеть none и seccomp закрывают незапланированные host/network/filesystem пути. Инструкция — `docs/SUPERVISOR_RUN.md`.
+
+Локально фактически прошёл один сквозной HTTP/SQLite сценарий: создание, stop/start/restart, точный replay с чтением текущего состояния, второй владелец, remove-retain и отказ сверх дискового бюджета. Docker/XFS/метрики в нём имитированы. Новые unit-наборы ради покрытия частностей не добавлялись. Публичная/production готовность и реальная XFS/Docker приёмка не заявляются.
+
+Для закрытия на ВМ нужен один функциональный прогон: создать из кабинета и подтвердить фактический running/health; stop/start и разделение двух владельцев; remove с сохранением данных и бюджетом. Назначение квот и привилегированный запуск выполняются только при явном согласии оператора. Старые ext4/config/coordinator проверки повторять не требуется.
+
+Предшествующие результаты: проект контракта записан в `docs/STAGE3_CONTRACT.md`. Реализованы политики, профиль, registry и библиотечный coordinator, объединяющий допуск с атомарным резервом. Свежий локальный прогон после добавления read-only XFS preflight: **70 supervisor-тестов и 15 lab/storage unit-тестов, OK**; 20 новых coordination-тестов включают SQLite lock, profile pinning, rollback и гонки. Это не приёмка Docker/storage integration.
 
 Приняты отдельные результаты пользователя на Linux-ВМ для предшествующего config-среза: 37 supervisor/15 storage OK; `lab-v1` валиден, example корректно отклонён с exit 2; фактический XFS mount/UUID совпадают, Accounting/Enforcement ON. Локальный lab-профиль явно задаёт disk_bytes=10737418240 (10 GiB), не универсальный default. Эти принятые проверки не требуют повторения для закрытия старого среза; затем принята пользовательская Linux-проверка coordinator: 57 supervisor/15 lab/storage OK. Новый preflight пока проверен только локально, не на реальном XFS.
 

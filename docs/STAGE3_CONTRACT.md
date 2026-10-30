@@ -181,7 +181,19 @@ Purge — отдельная подтверждённая стадия опер�
 
 ## 10. Решения до завершения этапа 3
 
-### Начатая реализация
+### Сквозная реализация runtime — ожидает приёмки ВМ
+
+Служба `supervisor.service` запускается только на Linux от root с `--enable-host-runtime`. AF_UNIX socket + отдельный credential связывают её с доверенным веб-backend; браузер не передаёт actor/image/mounts и не получает credential/Docker socket. Закрытый API и инструкция — `docs/SUPERVISOR_RUN.md`.
+
+`RuntimeStore` — отдельный durable журнал стадий, не неявное изменение предшествующего Registry. Первичный intent резервирует слот/ресурсы и разрешает только подготовку хранилища. На этой стадии допускается единственный отсутствующий признак disk_quota_unverified; остальные причины отказа действуют. После фактического назначения/чтения project ID и hard limits runtime create/start проходит полный свежий admission с подтверждённой персональной квотой. Это не установка фиктивного True в старый coordinator.
+
+Метрики собираются из /proc/stat, MemTotal/MemAvailable и statvfs; CPU прогревается 60 секунд, freshness 10 секунд. Общие budgets задаются явно оператором, retained disk учитывается после удаления, RAM/CPU освобождаются только после подтверждённого remove. Точный replay не повторяет effects и читает актуальное состояние Docker. Неудачные intents не удаляются автоматически. Полный fingerprint профиля закреплён в runtime DB; смена binding требует отдельной миграции, не удаления истории.
+
+Контейнер: immutable local image ID, UID1000, readonly rootfs, cap_drop ALL, no-new-privileges, memory/CPU/PIDs, bounded /tmp, logging none, network none, только две привязки внутри одного XFS проекта. Default-deny seccomp дополнительно ограничивает ioctl и запрещает альтернативные setters/io_uring, чтобы пользователь-владелец каталогов не снимал project inheritance. Per-agent inode hard limit — технический max(1024,disk_bytes//4096); точный block limit должен быть кратен 1024 байтам. Модель, чат и Telegram не подключаются этим срезом.
+
+Локальный сквозной HTTP/SQLite smoke прошёл с fake Docker/XFS/метриками. Это не доказательство реального старта образа или kernel quota enforcement. Целевая функциональная приёмка ВМ остаётся открытой; изменения ФС/сервисов автоматически не выполнялись.
+
+### Предшествующая библиотечная реализация
 
 - `supervisor/policy.py`: закрытая схема create-запроса и чистая функция допуска lab/final. Локально пройдены 6 policy-тестов с отрицательными и граничными случаями; это не измерение ВМ и не применение квоты.
 - Лабораторное послабление касается только порога 50%; свежесть метрик, физический недостаток ресурсов и отсутствие реально проверенной дисковой квоты не превращаются в разрешение.
@@ -192,7 +204,7 @@ Purge — отдельная подтверждённая стадия опер�
 - `supervisor/coordinator.py` связывает профиль, чистую policy и reserve_create в одной writer-транзакции: текущая ревизия для нового запроса, fresh typed observations, physical-total bounds и общие бюджеты. Точный replay возвращает старую операцию без нового допуска. В `deployment_profiles` атомарно фиксируется fingerprint полного профиля; смена contents под той же версией и необоснованное присвоение профиля legacy-записям запрещены. Callback допуска должен только быстро читать trusted cache, не делать host/network I/O под SQLite lock. Новый срез: 20 новых тестов; весь supervisor — 57, OK; storage — 15, OK, локально. Это не выполненная Linux-проверка нового среза, не новый независимый review и не реальный Docker create/start. Служебная авторизация, реальные metric/quota providers и executor отсутствуют; новый reserved/queued не доказывает runtime readiness. Полный контракт — `docs/DEPLOYMENT_CONFIG.md`.
 - После coordinator-среза приняты пользовательские Linux-проверки: 57 supervisor/15 lab/storage OK; отдельно сообщён ожидаемый отказ синтетического create при неподтверждённой квоте.
 - `supervisor/storage.py` и `supervisor/probes.py`: read-only XFS backend preflight, повторная проверка mount, bounded stdout/timeout, sanitised errors и CLI. 13 новых тестов; весь локальный supervisor — 70, lab/storage — 15, OK. Метаданные ФС в тестах синтетические; реальный новый CLI на ВМ ещё не проверен. backend_ready не означает персональную quota: disk_quota_verified всегда false. Назначение квот, Docker и служебная интеграция не добавлены. Инструкция — `docs/STORAGE_PREFLIGHT.md`.
-- Существующий API `/me/actions` не подключён к этому ядру и продолжает возвращать runtime_not_connected. Docker executor и служебная авторизация ещё не реализованы. Новые файлы сами по себе не меняют поведение работающего веба.
+- Предшествующий библиотечный coordinator напрямую к API не подключался. В новой сквозной реализации API использует private SupervisorClient и RuntimeStore; без opt-in конфигурации по-прежнему возвращается runtime_not_connected. Работающая ВМ сама от записи кода не меняется.
 
 Независимый review первоначального исходного среза (9 файлов supervisor/lab/storage, включая тесты и README) завершён с `passed=true`, без существенных security/logic findings. Соответствие тому snapshot проверялось SHA256 на момент приёмки. Позднее пользователь обнаружил ошибку переносимости test fixture: Windows fallback для TMPDIR удалён, добавлен регрессионный тест отсутствующей переменной. Новый тест сначала воспроизвёл ошибку, после исправления весь supervisor-набор прошёл: 27 тестов, OK; storage — 15 тестов, OK. Production-код этим исправлением не менялся; обновлённый тестовый файл не выдаётся за прежний неизменённый reviewed snapshot. Необязательные прежние замечания: лимит вывода probe ограничивает разбор после захвата, а не всю память subprocess; добавить отдельный тест точной границы свежести 10 секунд. Review исходников не является завершённым аудитом платформы или испытанием quota enforcement на ВМ.
 

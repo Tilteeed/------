@@ -9,6 +9,71 @@ let eventsBusy = false;
 let conflict = false;
 let dirty = false;
 let identityEpoch = 0;
+let currentUser = '';
+let runtimeData = { state: 'not_connected' };
+let capabilities = {};
+let connected = false;
+const operationMemory = new Map();
+let sessionStorageAvailable = true;
+
+function operationGet(key) {
+  if (operationMemory.has(key)) return operationMemory.get(key);
+  let value = null;
+  if (sessionStorageAvailable) {
+    try { value = sessionStorage.getItem(key); }
+    catch { sessionStorageAvailable = false; }
+  }
+  operationMemory.set(key, value);
+  return value;
+}
+
+function operationSet(key, value) {
+  operationMemory.set(key, value);
+  if (sessionStorageAvailable) {
+    try {
+      if (value === null) sessionStorage.removeItem(key);
+      else sessionStorage.setItem(key, value);
+    } catch { sessionStorageAvailable = false; }
+  }
+}
+
+function observeGeneration(runtime) {
+  if (!currentUser || ['unavailable', 'not_connected'].includes(runtime.state)) return;
+  let generation;
+  if (runtime.state === 'removed' || runtime.instance_id === null) generation = 'none';
+  else if (typeof runtime.instance_id === 'string' && runtime.instance_id) generation = runtime.instance_id;
+  else return; // Missing/ambiguous observations do not prove absence.
+  const generationKey = `agent-generation:${currentUser}`;
+  const previous = operationGet(generationKey);
+  if (previous !== null && previous !== 'none' && previous !== generation) {
+    const prefix = `agent-operation:${currentUser}:`;
+    const keys = new Set(operationMemory.keys());
+    if (sessionStorageAvailable) {
+      try {
+        // Copy before deleting: Storage indices change on removeItem.
+        for (let i = 0; i < sessionStorage.length; i += 1) keys.add(sessionStorage.key(i));
+      } catch { sessionStorageAvailable = false; }
+    }
+    for (const key of keys) {
+      if (typeof key === 'string' && key.startsWith(prefix)) operationSet(key, null);
+    }
+  }
+  operationSet(generationKey, generation);
+}
+
+function renderRuntime(data) {
+  runtimeData = data.runtime || { state: 'unavailable' };
+  observeGeneration(runtimeData);
+  capabilities = data.capabilities || {};
+  connected = !['not_connected', 'unavailable'].includes(runtimeData.state);
+  const view = runtimeView(runtimeData, connected || runtimeData.state === 'unavailable');
+  $('runtime-badge').textContent = view.label;
+  $('runtime-title').textContent = view.label;
+  $('runtime-description').textContent = view.description;
+  $('gateway-state').textContent = runtimeData.gateway === 'ready' ? 'Готов' : 'Не готов / не подтверждён';
+  $('metrics-state').textContent = capabilities.metrics ? 'Окно CPU готово' : 'Нет свежих данных / прогрев';
+  controls();
+}
 
 function notice(state, message, href) {
   $('notice').dataset.state = state;
@@ -21,7 +86,22 @@ function controls() {
   $('settings-fields').disabled = !authenticated || busy;
   $('save').disabled = conflict || !dirty;
   $('reload').disabled = busy;
+  $('refresh-runtime').disabled = !authenticated || busy;
   $('refresh-events').disabled = !authenticated || busy || eventsBusy;
+  for (const button of document.querySelectorAll('[data-action]')) {
+    const action = button.dataset.action;
+    const exists = Boolean(runtimeData.instance_id) && runtimeData.state !== 'removed';
+    const needsAdmission = ['create', 'start', 'restart'].includes(action);
+    button.disabled = !authenticated || busy || dirty || conflict || revision < 1 || !connected
+      || (needsAdmission && !capabilities.provisioning)
+      || (action === 'create' ? (exists && !runtimeData.pending_create_key) : !exists)
+      || (action === 'start' && runtimeData.state === 'running')
+      || (action === 'stop' && runtimeData.state === 'stopped');
+    if (action === 'create') {
+      button.textContent = runtimeData.pending_create_key ? 'Продолжить создание' : 'Создать';
+      button.title = runtimeData.pending_create_key ? `Будет использован исходный снимок настроек версии ${runtimeData.pending_create_revision}` : '';
+    }
+  }
   $('main').setAttribute('aria-busy', String(busy));
   $('save').textContent = busy ? 'Подождите…' : 'Сохранить настройки';
 }
@@ -29,6 +109,10 @@ function controls() {
 function revoke() {
   authenticated = false;
   identityEpoch += 1;
+  currentUser = '';
+  connected = false;
+  runtimeData = { state: 'not_connected' };
+  capabilities = {};
   dirty = false;
   $('identity').textContent = 'Учётная запись не подтверждена';
   $('agent-name').value = '';
@@ -36,12 +120,14 @@ function revoke() {
   $('revision').textContent = 'Версия не загружена';
   $('events-list').replaceChildren();
   $('events-status').textContent = 'События недоступны без подтверждённого доступа.';
+  renderRuntime({ runtime: { state: 'not_connected' } });
+  $('runtime-description').textContent = 'Доступ не подтверждён. Состояние экземпляра не загружено.';
 }
 
 function showError(error) {
   const view = errorView(error.status || 0, error.body);
   if (error.status === 401 || error.status === 403) revoke();
-  if (error.status === 409) conflict = true;
+  if (error.status === 409 && (!error.body?.detail?.code || error.body.detail.code === 'revision_conflict')) conflict = true;
   notice(view.state, view.message, view.href);
   controls();
 }
@@ -51,7 +137,7 @@ async function request(path = '', method = 'GET', payload) {
   try { token = localStorage.getItem('token'); } catch { /* Treat unavailable storage as signed out. */ }
   if (!token) throw { status: 401 };
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
+  const timeout = setTimeout(() => controller.abort(), 130000);
   try {
     const response = await fetch(`${apiRoot}${path}`, {
       method,
@@ -136,10 +222,9 @@ async function load() {
     applyDraft(data.draft);
     authenticated = true;
     identityEpoch += 1;
+    currentUser = data.user.id;
     $('identity').textContent = data.user.name;
-    const runtime = runtimeView(data.runtime);
-    $('runtime-badge').textContent = runtime.label;
-    $('runtime-description').textContent = runtime.description;
+    renderRuntime(data);
     void loadEvents();
   } catch (error) {
     // A failed initial read must never enable saving against an invented revision.
@@ -173,6 +258,55 @@ $('settings-form').addEventListener('submit', async (event) => {
     if (!data.draft) throw { status: 0 };
     applyDraft(data.draft);
     void loadEvents();
+  } catch (error) { if (epoch === identityEpoch) showError(error); }
+  finally { busy = false; controls(); }
+});
+for (const button of document.querySelectorAll('[data-action]')) {
+  button.addEventListener('click', async () => {
+    if (button.disabled || busy || !authenticated) return;
+    const action = button.dataset.action;
+    if (action === 'remove' && !window.confirm('Удалить контейнер? Данные будут сохранены. Для следующего экземпляра потребуется дополнительный дисковый бюджет.')) return;
+    const epoch = identityEpoch;
+    const resuming = action === 'create' && typeof runtimeData.pending_create_key === 'string'
+      && Number.isSafeInteger(runtimeData.pending_create_revision) && runtimeData.pending_create_revision > 0;
+    const requestRevision = resuming ? runtimeData.pending_create_revision : revision;
+    const storageKey = `agent-operation:${currentUser}:${requestRevision}:${action}`;
+    let key = resuming ? runtimeData.pending_create_key : operationGet(storageKey);
+    if (!key) {
+      const bytes = crypto.getRandomValues(new Uint8Array(16));
+      key = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+      operationSet(storageKey, key);
+    }
+    busy = true;
+    controls();
+    notice('loading', 'Supervisor выполняет операцию. Не закрывайте страницу…');
+    try {
+      const data = await request('/actions', 'POST', { action, idempotency_key: key, settings_revision: requestRevision });
+      if (epoch !== identityEpoch) return;
+      renderRuntime(data);
+      // Failed/ambiguous requests retain the same key so a retry cannot duplicate effects.
+      if (data.operation?.status === 'succeeded' || data.operation?.status === 'completed') {
+        operationSet(storageKey, null);
+      }
+      notice('saved', 'Ответ supervisor получен. Состояние контейнера показано справа.');
+    } catch (error) {
+      if (epoch === identityEpoch) {
+        if (error.body?.detail?.code === 'instance_retired') {
+          operationSet(storageKey, null);
+          notice('error', 'Операция относится к удалённому экземпляру. Обновите состояние и нажмите «Создать» снова.');
+        } else showError(error);
+      }
+    } finally { busy = false; controls(); }
+  });
+}
+$('refresh-runtime').addEventListener('click', async () => {
+  if (!authenticated || busy) return;
+  const epoch = identityEpoch;
+  busy = true;
+  controls();
+  try {
+    const data = await request();
+    if (epoch === identityEpoch) renderRuntime(data);
   } catch (error) { if (epoch === identityEpoch) showError(error); }
   finally { busy = false; controls(); }
 });

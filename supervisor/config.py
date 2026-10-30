@@ -56,7 +56,7 @@ def validate_profile(data) -> DeploymentProfile:
         if type(value) is not int or not 0 < value <= 2**63 - 1:
             raise ValueError('Agent limits must be positive int64 values')
     storage = data['storage']
-    # Only the XFS profile contract exists in schema v1; no enforcement adapter yet.
+    # Schema v1 supports XFS; actual enforcement is separately checked by volumes.py.
     if type(storage['backend']) is not str or storage['backend'] != 'xfs_project_quota':
         raise ValueError('Unsupported storage backend')
     path = storage['mountpoint']

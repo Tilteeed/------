@@ -1,0 +1,11 @@
+{
+  "profile_path": null,
+  "state_dir": "/var/lib/personal-agent-supervisor",
+  "socket_path": "/run/personal-agent-supervisor/control.sock",
+  "token_file": "/var/lib/personal-agent-supervisor/service.token",
+  "image": null,
+  "capacity_ram_bytes": null,
+  "capacity_cpu_millicores": null,
+  "capacity_disk_bytes": null,
+  "disk_floor_bytes": null
+}

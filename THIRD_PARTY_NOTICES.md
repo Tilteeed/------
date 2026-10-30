@@ -13,4 +13,8 @@ This project extends Open WebUI without replacing its authentication or branding
 
 The project does not embed an OpenClaw image yet. Referenced OpenClaw functionality is not redistributed as part of the current source tree.
 
+## Moby seccomp configuration
+
+`supervisor/seccomp.json` derives from Moby v26.1.5 commit `411e817ddf710ff8e08fa193da80cb78af708191`, `profiles/seccomp/default.json`. The Apache-2.0 license and upstream notice are retained in `supervisor/MOBY_LICENSE` and `supervisor/MOBY_NOTICE`; source provenance and local changes are listed in `supervisor/SECCOMP_SOURCE.md`. The local policy retains default-deny and replaces unrestricted ioctl with a small terminal/pipe whitelist to protect project-quota inheritance. This does not assert completed Linux/Docker verification.
+
 Node is used only in a container test stage for dependency-free frontend unit tests. Python/FastAPI and other runtime dependencies are supplied by the pinned upstream image; the host environment is not modified by writing this repository.

@@ -1,0 +1,20 @@
+# Opt-in bridge only. The web still never receives /var/run/docker.sock.
+# Start the host supervisor first; missing bind sources must not be created here.
+services:
+  web:
+    environment:
+      AGENT_PLATFORM_SUPERVISOR_SOCKET: /run/agent-supervisor/control.sock
+      AGENT_PLATFORM_SUPERVISOR_TOKEN_FILE: /run/agent-supervisor-token
+    volumes:
+      - type: bind
+        source: ${SUPERVISOR_SOCKET_DIR:?Set the host supervisor socket directory}
+        target: /run/agent-supervisor
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SUPERVISOR_TOKEN_FILE:?Set the host service credential file}
+        target: /run/agent-supervisor-token
+        read_only: true
+        bind:
+          create_host_path: false

@@ -1,6 +1,14 @@
 # Ядро supervisor — отдельные модули стадии 3
 
-Это отдельный, пока **не подключённый к вебу** доменный модуль. Он не создаёт контейнеры, не запускает HTTP-сервер и не управляет Docker. Работающие Open WebUI и лабораторный Gateway не изменяются. Новые зависимости не требуются.
+## Сквозной runtime
+
+Добавлены `service.py`, `runtime_store.py`, `metrics.py`, `volumes.py` и `docker_engine.py`: отдельная привилегированная Linux-служба с приватным AF_UNIX API, staged storage intents, персональными XFS quotas и реальным Docker lifecycle. Кабинет подключается через `control_plane/runtime.py` и `compose.supervisor.yaml`, без Docker socket в вебе. Модель/чат/Telegram пока не подключены; сеть runtime — none. Seccomp сохраняет default-deny и блокирует изменение project inheritance.
+
+Запуск с явным согласием на изменения ВМ — `docs/SUPERVISOR_RUN.md`. Подтверждён локальный сквозной HTTP/SQLite сценарий с явно fake Docker/XFS/метриками (`scripts/smoke_runtime.py`); реальный новый runtime на ВМ ещё не принят. Это не объявление завершённой Docker/XFS-верификации.
+
+## Предшествующее библиотечное ядро
+
+Ниже описаны исходные policy/Registry/CreateCoordinator. Они сохранены как библиотечные компоненты, но работающий service использует отдельный RuntimeStore со стадиями подготовки и retained-data бюджетом. Новых Python-пакетов для host-service не требуется. Старый лабораторный Gateway не мигрируется и не усыновляется автоматически.
 
 ## Реально реализованные политики
 
@@ -50,7 +58,7 @@ Read-only проверка файла: `python -m supervisor.config --check supe
 
 20 новых тестов проверяют реальный SQLite lock, отказы/rollback (включая trigger-induced INSERT failure), profile drift/legacy history, границу свежести 10 секунд и гонки 4 потоков. Метрики/quota evidence в этих тестах синтетические. Работающий XFS и успешный config check сами не дают `disk_quota_verified=True` настоящему агенту.
 
-Сейчас нет executor, изменения статусов, освобождения резервов или удаления: все созданные записи продолжают занимать слот и бюджет. Не использовать это ограниченное ядро как готовый управляющий сервис. Подключение этих операций требует отдельного recovery/reconciliation-контракта, а не удаления строк вручную.
+В предшествующем библиотечном Registry нет executor, изменения статусов, освобождения резервов или удаления: его записи продолжают занимать слот и бюджет. Новый host-service использует отдельный RuntimeStore; это не миграция старых reservations. Не использовать один библиотечный Registry как готовый управляющий сервис. Подключение этих операций требует отдельного recovery/reconciliation-контракта, а не удаления строк вручную.
 
 Реестр/coordinator не являются сервисной аутентификацией. До подключения API необходимо завершить доверенный канал web → supervisor, авторизацию actor, реальные host/quota providers, recovery/reconciliation и проверяемый Docker executor. Не открывать библиотечные методы браузеру напрямую и не включать публичный provisioning по успеху unit-тестов.
 

@@ -7,9 +7,10 @@ from starlette.concurrency import run_in_threadpool
 
 from .policy import require_owner, validate_agent_input
 from .store import RevisionConflict
+from .runtime import RuntimeRejected, RuntimeUnavailable
 
 
-def create_router(verified_user, store, *, public_origin: str | None = None):
+def create_router(verified_user, store, *, public_origin: str | None = None, runtime=None):
     """Use the upstream verified-user dependency; never accept user-id headers."""
     router = APIRouter(prefix="/api/v1/agent-platform", tags=["agent-platform"])
 
@@ -63,12 +64,18 @@ def create_router(verified_user, store, *, public_origin: str | None = None):
     @router.get("/me")
     def get_me(response: Response, user=Depends(actor)):
         response.headers["Cache-Control"] = "no-store"
-        return {
+        result = {
             "user": {"id": user.id, "name": user.name, "role": user.role},
             "draft": store.get(user.id),
             "capabilities": {"provisioning": False, "chat": False, "telegram": False, "metrics": False},
             "runtime": {"state": "not_connected", "gateway": "not_connected", "model": "not_connected", "telegram": "not_connected"},
         }
+        if runtime is not None:
+            try:
+                result.update(runtime.get(user.id))
+            except (RuntimeUnavailable, RuntimeRejected):
+                result["runtime"]["state"] = "unavailable"
+        return result
 
     @router.put("/me/settings")
     async def put_settings(request: Request, response: Response, user=Depends(actor)):
@@ -91,9 +98,35 @@ def create_router(verified_user, store, *, public_origin: str | None = None):
         return {"events": store.events(user.id)}
 
     @router.post("/me/actions")
-    async def lifecycle_action(request: Request, user=Depends(actor)):
+    async def lifecycle_action(request: Request, response: Response, user=Depends(actor)):
+        response.headers["Cache-Control"] = "no-store"
         payload = await mutation_body(request)
         allowed_actions = {"create", "start", "stop", "restart", "remove"}
+        if runtime is not None:
+            if (type(payload) is not dict
+                    or set(payload) != {"action", "idempotency_key", "settings_revision"}
+                    or type(payload["action"]) is not str or payload["action"] not in allowed_actions
+                    or type(payload["idempotency_key"]) is not str
+                    or not 1 <= len(payload["idempotency_key"]) <= 128
+                    or any(not (c.isascii() and (c.isalnum() or c in "_-")) for c in payload["idempotency_key"])
+                    or type(payload["settings_revision"]) is not int
+                    or not 1 <= payload["settings_revision"] <= 2**53 - 1):
+                raise HTTPException(400, "Supported action, idempotency_key and saved settings_revision required")
+            try:
+                try:
+                    return await run_in_threadpool(runtime.replay, user.id, payload)
+                except RuntimeRejected as error:
+                    if error.status != 404 or error.code != 'operation_not_found':
+                        raise
+                draft = await run_in_threadpool(store.get, user.id)
+                if draft is None or draft["revision"] != payload["settings_revision"]:
+                    raise HTTPException(409, {"code": "revision_conflict", "message": "Перечитайте сохранённые настройки перед операцией."})
+                result = await run_in_threadpool(runtime.action, user.id, payload, draft)
+            except RuntimeUnavailable:
+                raise HTTPException(503, {"code": "supervisor_unavailable", "message": "Связь с supervisor недоступна. Результат операции неизвестен: обновите состояние перед повтором."}) from None
+            except RuntimeRejected as error:
+                raise HTTPException(error.status, {"code": error.code, "message": error.message}) from None
+            return result
         if (
             not isinstance(payload, dict)
             or set(payload) != {"action"}
