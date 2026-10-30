@@ -54,6 +54,14 @@ Read-only проверка файла: `python -m supervisor.config --check supe
 
 Реестр/coordinator не являются сервисной аутентификацией. До подключения API необходимо завершить доверенный канал web → supervisor, авторизацию actor, реальные host/quota providers, recovery/reconciliation и проверяемый Docker executor. Не открывать библиотечные методы браузеру напрямую и не включать публичный provisioning по успеху unit-тестов.
 
+## Read-only preflight XFS
+
+`supervisor/storage.py` проверяет подготовленный backend по административному профилю: канонический путь, точный mountpoint, XFS/UUID/корень ФС, rw и project quota mount options, Accounting/Enforcement ON. После чтения quota state mount проверяется повторно; смена метаданных блокирует результат. Это снимок, не устранение всех TOCTOU-гонок будущего provisioning.
+
+CLI на Linux-ВМ: `sudo python3 -m supervisor.storage --check supervisor/deployment.local.json`. JSON `status=backend_ready` и exit 0 означают только успешный backend preflight; `status=blocked` и exit 2 — отказ. **disk_quota_verified всегда false**, включая успешный preflight: персональные project ID/hard limits не назначаются и не проверяются. Не переносить backend_ready в admission как доказательство квоты экземпляра.
+
+`supervisor/probes.py` запускает фиксированные команды вызывающего кода без shell, с LC_ALL=C, ограниченным чтением stdout и timeout; stderr не публикуется. Сам runner не является sandbox для произвольных argv. Нет форматирования, mount/remount, назначения квот, Docker или fallback. Подробности и конечный список VM-проверок — `docs/STORAGE_PREFLIGHT.md`.
+
 ## Проверки
 
 Из корня проекта:
@@ -65,8 +73,8 @@ python -m unittest discover -s lab/storage/tests -v
 
 Тестовые метрики, профили и JSON-фикстуры — синтетические входы unit-тестов, не сведения о ВМ и не результат исполнения Docker. Временные SQLite создаются только внутри тестов. Никакие `.env` или реальные credentials для тестов не нужны.
 
-Свежий локальный прогон подтвердил **57 supervisor-тестов и 15 storage-тестов, OK**, включая 20 coordination-тестов. Это unit/contract-проверки с настоящими временными файлами/SQLite/Python subprocess, не испытание Docker или XFS. Предыдущий lab/openclaw-прогон: 18, OK с 2 skips; этот набор не менялся и заново в данном срезе не выполнялся.
+Свежий локальный прогон подтвердил **70 supervisor-тестов и 15 lab/storage-тестов, OK**, включая 20 coordination-тестов и 13 новых storage/probe/CLI-тестов. Это unit/contract-проверки с настоящими временными файлами/SQLite/Python subprocess, не испытание Docker или XFS. Предыдущий lab/openclaw-прогон: 18, OK с 2 skips; этот набор не менялся и заново в данном срезе не выполнялся.
 
-Отдельно приняты результаты пользователя на Linux-ВМ для предшествующего config-среза: 37 supervisor/15 storage OK, `lab-v1` валиден, незаполненный example возвращает exit 2, mount UUID/тип XFS совпадают, project Accounting/Enforcement ON. Диск в локальном lab-профиле явно выбран 10737418240 bytes (10 GiB), это не universal default и не уже испытанная квота OpenClaw. Новый coordinator пока проверен локально, не на ВМ.
+Отдельно приняты результаты пользователя на Linux-ВМ для предшествующего config-среза: 37 supervisor/15 storage OK, `lab-v1` валиден, незаполненный example возвращает exit 2, mount UUID/тип XFS совпадают, project Accounting/Enforcement ON. Диск в локальном lab-профиле явно выбран 10737418240 bytes (10 GiB), это не universal default и не уже испытанная квота OpenClaw. Затем пользователь предоставил Linux-прогон coordinator-среза: 57 supervisor/15 lab/storage OK и сообщение об ожидаемом отказе синтетического create при неподтверждённой квоте. Новый XFS preflight пока проверен локально на фикстурах/процессах, не на реальной ФС ВМ.
 
 Read-only диагностика ext4 в `lab/storage/` уже выполнена пользователем на Linux-ВМ: complete/errors=[], корневой `/dev/sda1`, project=false, quota=false, prjquota_visible=false, enforcement_verified=false. Она не включает квоты и не исследует новый XFS-том. Исторический Windows-результат incomplete/unsupported_platform не блокирует завершённое Linux-discovery. Новый XFS `/srv/agent-data` имеет отдельные предоставленные свидетельства Accounting/Enforcement ON; сведения о reboot и пробе 100 МиБ из последующего ревью отделены от первичных логов в `docs/VM_STORAGE.md`. Проверка quota backend настоящего экземпляра OpenClaw ещё не выполнена. Изменение ФС, монтирование и установка утилит требуют отдельного разрешения.

@@ -61,6 +61,10 @@ Exit 0 означает **только корректность файла пр�
 
 Файл должен задаваться администратором и находиться вне путей, доступных агентам на запись. Проверка владельца/прав самого файла и безопасное подключение к службе ещё не реализованы; чтение JSON не является аутентификацией администратора. В профиль нельзя добавлять `disk_quota_verified`, живые capacity snapshots, `image`, actor или произвольный порог: закрытая схема их отклоняет. Порог 50%, окно CPU 60 секунд и свежесть 10 секунд остаются в действующей чистой политике; этот срез их не меняет.
 
+## Read-only проверка подготовленного XFS backend
+
+После проверки файла на Linux-ВМ выполнить `sudo python3 -m supervisor.storage --check supervisor/deployment.local.json`. Проверяются именно UUID/mountpoint из профиля этой машины, без автоматического принятия обнаруженной идентичности. Выход 0 / backend_ready не разрешает create и не устанавливает disk_quota_verified: назначение и подтверждение персональной hard quota остаются отдельным механизмом. Выход 2 / blocked означает отказ без fallback и изменений ФС. Команды, ограничения и VM-приёмка — `docs/STORAGE_PREFLIGHT.md`.
+
 ## Реализованная связка допуска и резервирования
 
 `supervisor/coordinator.py`: `CreateCoordinator(registry, profile, observe, clock)` и `create(actor_id, payload, current_settings_revision=...)`. Это доверенный внутрипроцессный API, не HTTP endpoint. Actor/current draft revision даёт будущая проверенная служба, не поля JSON. Клиент по-прежнему передаёт только action/create, idempotency key и ожидаемую ревизию.
