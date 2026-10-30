@@ -4,7 +4,9 @@
 
 ## Реально реализованные политики
 
-Перенос на другую машину: см. `docs/DEPLOYMENT_CONFIG.md`. UUID, устройства и пути из `docs/VM_STORAGE.md` относятся только к лабораторной ВМ. Их нельзя вшивать в runtime как defaults: будущий backend получает ожидаемые параметры из доверенного deployment-профиля целевого стенда. Сейчас загрузчик такого профиля не реализован, а чистые политики/реестр получают ресурсы аргументами. При добавлении загрузчика документировать параметры и проверки рядом с кодом; не выдавать поля документации за действующие настройки.
+Перенос на другую машину: см. `docs/DEPLOYMENT_CONFIG.md`. UUID, устройства и пути из `docs/VM_STORAGE.md` относятся только к лабораторной ВМ. Загрузчик `config.load_profile(path)` уже реализован: он читает явно заданный административный JSON-профиль версии 1 и возвращает неизменяемые settings без подстановки лабораторной идентичности. Шаблон — `supervisor/deployment.example.json`, локальная копия — игнорируемая `supervisor/deployment.local.json`. UUID, mountpoint и дисковый лимит в шаблоне не заполнены намеренно; без них профиль отклоняется.
+
+Read-only проверка файла: `python -m supervisor.config --check supervisor/deployment.local.json`. Exit 0 означает корректность профиля, **не** mount/quota readiness; exit 2 — отказ. Проверены реальное чтение файла, строгие типы/границы, неизвестные поля, дубли JSON, лимит 65536 байт и CLI в отдельном Python-процессе. `disk_quota_verified`, actor, image и произвольный порог задавать в JSON нельзя. Пока нет coordinator, профиль не применяется автоматически к policy/registry или Docker. CPU в профиле задан в millicores; будущая связка обязана использовать один масштаб candidate/capacity. Подробности и оставшиеся проверки — в руководстве конфигурации.
 
 `policy.validate_create(payload)` принимает только:
 
@@ -51,6 +53,6 @@ python -m unittest discover -s lab/storage/tests -v
 
 Тестовые метрики, профили и JSON-фикстуры — синтетические входы unit-тестов, не сведения о ВМ и не результат исполнения Docker. Временные SQLite создаются только внутри тестов. Никакие `.env` или реальные credentials для тестов не нужны.
 
-Свежий локальный прогон подтвердил **27 supervisor-тестов и 15 storage-тестов, OK**, включая regression отсутствующего TMPDIR. Это unit/contract-проверки, не испытание Docker или XFS.
+Свежий локальный прогон подтвердил **37 supervisor-тестов и 15 storage-тестов, OK**, включая regression отсутствующего TMPDIR и 10 новых config/CLI-тестов. Это unit/contract-проверки с настоящими временными файлами/SQLite и Python subprocess, не испытание Docker или XFS. Дополнительно выполнены 18 тестов `lab/openclaw/`: OK, 2 skips (POSIX permissions и реальный Compose на Windows без Docker).
 
 Read-only диагностика ext4 в `lab/storage/` уже выполнена пользователем на Linux-ВМ: complete/errors=[], корневой `/dev/sda1`, project=false, quota=false, prjquota_visible=false, enforcement_verified=false. Она не включает квоты и не исследует новый XFS-том. Исторический Windows-результат incomplete/unsupported_platform не блокирует завершённое Linux-discovery. Новый XFS `/srv/agent-data` имеет отдельные предоставленные свидетельства Accounting/Enforcement ON; сведения о reboot и пробе 100 МиБ из последующего ревью отделены от первичных логов в `docs/VM_STORAGE.md`. Проверка quota backend настоящего экземпляра OpenClaw ещё не выполнена. Изменение ФС, монтирование и установка утилит требуют отдельного разрешения.

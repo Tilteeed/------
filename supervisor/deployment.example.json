@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "profile_version": "replace-with-site-v1",
+  "mode": "final",
+  "storage": {
+    "backend": "xfs_project_quota",
+    "mountpoint": null,
+    "expected_uuid": null
+  },
+  "agent_limits": {
+    "ram_bytes": 2147483648,
+    "cpu_millicores": 1000,
+    "pids_limit": 256,
+    "disk_bytes": null
+  }
+}

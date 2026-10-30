@@ -4,6 +4,8 @@ __pycache__/
 .env
 .env.*
 !.env.example
+# Administrator's site profile; keep the portable deployment.example.json tracked.
+/supervisor/deployment.local.json
 *.sqlite3
 *.sqlite3-*
 instance/

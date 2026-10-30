@@ -5,6 +5,7 @@ __pycache__
 .env
 .env.*
 !.env.example
+supervisor/deployment.local.json
 state
 instance
 secrets
