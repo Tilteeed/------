@@ -56,12 +56,16 @@ def evaluate_admission(*, mode, now, sampled_at, cpu_window_seconds,
             raise ValueError('Finite non-negative metric required')
     if cpu_percent > 100 or type(disk_quota_verified) is not bool:
         raise ValueError('Invalid CPU measurement or quota evidence flag')
+    # Owner-chosen, project-wide 50% policy, not a property of the lab hardware.
+    # The trusted lab/final mode changes enforcement, not the threshold value.
     thresholds = []
     if (total_ram_bytes - available_ram_bytes) * 2 >= total_ram_bytes:
         thresholds.append('memory_threshold')
     if cpu_percent >= 50:
         thresholds.append('cpu_threshold')
     reasons = list(thresholds) if mode == 'final' else []
+    # Technical policy baseline: age <= 10 seconds and CPU window >= 60 seconds.
+    # These are not host capacities or browser-controlled deployment overrides.
     if sampled_at > now:
         reasons.append('future_metrics')
     elif now - sampled_at > 10:

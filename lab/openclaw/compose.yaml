@@ -26,6 +26,9 @@ services:
     security_opt:
       - no-new-privileges:true
     cap_drop: [NET_RAW, NET_ADMIN]
+    # Verified single-Gateway lab baseline, not the final profile for every host.
+    # RAM/CPU overrides belong to the operator's local lab .env; PIDs stay fixed here.
+    # Future supervisor profiles are separate: see docs/DEPLOYMENT_CONFIG.md.
     pids_limit: 256
     mem_limit: ${OPENCLAW_LAB_MEMORY:-2g}
     cpus: ${OPENCLAW_LAB_CPUS:-1.0}
