@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 
@@ -11,8 +12,7 @@ from supervisor import registry
 
 class RegistryTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=os.environ.get(
-            'TMPDIR', 'C:/Users/SystemX/AppData/Local/hermes/cache/scratch'))
+        self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.path = os.path.join(self.temp.name, 'registry.sqlite3')
         self.registry = registry.Registry(self.path)
@@ -236,6 +236,24 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(instance[field], self.request[field])
         self.assertNotIn('container_id', instance)
         self.assertNotIn('container_id', op)
+
+
+class PortabilityTests(unittest.TestCase):
+    def test_fixture_uses_platform_temp_default_without_tmpdir(self):
+        # Cache the runtime's configured temp root before removing TMPDIR.
+        # On the assistant host this keeps real files within Hermes scratch.
+        temporary_root = tempfile.gettempdir()
+        real_factory = tempfile.TemporaryDirectory
+        case = RegistryTests('test_persistent_reserved_instance_and_queued_operation')
+        self.addCleanup(case.doCleanups)
+        with patch.dict(os.environ), patch.object(tempfile, 'tempdir', temporary_root):
+            os.environ.pop('TMPDIR', None)
+            with patch.object(tempfile, 'TemporaryDirectory', wraps=real_factory) as factory:
+                case.setUp()
+                case.test_persistent_reserved_instance_and_queued_operation()
+                # A host-specific dir override is precisely the portability bug.
+                self.assertEqual(factory.call_args.args, ())
+                self.assertIsNone(factory.call_args.kwargs.get('dir'))
 
 
 if __name__ == '__main__':
