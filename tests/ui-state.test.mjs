@@ -40,4 +40,6 @@ test('runtime never claims an agent is running without a connection', () => {
       description: 'Docker и среда выполнения не подключены. Агент не создан и не запущен.',
     });
   }
+  assert.equal(ui.runtimeView({ state: 'purging' }, true).label, 'Удаление данных');
+  assert.equal(ui.runtimeView({ state: 'purged' }, true).label, 'Полностью удалён');
 });

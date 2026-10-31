@@ -11,6 +11,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
 from control_plane import api
+from control_plane.policy import validate_agent_input
+from control_plane.runtime import RuntimeRejected
 from control_plane.store import DraftStore
 
 
@@ -110,8 +112,50 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(self.client.get(self.base + "/events", headers=self.bob).json(), {"events": []})
         self.assertEqual(self.client.get(self.base, headers=self.alice).json()["runtime"]["state"], "not_connected")
 
+    def test_purge_route_replays_old_revision_but_rejects_new_stale_request(self):
+        self.store.save('alice', validate_agent_input({'name': 'Agent', 'instructions': 'initial'}), expected_revision=0)
+
+        class Runtime:
+            def __init__(self):
+                self.calls = []
+
+            def replay(self, _actor, payload):
+                if any(call['idempotency_key'] == payload['idempotency_key'] for call in self.calls):
+                    return {'runtime': {'state': 'purged', 'instance_id': payload['instance_id']},
+                            'capabilities': {}, 'retained': [],
+                            'operation': {'id': 'op', 'status': 'completed'}}
+                raise RuntimeRejected(404, 'operation_not_found', 'not found')
+
+            def action(self, _actor, payload, _draft):
+                self.calls.append(payload.copy())
+                return {'runtime': {'state': 'purged', 'instance_id': payload['instance_id']},
+                        'capabilities': {}, 'retained': [],
+                        'operation': {'id': 'op', 'status': 'completed'}}
+
+        runtime = Runtime()
+        app = FastAPI()
+        app.include_router(api.create_router(verified_test_user, self.store, runtime=runtime))
+        client = TestClient(app)
+        self.addCleanup(client.close)
+        path = self.base + '/actions'
+        payload = {'action': 'purge', 'idempotency_key': 'purge-key-1',
+                   'settings_revision': 1, 'instance_id': 'a' * 32}
+        first = client.post(path, headers=self.alice, json=payload)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(len(runtime.calls), 1)
+        self.store.save('alice', validate_agent_input({'name': 'Agent v2', 'instructions': 'new draft'}), expected_revision=1)
+        replay = client.post(path, headers=self.alice, json=payload)
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertEqual(len(runtime.calls), 1)
+        stale = {**payload, 'idempotency_key': 'purge-key-2'}
+        result = client.post(path, headers=self.alice, json=stale)
+        self.assertEqual(result.status_code, 409)
+        self.assertEqual(len(runtime.calls), 1)
+        malformed = {**payload, 'instance_id': '../other'}
+        self.assertEqual(client.post(path, headers=self.alice, json=malformed).status_code, 400)
+
     def test_lifecycle_refuses_unconnected_runtime_without_faking_success(self):
-        for action in ("create", "start", "stop", "restart", "remove"):
+        for action in ("create", "start", "stop", "restart", "remove", "purge"):
             with self.subTest(action=action):
                 result = self.client.post(self.base + "/actions", headers=self.alice, json={"action": action})
                 self.assertEqual(result.status_code, 503, result.text)

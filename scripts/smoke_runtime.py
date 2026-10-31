@@ -35,12 +35,23 @@ class FakeMetrics:
 
 
 class FakeVolumes:
-    verified = True
+    def __init__(self):
+        self.verified = True
+        self.purge_calls = 0
+        self.purged = set()
+
     def prepare(self, instance_id, disk_bytes):
         return self.verify(instance_id, disk_bytes)
     def verify(self, instance_id, disk_bytes):
         return dict(host_path='/mnt/integration-fixture/instances/' + instance_id,
                     project_id=123, disk_quota_verified=self.verified)
+    def purge(self, instance_id, disk_bytes, expected_project_id=None):
+        self.purge_calls += 1
+        if self.purge_calls == 1:
+            raise OSError('synthetic interrupted purge')
+        assert expected_project_id == 123 and disk_bytes == 10 * 1024**3
+        self.purged.add(instance_id)
+        return dict(purged=True, project_id=expected_project_id)
 
 
 class FakeEngine:
@@ -117,9 +128,12 @@ def main():
                 bob_saved = web.put(base + '/settings', headers=bob, json=dict(
                     settings=dict(name='Bob agent', instructions='Bob instructions'), revision=0))
                 assert bob_saved.status_code == 200, bob_saved.text
-                def action(name, key, headers=alice, settings_revision=1):
-                    return web.post(base + '/actions', headers=headers, json=dict(
-                        action=name, idempotency_key=key, settings_revision=settings_revision))
+                def action(name, key, headers=alice, settings_revision=1, instance_id=None):
+                    payload: dict[str, object] = dict(action=name, idempotency_key=key,
+                                   settings_revision=settings_revision)
+                    if name == 'purge':
+                        payload['instance_id'] = instance_id
+                    return web.post(base + '/actions', headers=headers, json=payload)
                 failed = action('create', 'create-1')
                 assert failed.status_code == 503, failed.text
                 pending = web.get(base, headers=alice).json()['runtime']
@@ -171,13 +185,48 @@ def main():
                 assert engine.inspect(identifier)['state'] == 'stopped', 'Unverified storage must not leave an adopted runtime running'
                 volumes.verified = True
                 assert action('remove', 'remove-1', settings_revision=2).json()['runtime']['state'] == 'removed'
+                retained = web.get(base, headers=alice).json()['retained']
+                assert [item['instance_id'] for item in retained] == [identifier]
+                assert web.get(base, headers=bob).json()['retained'] == []
                 assert store.totals() == (profile.agent_limits.ram_bytes, profile.agent_limits.cpu_millicores,
                                           2 * profile.agent_limits.disk_bytes), 'Retained disk must remain reserved'
                 recreated = web.post(base + '/actions', headers=alice, json=dict(
                     action='create', idempotency_key='create-after-remove', settings_revision=2))
                 assert recreated.status_code == 200, recreated.text
-                assert recreated.json()['runtime']['instance_id'] not in {identifier, bob_id}
+                new_identifier = recreated.json()['runtime']['instance_id']
+                assert new_identifier not in {identifier, bob_id}
+                assert 'pending_create_key' not in recreated.json()['runtime'], 'Removed create keys must not attach to a new instance'
                 assert engine.creates == 3
+                assert web.get(base, headers=bob).json()['retained'] == []
+
+                foreign_purge = action('purge', 'foreign-purge', headers=bob,
+                                       settings_revision=1, instance_id=identifier)
+                assert foreign_purge.status_code == 404, foreign_purge.text
+                assert volumes.purge_calls == 0, 'A foreign owner must not reach storage deletion'
+                purge_payload = dict(action='purge', idempotency_key='purge-retained-1',
+                                     settings_revision=2, instance_id=identifier)
+                before_purge = store.totals()
+                failed_purge = web.post(base + '/actions', headers=alice, json=purge_payload)
+                assert failed_purge.status_code == 503, failed_purge.text
+                assert store.totals() == before_purge, 'Failed purge must retain its disk reservation'
+                pending_purge = web.get(base, headers=alice).json()
+                assert pending_purge['runtime']['instance_id'] == new_identifier
+                saved_item = pending_purge['retained'][0]
+                assert saved_item['instance_id'] == identifier
+                assert saved_item['pending_purge_key'] == 'purge-retained-1'
+                assert saved_item['pending_purge_revision'] == 2
+                purged = web.post(base + '/actions', headers=alice, json=purge_payload)
+                assert purged.status_code == 200, purged.text
+                assert purged.json()['runtime']['instance_id'] == new_identifier, 'Purging retained data must not hide the current instance'
+                assert store.instance(identifier)['state'] == 'purged'
+                assert identifier in volumes.purged
+                calls_after_purge = volumes.purge_calls
+                replay_purge = web.post(base + '/actions', headers=alice, json=purge_payload)
+                assert replay_purge.status_code == 200, replay_purge.text
+                assert replay_purge.json()['runtime']['instance_id'] == new_identifier
+                assert volumes.purge_calls == calls_after_purge, 'Exact purge replay must not repeat deletion'
+                assert web.get(base, headers=alice).json()['retained'] == []
+                assert new_identifier not in str(web.get(base, headers=bob).json())
                 assert token not in str(data) and 'gateway_token' not in str(data)
             unauth = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=5)
             try:
@@ -187,7 +236,7 @@ def main():
                 response.read()
             finally:
                 unauth.close()
-            print('PASS: lifecycle, replay after draft revision, stale-key rejection, pending-create recovery, owner isolation, paused/restarting state, remove-retain and fresh create.')
+            print('PASS: lifecycle, replay after draft revision, stale-key rejection, pending-create recovery, owner isolation, paused/restarting state, remove-retain, fresh create, and owner-scoped purge retry/replay.')
             print('Scope: FAKE Docker/XFS/metrics, real HTTP and SQLite. Linux AF_UNIX, Docker image and XFS enforcement NOT verified.')
         finally:
             server.shutdown()

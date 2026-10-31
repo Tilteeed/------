@@ -315,6 +315,156 @@ class XfsVolumes:
         return {'host_path': str(root), 'project_id': project_id,
                 'disk_quota_verified': True}
 
+    @classmethod
+    def _clear_contents(cls, path, device):
+        """Delete one owned tree without following symlinks or crossing devices."""
+        with os.scandir(path) as entries:
+            for entry in entries:
+                info = os.lstat(entry.path)
+                _require(info.st_dev == device and not os.path.ismount(entry.path),
+                         'nested_mount')
+                if stat.S_ISDIR(info.st_mode):
+                    cls._clear_contents(Path(entry.path), device)
+                    os.rmdir(entry.path)
+                else:
+                    # Symlinks and special files are unlinked, never opened/followed.
+                    os.unlink(entry.path)
+        cls._sync_dir(path)
+
+    @staticmethod
+    def _quota_clear(rows):
+        return all(row is None or row == (0, 0, 0) for row in rows)
+
+    @staticmethod
+    def _quota_matches(rows, disk_bytes):
+        return (len(rows) == 2 and rows[0] is not None and rows[1] is not None
+                and rows[0][1:] == (0, disk_bytes // 1024)
+                and rows[1][1:] == (0, max(1024, disk_bytes // 4096)))
+
+    def purge(self, instance_id, disk_bytes, expected_project_id=None):
+        """Delete only a journaled instance tree; keep its quota reserved on failure.
+
+        The caller must first prove that its Docker container is absent. The storage
+        DB's purging stages make every filesystem step retryable after a crash.
+        """
+        _arguments(instance_id, disk_bytes)
+        if expected_project_id is not None:
+            _require(type(expected_project_id) is int and 0 < expected_project_id <= 2147483646,
+                     'invalid_project_id')
+        self._preflight()
+        root = self.instances / instance_id
+        if not os.path.lexists(self.db_path):
+            _require(not os.path.lexists(root), 'foreign_directory')
+            _require(expected_project_id is None, 'storage_state_missing')
+            return {'purged': True, 'project_id': None}
+        try:
+            with self._database(create=False) as db:
+                row = db.execute('SELECT * FROM volume_projects WHERE instance_id=?',
+                                 (instance_id,)).fetchone()
+                root = self.instances / instance_id
+                if row is None:
+                    _require(not os.path.lexists(root), 'foreign_directory')
+                    if expected_project_id is not None:
+                        _require(self._quota_clear(self._limits(expected_project_id)),
+                                 'quota_cleanup_unverified')
+                    return {'purged': True, 'project_id': expected_project_id}
+
+                project_id = row['project_id']
+                _require(expected_project_id in (None, project_id), 'project_identity_mismatch')
+                _require(row['disk_bytes'] == disk_bytes, 'quota_request_changed')
+                stage = row['stage']
+                _require(stage in ('reserved', 'assigned', 'ready', 'purging',
+                                    'quota_cleared', 'quota_reset'), 'invalid_volume_state')
+                original_stage = stage
+                if stage not in ('purging', 'quota_cleared', 'quota_reset'):
+                    db.execute('BEGIN IMMEDIATE')
+                    try:
+                        db.execute("UPDATE volume_projects SET stage='purging' WHERE instance_id=?",
+                                   (instance_id,))
+                        db.commit()
+                    except BaseException:
+                        db.rollback()
+                        raise
+                    stage = 'purging'
+
+                root_key = root.relative_to(self.mountpoint).as_posix()
+                root_record = db.execute('SELECT * FROM volume_directories WHERE path=?',
+                                         (root_key,)).fetchone()
+                if os.path.lexists(root):
+                    _require(root_record is not None, 'foreign_directory')
+                    info = self._canonical(root)
+                    mount_info = self._canonical(self.mountpoint)
+                    _require((info.st_dev, info.st_ino) ==
+                             (root_record['device'], root_record['inode']),
+                             'directory_identity_changed')
+                    _require(info.st_dev == mount_info.st_dev
+                             and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o700,
+                             'unsafe_directory')
+                    identity = self._fsxattr(root)
+                    limits = self._limits(project_id)
+                    if identity == (project_id, True):
+                        _require((self._quota_clear(limits) or self._quota_matches(limits, disk_bytes))
+                                 if original_stage == 'reserved'
+                                 else self._quota_matches(limits, disk_bytes),
+                                 'quota_limit_mismatch')
+                        self._clear_contents(root, root.stat().st_dev)
+                        self._quota(f'project -C -p {root} {project_id}')
+                        identity = self._fsxattr(root)
+                    else:
+                        _require(identity == (0, False)
+                                 and stage in ('purging', 'quota_cleared', 'quota_reset')
+                                 and not any(root.iterdir())
+                                 and (self._quota_matches(limits, disk_bytes)
+                                      or self._quota_clear(limits)),
+                                 'project_identity_mismatch')
+                    _require(identity == (0, False) and not any(root.iterdir()),
+                             'project_cleanup_unverified')
+                    db.execute('BEGIN IMMEDIATE')
+                    try:
+                        db.execute("UPDATE volume_projects SET stage='quota_cleared' WHERE instance_id=?",
+                                   (instance_id,))
+                        db.commit()
+                    except BaseException:
+                        db.rollback()
+                        raise
+                    os.rmdir(root)
+                    self._sync_dir(root.parent)
+                elif original_stage == 'reserved':
+                    _require(root_record is None and self._quota_clear(self._limits(project_id)),
+                             'unprepared_project_has_quota')
+                    db.execute('BEGIN IMMEDIATE')
+                    try:
+                        db.execute("UPDATE volume_projects SET stage='quota_cleared' WHERE instance_id=?",
+                                   (instance_id,))
+                        db.commit()
+                    except BaseException:
+                        db.rollback()
+                        raise
+                else:
+                    _require(original_stage in ('quota_cleared', 'quota_reset'),
+                             'purge_state_inconsistent')
+
+                limits = self._limits(project_id)
+                _require(all(item is None or item[0] == 0 for item in limits),
+                         'quota_usage_remaining')
+                self._quota(f'limit -p bsoft=0 bhard=0 isoft=0 ihard=0 {project_id}')
+                _require(self._quota_clear(self._limits(project_id)), 'quota_cleanup_unverified')
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    db.execute("UPDATE volume_projects SET stage='quota_reset' WHERE instance_id=?",
+                               (instance_id,))
+                    db.execute('DELETE FROM volume_directories WHERE path=? OR path LIKE ?',
+                               (root_key, root_key + '/%'))
+                    db.execute('DELETE FROM volume_projects WHERE instance_id=?', (instance_id,))
+                    db.commit()
+                except BaseException:
+                    db.rollback()
+                    raise
+                self._sync_dir(self.state_dir)
+                return {'purged': True, 'project_id': project_id}
+        finally:
+            self._preflight()
+
     def _operate(self, instance_id, disk_bytes, create):
         _arguments(instance_id, disk_bytes)
         self._preflight()  # Before state DB setup OR any volume mutation.

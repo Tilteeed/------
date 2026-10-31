@@ -91,6 +91,37 @@ class RuntimeStore:
             row = self.db.execute("SELECT key FROM operations WHERE instance_id=? AND action='create' AND status IN ('pending','failed') LIMIT 1", (instance_id,)).fetchone()
             return row['key'] if row else None
 
+    def retained(self, actor):
+        """Owner-scoped retained datasets; never expose host paths or project IDs."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT * FROM instances WHERE actor=? AND active=0 AND disk>0 "
+                "AND state IN ('removed','purging') ORDER BY id LIMIT 100", (actor,)).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                try:
+                    settings = json.loads(item['settings'])
+                    name = settings.get('name', 'Агент') if type(settings) is dict else 'Агент'
+                except (ValueError, TypeError):
+                    name = 'Агент'
+                retry = self.purge_retry(item['id'])
+                result.append({'instance_id': item['id'], 'name': name,
+                               'disk_bytes': item['disk'], 'state': item['state'],
+                               'pending_purge_key': retry['key'] if retry else None,
+                               'pending_purge_revision': retry['revision'] if retry else None})
+            return result
+
+    def purge_retry(self, instance_id):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT key,payload FROM operations WHERE instance_id=? AND action='purge' "
+                "AND status IN ('pending','failed') ORDER BY rowid DESC LIMIT 1", (instance_id,)).fetchone()
+            if row is None:
+                return None
+            request = json.loads(row['payload'])['request']
+            return {'key': row['key'], 'revision': request['settings_revision']}
+
     def current(self, actor):
         with self.lock:
             row = self.db.execute('SELECT * FROM instances WHERE actor=? AND active=1', (actor,)).fetchone()
@@ -112,7 +143,7 @@ class RuntimeStore:
             return tuple(self.db.execute('SELECT COALESCE(SUM(ram),0),COALESCE(SUM(cpu),0),COALESCE(SUM(disk),0) FROM instances').fetchone())
 
     def intent(self, payload, limits, capacities):
-        """Atomic exact replay, owner slot, RAM/CPU/disk reservation and intent."""
+        """Atomic replay, owner slot, reservation and operation intent."""
         with self.transaction():
             replay = self.lookup(payload)
             if replay:
@@ -121,7 +152,21 @@ class RuntimeStore:
                     raise StoreError('operation_pending')
                 return replay
             actor, action = payload['actor_id'], payload['action']
-            instance = self.current(actor)
+            if action not in {'create', 'start', 'stop', 'restart', 'remove', 'purge'}:
+                raise StoreError('invalid_action')
+            instance_id = None
+            instance = None
+            if action == 'purge':
+                row = self.db.execute('SELECT * FROM instances WHERE id=? AND actor=?',
+                                      (payload['instance_id'], actor)).fetchone()
+                instance = dict(row) if row else None
+                if instance is None or instance['disk'] <= 0 or instance['state'] == 'purged':
+                    raise StoreError('instance_not_found')
+                if not instance['active'] and instance['state'] not in {'removed', 'purging'}:
+                    raise StoreError('instance_not_found')
+                instance_id = instance['id']
+            else:
+                instance = self.current(actor)
             if action == 'create':
                 if instance:
                     raise StoreError('owner_has_instance')
@@ -132,18 +177,22 @@ class RuntimeStore:
                 self.db.execute('INSERT INTO instances (id,actor,active,state,settings,revision,ram,cpu,disk,gateway_token,storage,container_id) VALUES (?,?,1,?,?,?,?,?,?,?,NULL,NULL)',
                                 (instance_id, actor, 'preparing', canonical(payload['settings']),
                                  payload['settings_revision'], *limits, secrets.token_urlsafe(32)))
-            else:
+            elif action != 'purge':
                 if instance is None:
                     raise StoreError('instance_not_found')
                 instance_id = instance['id']
-                pending = self.db.execute("SELECT 1 FROM operations WHERE instance_id=? AND status='pending'", (instance_id,)).fetchone()
-                if pending and action not in {'stop', 'remove'}:
-                    raise StoreError('operation_pending')
-                if pending:
-                    self.db.execute("UPDATE operations SET status='failed',error='interrupted' WHERE instance_id=? AND status='pending'", (instance_id,))
+            pending = self.db.execute("SELECT 1 FROM operations WHERE instance_id=? AND status='pending'", (instance_id,)).fetchone()
+            if pending and action not in {'stop', 'remove'}:
+                raise StoreError('operation_pending')
+            if pending:
+                self.db.execute("UPDATE operations SET status='failed',error='interrupted' WHERE instance_id=? AND status='pending'", (instance_id,))
+            if instance_id is None:
+                raise StoreError('invalid_action')
             operation_id = uuid.uuid4().hex
             self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?,?,NULL)',
                             (operation_id, actor, payload['idempotency_key'], self._payload(payload), instance_id, action, 'pending'))
+            if action == 'purge':
+                self.db.execute("UPDATE instances SET state='purging' WHERE id=?", (instance_id,))
             return self.lookup(payload)
 
     def pending(self, operation_id):
@@ -170,6 +219,8 @@ class RuntimeStore:
                 raise StoreError('operation_not_found')
             if state == 'removed':
                 self.db.execute("UPDATE instances SET active=0,state='removed',ram=0,cpu=0,container_id=NULL WHERE id=?", (operation['instance_id'],))
+            elif state == 'purged':
+                self.db.execute("UPDATE instances SET active=0,state='purged',ram=0,cpu=0,disk=0,storage=NULL,container_id=NULL WHERE id=?", (operation['instance_id'],))
             else:
                 self.db.execute('UPDATE instances SET state=?,container_id=? WHERE id=? AND active=1', (state, container_id, operation['instance_id']))
             self.db.execute("UPDATE operations SET status='completed',error=NULL WHERE id=?", (operation_id,))

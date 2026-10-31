@@ -2,14 +2,14 @@
 
 ## 1. Главная задача и статус
 
-Основной функциональный сценарий host-runtime из кабинета **пройден на лабораторной Linux-ВМ** по отчёту пользователя для commit `4494d7575b0c7534076684e6d8547477b527a42f`: настоящий OpenClaw → running/healthy → stop/start/restart → remove-retain → новое создание. Свидетельства пользовательские, не собственное выполнение помощника и не полный аудит.
+Базовый сценарий host-runtime из кабинета **пройден на лабораторной Linux-ВМ по отчёту пользователя** для commit `4494d7575b0c7534076684e6d8547477b527a42f`: настоящий OpenClaw → running/healthy → stop/start/restart → remove-retain → новое создание. Текущая локальная ветка содержит последующие изменения; они не развёрнуты и не приняты на ВМ, поэтому текущую стадию 3 не считать закрытой.
 
-Этапы 3–4 функционально приняты в объёме этого сценария. Не объявлять доказанными EDQUOT, прямой API owner isolation, конкуренцию, recovery supervisor или общую невозможность обхода ограничений. Полный актуальный статус и следующий шаг — `docs/ROADMAP.md` и `docs/verification.md`.
+Базовый сценарий из пользовательского отчёта принят для той версии. Не объявлять доказанными EDQUOT, прямую owner isolation на ВМ, конкуренцию, recovery supervisor или общую невозможность обхода ограничений. Текущая локальная версия требует отдельной приёмки; актуальные границы и следующий шаг — `docs/ROADMAP.md` и `docs/verification.md`.
 
 ## 2. Где находится проект
 
 - Локальный корень: `C:/Users/SystemX/Downloads/Диплом/Практика/Вебчик`.
-- Проверенный commit на момент сверки: ветка `main`, HEAD **`4494d7575b0c7534076684e6d8547477b527a42f` — `stage 3 3/3 fix`**; локальный `origin/main` указывал на тот же commit. Сеть заново не опрашивалась.
+- Текущая локальная ветка `main`, HEAD **`25d3afafcfc54c1a29a3d0f618569410c15c5300` — `stage 4 1/4`**, с незакоммиченными изменениями. Локальный ref `origin/main` указывал на этот же commit; сеть не опрашивалась. Пользовательский VM-отчёт относится к более раннему `4494d7575b0c7534076684e6d8547477b527a42f`.
 - Пользовательский отчёт заявляет проверку этого commit на ВМ. Сопоставить отчёт и локальный код; не переносить лабораторные параметры на другой стенд.
 - После получения отчёта актуализируются документы приёмки/roadmap. Проверить текущий `git status/diff`; не публиковать без отдельного разрешения.
 - Доставка согласована: локальный проект → GitHub после разрешения → clone/build на ВМ. На основном Windows-хосте Docker отсутствует; развёртывание туда не переносить.
@@ -28,7 +28,7 @@
 - Один не удалённый экземпляр на владельца, включая остановленный.
 - Порог RAM/средней CPU **50% — единое правило проекта**. В `final` отказ, в `lab` — `would_deny`. Не превращать его в произвольный пользовательский/host override и не распространять автоматически на диск.
 - Метрики CPU: окно 60 секунд, свежесть 10 секунд; swap не добавляется в физическую RAM.
-- Удаление сейчас реализовано только как **remove с сохранением данных**. Purge и повторное подключение retained storage не реализованы; не удалять данные автоматически.
+- Обычный `remove` сохраняет данные. Явный owner-scoped `purge` и повторяемая очистка реализованы в текущей локальной копии и прошли fake-backend проверки; на ВМ не проверялись. Автоматической очистки нет. Retained storage не подключается к новому экземпляру.
 - Модели пока нет. Работа контейнера не означает работающий LLM-чат.
 - Не объявлять проект соответствующим КИИ/ГИС/ИСПДН: нормативные идеи адаптируются, применимость отдельно обосновывается.
 
@@ -74,18 +74,18 @@
 | --- | --- |
 | `control_plane/api.py`, `openwebui.py` | Проверенный upstream actor, draft/revision, lifecycle bridge. Клиент не задаёт actor/image/mounts. |
 | `control_plane/runtime.py` | Ограниченный приватный клиент; credential только на backend, allowlist ответа. |
-| `web/agent/app.js`, `ui-state.mjs`, `index.html` | Кнопки lifecycle, состояние, восстановление pending create и клиентские ключи. |
+| `web/agent/app.js`, `ui-state.mjs`, `index.html` | Кнопки lifecycle, retained datasets, явный purge, состояние и восстановление pending operations. |
 | `supervisor/service.py` | Root Linux service; `/v1/me`, `/v1/actions`, `/v1/replay`; явный запуск с `--enable-host-runtime`. |
 | `supervisor/runtime_store.py` | Новый durable runtime-журнал: owner slot, бюджеты, неизменяемые snapshots, tombstones/retained disk. |
 | `supervisor/metrics.py` | Фоновый сбор /proc/stat, MemTotal/MemAvailable, statvfs, прогрев CPU 60 секунд. |
-| `supervisor/volumes.py` | XFS prepare/verify, private state DB вне тома, уникальные project IDs, проверка дерева/лимитов. |
+| `supervisor/volumes.py` | XFS prepare/verify и явный retryable purge journaled tree; private state DB, project IDs, дерево/лимиты. Purge пока не принимался на ВМ. |
 | `supervisor/docker_engine.py` | Stdlib Docker HTTP Unix socket, API v1.45, immutable local image, проверка фактического контейнера. |
 | `supervisor/seccomp.json`, `SECCOMP_SOURCE.md`, `MOBY_LICENSE`, `MOBY_NOTICE` | Default-deny профиль на базе закреплённого Moby с ограничением ioctl и альтернативных quota setters. |
 | `supervisor/config.py`, `policy.py`, `storage.py`, `probes.py` | Профиль, ресурсная политика, read-only backend preflight, bounded subprocess. |
 | `supervisor/registry.py`, `coordinator.py` | Предшествующее библиотечное ядро. Новый сервис использует RuntimeStore, а не неявно мигрированные старые reservations. |
 | `scripts/configure_supervisor.py` | Явная подготовка root-owned deployment/runtime JSON, фиксация локального image ID. Не запускает службу и не назначает квоты. |
 | `compose.supervisor.yaml` | Opt-in bridge: socket directory + credential read-only. **Без Docker socket в вебе.** |
-| `scripts/smoke_runtime.py` | Один локальный сквозной сценарий с настоящими HTTP/SQLite и fake Docker/XFS/metrics. |
+| `scripts/smoke_runtime.py` | Один локальный сквозной сценарий с настоящими HTTP/SQLite и fake Docker/XFS/metrics, включая retry/replay purge retained-набора. |
 
 Базовый `compose.yaml` остаётся web-only. Без opt-in bridge API честно возвращает runtime_not_connected.
 
@@ -106,8 +106,8 @@
 ### Подтверждено
 
 - Пользователь сообщил о ВМ-приёмке настоящего OpenClaw на commit `4494d7575b0c7534076684e6d8547477b527a42f`: create из кабинета, running/healthy, stop/start/restart, remove-retain, новая instance после remove; 73 supervisor tests OK. Ограничения отчёта — `docs/verification.md`.
-- Локально после последних исправлений прошёл обновлённый `scripts/smoke_runtime.py`: настоящий HTTP/SQLite, fake Docker/XFS/metrics; включает lifecycle, replay после смены draft, отказ stale fresh request, pending-create recovery по исходному snapshot, owner split, paused/restarting, retain и новое создание.
-- Локально прошли `node --check web/agent/app.js`, 4 текущих UI state tests и `git diff --check`. Это не браузерный end-to-end, не реальный AF_UNIX, Docker, OpenClaw или XFS.
+- Локально после текущих изменений прошёл `scripts/smoke_runtime.py`: настоящий HTTP/SQLite, fake Docker/XFS/metrics; lifecycle, replay после смены draft, отказ новому stale request, pending-create recovery по исходному snapshot, owner split, paused/restarting, remove-retain, новое создание, owner-scoped purge с отказом чужому владельцу, retry после синтетического сбоя и exact replay без повторного эффекта.
+- Локально прошли targeted `supervisor.tests.test_runtime_service` (3 теста), два HTTP API regression tests, `node --check web/agent/app.js`, 4 UI state tests, `compileall` и `git diff --check`. Это не браузерный end-to-end, не настоящий AF_UNIX, Docker, OpenClaw или XFS.
 - Временный HTTP server и SQLite из smoke удалены; пользовательские VM-данные не затрагивались.
 
 ### Последнее независимое ручное ревью и внесённые после него правки
@@ -126,7 +126,7 @@
 - EDQUOT при достижении hard limit настоящим экземпляром; report confirms quota assignment/readback, not rejection of writes.
 - Прямой cross-owner запрос к чужому instance/API (report verifies only UI visibility).
 - Конкурентный lifecycle/create и supervisor restart/recovery while managed instance exists; service autostart after reboot.
-- Полный purge/reset project quota, retained storage reattachment и safe retryable cleanup failed create.
+- Явный owner-scoped purge retained dataset и его retry/exact replay прошли локальные fake-backend/synthetic checks; cleanup частично созданного failed-create dataset, настоящий XFS/Docker и ВМ-приёмка не подтверждены. Retained storage reattachment не реализовано.
 - Реальный browser end-to-end для operation-key generation/recovery; локальные JS syntax/UI-state checks не заменяют его.
 - Gateway/browser integration, application of changed draft, LLM/chat, Telegram.
 - Перенос на другую машину и полный security audit.
@@ -146,9 +146,9 @@
 ## 9. Следующие действия — короткий маршрут
 
 1. Пользователь подтвердил sequence rollout: old container удалён retain, DB показала inactive/removed до остановки старого supervisor и запуска нового. Это не означает поддержку active old-seccomp adoption; сохранять эту границу.
-2. Ближайшая рекомендуемая разработка — явный owner-scoped purge вместе с durable recovery failed-create cleanup. Освобождать XFS project/quota и SQLite disk reservation только после подтверждённого удаления данных и quota reset. Retain остаётся безопасным отдельным режимом; не чистить автоматически после ошибки.
-3. Сначала определить состояния/повторы/частичные сбои и изолированный синтетический тест. EDQUOT/purge на ВМ — только отдельное согласие и не на действующих пользовательских данных.
-4. После реализации закрыть оставшиеся прямые API owner checks, конкурентные операции и supervisor recovery одним коротким целевым прогоном. Затем переходить к Gateway/browser integration и применению настроек; LLM/Telegram остаются позже.
+2. Базовый VM-сценарий для `4494d757` принят пользователем; не менять его действующие данные. Текущие локальные изменения после этой версии на ВМ не проверены.
+3. Локально реализован явный `purge` с сохранением резерва до подтверждённого удаления дерева и сброса quota; fake-backend HTTP/SQLite smoke и synthetic XFS purge test прошли. Не запускать purge на ВМ или действующих данных.
+4. Следующий шаг — короткая приёмка текущего кода на Linux-ВМ по `docs/SUPERVISOR_RUN.md`, только после отдельного согласия на публикацию/доставку и привилегированный запуск. Обычная приёмка ограничивается create/lifecycle/remove-retain; purge/EDQUOT — отдельная изолированная проверка с отдельным согласием.
 
 Это рекомендуемый порядок, не разрешение на кодовую миграцию, публикацию, SSH, privileged setup, квоты, системные изменения или удаление данных. Работать в локальной копии, сохраняя пользовательские изменения.
 

@@ -21,6 +21,7 @@ import stat
 import sys
 import threading
 import time
+from typing import Any
 
 from .config import load_profile, _unique_object, _reject_constant
 from .metrics import HostMetrics, MetricsUnavailable
@@ -72,11 +73,18 @@ def actor(value):
 
 
 def validate_action(payload):
-    if type(payload) is not dict or set(payload) != {
-            'actor_id', 'action', 'idempotency_key', 'settings_revision', 'settings'}:
+    common = {'actor_id', 'action', 'idempotency_key', 'settings_revision', 'settings'}
+    if type(payload) is not dict:
+        raise ServiceError('invalid_request', 400)
+    action = payload.get('action')
+    expected = common | {'instance_id'} if action == 'purge' else common
+    if set(payload) != expected:
         raise ServiceError('invalid_request', 400)
     actor(payload['actor_id'])
-    if type(payload['action']) is not str or payload['action'] not in {'create', 'start', 'stop', 'restart', 'remove'}:
+    if type(action) is not str or action not in {'create', 'start', 'stop', 'restart', 'remove', 'purge'}:
+        raise ServiceError('invalid_request', 400)
+    if action == 'purge' and (type(payload['instance_id']) is not str
+            or re.fullmatch(r'[0-9a-f]{32}', payload['instance_id']) is None):
         raise ServiceError('invalid_request', 400)
     key = payload['idempotency_key']
     if type(key) is not str or re.fullmatch(r'[A-Za-z0-9_-]{1,128}', key) is None:
@@ -264,7 +272,9 @@ class RuntimeService:
             gateway = info.get('gateway')
             if gateway in ('connected', 'ready', 'starting', 'not_connected', 'unavailable', 'unknown', 'not_ready'):
                 runtime['gateway'] = gateway
-        result = dict(runtime=runtime, capabilities=dict(provisioning=False, chat=False, telegram=False, metrics=False))
+        result: dict[str, Any] = dict(runtime=runtime,
+            capabilities=dict(provisioning=False, chat=False, telegram=False, metrics=False),
+            retained=self.store.retained(instance['actor']) if instance else [])
         try:
             sample = self._sample()
             result['capabilities']['metrics'] = (sample['cpu_window_seconds'] >= 60
@@ -277,12 +287,17 @@ class RuntimeService:
         except (ServiceError, ValueError):
             pass
         if instance and instance['active']:
-            retry_key = self.store.create_retry(instance['id'])
+            retry_key = (self.store.create_retry(instance['id'])
+                         if instance['state'] in {'preparing', 'failed'} else None)
             if retry_key:
                 # Owner-scoped operation identifier, not a credential. Enables
                 # recovery from another tab/device without changing the snapshot.
                 runtime['pending_create_key'] = retry_key
                 runtime['pending_create_revision'] = instance['revision']
+            purge_retry = self.store.purge_retry(instance['id'])
+            if purge_retry:
+                runtime['pending_purge_key'] = purge_retry['key']
+                runtime['pending_purge_revision'] = purge_retry['revision']
         if operation:
             result['operation'] = {'id': operation['id'], 'status': operation['status']}
         return result
@@ -295,6 +310,7 @@ class RuntimeService:
             instance = self.store.current(owner)
             info = self._inspect(instance['id']) if instance else None
             result = self._view(instance, info=info)
+            result['retained'] = self.store.retained(owner)
             try:
                 sample = self._sample()
                 result['capabilities']['metrics'] = (sample['cpu_window_seconds'] >= 60
@@ -307,23 +323,31 @@ class RuntimeService:
             return result
 
     def replay(self, payload):
-        if type(payload) is not dict or set(payload) != {
-                'actor_id', 'action', 'idempotency_key', 'settings_revision'}:
+        common = {'actor_id', 'action', 'idempotency_key', 'settings_revision'}
+        if type(payload) is not dict:
+            raise ServiceError('invalid_request', 400)
+        action = payload.get('action')
+        expected = common | {'instance_id'} if action == 'purge' else common
+        if set(payload) != expected:
             raise ServiceError('invalid_request', 400)
         owner = actor(payload['actor_id'])
         if (type(payload['action']) is not str
-                or payload['action'] not in {'create', 'start', 'stop', 'restart', 'remove'}
+                or payload['action'] not in {'create', 'start', 'stop', 'restart', 'remove', 'purge'}
                 or type(payload['idempotency_key']) is not str
                 or re.fullmatch(r'[A-Za-z0-9_-]{1,128}', payload['idempotency_key']) is None
                 or type(payload['settings_revision']) is not int
                 or not 0 <= payload['settings_revision'] <= 2**63 - 1):
+            raise ServiceError('invalid_request', 400)
+        if action == 'purge' and (type(payload['instance_id']) is not str
+                or re.fullmatch(r'[0-9a-f]{32}', payload['instance_id']) is None):
             raise ServiceError('invalid_request', 400)
         with self.lock:
             saved = self.store.saved_request(owner, payload['idempotency_key'])
             if saved is None:
                 raise ServiceError('operation_not_found', 404)
             if (saved['action'] != payload['action']
-                    or saved['settings_revision'] != payload['settings_revision']):
+                    or saved['settings_revision'] != payload['settings_revision']
+                    or saved.get('instance_id') != payload.get('instance_id')):
                 raise ServiceError('idempotency_conflict')
             return self.action(saved)
 
@@ -335,12 +359,17 @@ class RuntimeService:
                 previous = self.store.lookup(payload)
                 if previous and previous['status'] == 'completed':
                     instance = self.store.instance(previous['instance_id'])
+                    if previous['action'] == 'purge':
+                        current = self.store.current(payload['actor_id'])
+                        if current is not None:
+                            return self._view(current, previous, self._inspect(current['id']))
                     info = self._inspect(instance['id']) if instance['active'] else None
                     return self._view(instance, previous, info)
                 if previous:
                     instance = self.store.instance(previous['instance_id'])
                     current = self.store.current(payload['actor_id'])
-                    if not instance['active'] or current is None or current['id'] != instance['id']:
+                    if payload['action'] != 'purge' and (
+                            not instance['active'] or current is None or current['id'] != instance['id']):
                         raise ServiceError('instance_retired')
                 if payload['action'] == 'create':
                     self._admit(quota=False, preparing=True)
@@ -387,6 +416,21 @@ class RuntimeService:
                 elif action == 'remove':
                     if not self._absent(info):
                         self.engine.remove(instance_id)
+                elif action == 'purge':
+                    if not self._absent(info):
+                        self.engine.remove(instance_id)
+                    info = self._inspect(instance_id)
+                    if not self._absent(info):
+                        raise ServiceError('runtime_unavailable', 503)
+                    evidence = json.loads(instance['storage']) if instance['storage'] else None
+                    expected_project_id = evidence.get('project_id') if evidence else None
+                    self.volumes.purge(instance_id, instance['disk'], expected_project_id)
+                    self.store.complete(operation['id'], 'purged')
+                    operation['status'] = 'completed'
+                    current = self.store.current(payload['actor_id'])
+                    if current is not None:
+                        return self._view(current, operation, self._inspect(current['id']))
+                    return self._view(self.store.instance(instance_id), operation, info)
                 info = self._inspect(instance_id)
                 if action in {'create', 'start', 'restart'} and info['state'] != 'running':
                     raise ServiceError('runtime_unavailable', 503)

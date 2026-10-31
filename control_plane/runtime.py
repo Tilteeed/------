@@ -101,9 +101,36 @@ class SupervisorClient:
                 'state', 'gateway', 'model', 'telegram', 'instance_id', 'container_id',
                 'settings_revision', 'operation_status', 'error_code', 'retained_data',
                 'pending_create_key', 'pending_create_revision',
+                'pending_purge_key', 'pending_purge_revision',
             ) and type(v) in (str, int, bool, type(None))}
             safe_caps = {k: capabilities.get(k) is True for k in ('provisioning', 'chat', 'telegram', 'metrics')}
-            result = {'runtime': safe_runtime, 'capabilities': safe_caps}
+            retained = data.get('retained', [])
+            if type(retained) is not list or len(retained) > 100:
+                raise ValueError('Invalid retained data list')
+            safe_retained = []
+            for item in retained:
+                if (type(item) is not dict
+                        or type(item.get('instance_id')) is not str
+                        or re.fullmatch(r'[0-9a-f]{32}', item['instance_id']) is None
+                        or type(item.get('name')) is not str or len(item['name']) > 80
+                        or type(item.get('disk_bytes')) is not int
+                        or not 0 < item['disk_bytes'] <= 2**63 - 1
+                        or item.get('state') not in {'removed', 'purging'}):
+                    raise ValueError('Invalid retained data entry')
+                pending_key, pending_revision = item.get('pending_purge_key'), item.get('pending_purge_revision')
+                if pending_key is not None and (type(pending_key) is not str
+                        or re.fullmatch(r'[A-Za-z0-9_-]{1,128}', pending_key) is None):
+                    raise ValueError('Invalid retained operation key')
+                if pending_revision is not None and (type(pending_revision) is not int
+                        or not 0 <= pending_revision <= 2**63 - 1):
+                    raise ValueError('Invalid retained operation revision')
+                safe_retained.append({
+                    'instance_id': item['instance_id'], 'name': item['name'],
+                    'disk_bytes': item['disk_bytes'], 'state': item['state'],
+                    'pending_purge_key': pending_key,
+                    'pending_purge_revision': pending_revision,
+                })
+            result = {'runtime': safe_runtime, 'capabilities': safe_caps, 'retained': safe_retained}
             operation = data.get('operation')
             if type(operation) is dict:
                 result['operation'] = {k: operation[k] for k in ('id', 'status') if type(operation.get(k)) is str}

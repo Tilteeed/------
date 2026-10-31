@@ -73,6 +73,10 @@ input:disabled, textarea:disabled { color: #a5a8b6; background: #13141a; }
 dt { color: var(--muted); }
 dd { margin: 0; text-align: right; color: #c9ccd8; }
 .lifecycle { display: flex; flex-wrap: wrap; gap: 8px; }
+#retained-list { list-style: none; padding: 0; margin: 16px 0 0; }
+#retained-list li { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; border-top: 1px solid var(--border); padding: 12px 0; }
+#retained-list li span { min-width: 0; overflow-wrap: anywhere; }
+#retained-list button { font-size: 12px; }
 .lifecycle button { font-size: 12px; padding: 8px 10px; }
 #lifecycle-help { margin-bottom: 0; }
 .events { grid-column: 1 / -1; }

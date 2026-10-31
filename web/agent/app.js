@@ -40,7 +40,7 @@ function operationSet(key, value) {
 function observeGeneration(runtime) {
   if (!currentUser || ['unavailable', 'not_connected'].includes(runtime.state)) return;
   let generation;
-  if (runtime.state === 'removed' || runtime.instance_id === null) generation = 'none';
+  if (runtime.state === 'removed' || runtime.state === 'purged' || runtime.instance_id === null) generation = 'none';
   else if (typeof runtime.instance_id === 'string' && runtime.instance_id) generation = runtime.instance_id;
   else return; // Missing/ambiguous observations do not prove absence.
   const generationKey = `agent-generation:${currentUser}`;
@@ -61,6 +61,30 @@ function observeGeneration(runtime) {
   operationSet(generationKey, generation);
 }
 
+function renderRetained(items) {
+  const panel = $('retained-panel');
+  const list = $('retained-list');
+  const entries = Array.isArray(items) ? items : [];
+  panel.hidden = entries.length === 0;
+  list.replaceChildren();
+  for (const item of entries) {
+    const row = document.createElement('li');
+    const description = document.createElement('span');
+    const gib = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 })
+      .format(item.disk_bytes / (1024 ** 3));
+    description.textContent = `${item.name} — ${gib} ГиБ; ${item.state === 'purging' ? 'очистка ожидает повтора' : 'данные сохранены'}`;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = item.pending_purge_key ? 'Продолжить удаление' : 'Удалить данные и квоту';
+    button.setAttribute('aria-label', `Полностью удалить данные агента ${item.name}`);
+    button.disabled = !authenticated || busy || dirty || conflict || revision < 1 || !connected;
+    button.addEventListener('click', () => submitAction(button, 'purge', item.instance_id,
+      item.pending_purge_key, item.pending_purge_revision));
+    row.append(description, button);
+    list.append(row);
+  }
+}
+
 function renderRuntime(data) {
   runtimeData = data.runtime || { state: 'unavailable' };
   observeGeneration(runtimeData);
@@ -72,6 +96,7 @@ function renderRuntime(data) {
   $('runtime-description').textContent = view.description;
   $('gateway-state').textContent = runtimeData.gateway === 'ready' ? 'Готов' : 'Не готов / не подтверждён';
   $('metrics-state').textContent = capabilities.metrics ? 'Окно CPU готово' : 'Нет свежих данных / прогрев';
+  renderRetained(data.retained);
   controls();
 }
 
@@ -90,10 +115,12 @@ function controls() {
   $('refresh-events').disabled = !authenticated || busy || eventsBusy;
   for (const button of document.querySelectorAll('[data-action]')) {
     const action = button.dataset.action;
-    const exists = Boolean(runtimeData.instance_id) && runtimeData.state !== 'removed';
+    const exists = Boolean(runtimeData.instance_id) && !['removed', 'purged'].includes(runtimeData.state);
+    const purgePending = Boolean(runtimeData.pending_purge_key);
     const needsAdmission = ['create', 'start', 'restart'].includes(action);
     button.disabled = !authenticated || busy || dirty || conflict || revision < 1 || !connected
       || (needsAdmission && !capabilities.provisioning)
+      || (purgePending && action !== 'purge')
       || (action === 'create' ? (exists && !runtimeData.pending_create_key) : !exists)
       || (action === 'start' && runtimeData.state === 'running')
       || (action === 'stop' && runtimeData.state === 'stopped');
@@ -101,6 +128,13 @@ function controls() {
       button.textContent = runtimeData.pending_create_key ? 'Продолжить создание' : 'Создать';
       button.title = runtimeData.pending_create_key ? `Будет использован исходный снимок настроек версии ${runtimeData.pending_create_revision}` : '';
     }
+    if (action === 'purge') {
+      button.textContent = runtimeData.pending_purge_key ? 'Продолжить удаление данных' : 'Удалить данные и квоту';
+      button.title = runtimeData.pending_purge_key ? `Будет повторена операция версии ${runtimeData.pending_purge_revision}` : '';
+    }
+  }
+  for (const button of document.querySelectorAll('#retained-list button')) {
+    button.disabled = !authenticated || busy || dirty || conflict || revision < 1 || !connected;
   }
   $('main').setAttribute('aria-busy', String(busy));
   $('save').textContent = busy ? 'Подождите…' : 'Сохранить настройки';
@@ -120,6 +154,7 @@ function revoke() {
   $('revision').textContent = 'Версия не загружена';
   $('events-list').replaceChildren();
   $('events-status').textContent = 'События недоступны без подтверждённого доступа.';
+  renderRetained([]);
   renderRuntime({ runtime: { state: 'not_connected' } });
   $('runtime-description').textContent = 'Доступ не подтверждён. Состояние экземпляра не загружено.';
 }
@@ -261,43 +296,69 @@ $('settings-form').addEventListener('submit', async (event) => {
   } catch (error) { if (epoch === identityEpoch) showError(error); }
   finally { busy = false; controls(); }
 });
-for (const button of document.querySelectorAll('[data-action]')) {
-  button.addEventListener('click', async () => {
-    if (button.disabled || busy || !authenticated) return;
-    const action = button.dataset.action;
-    if (action === 'remove' && !window.confirm('Удалить контейнер? Данные будут сохранены. Для следующего экземпляра потребуется дополнительный дисковый бюджет.')) return;
-    const epoch = identityEpoch;
-    const resuming = action === 'create' && typeof runtimeData.pending_create_key === 'string'
-      && Number.isSafeInteger(runtimeData.pending_create_revision) && runtimeData.pending_create_revision > 0;
-    const requestRevision = resuming ? runtimeData.pending_create_revision : revision;
-    const storageKey = `agent-operation:${currentUser}:${requestRevision}:${action}`;
-    let key = resuming ? runtimeData.pending_create_key : operationGet(storageKey);
-    if (!key) {
-      const bytes = crypto.getRandomValues(new Uint8Array(16));
-      key = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
-      operationSet(storageKey, key);
+async function submitAction(button, action, targetInstanceId = null, savedPurgeKey = null, savedPurgeRevision = null) {
+  if (button.disabled || busy || !authenticated) return;
+  if (action === 'remove' && !window.confirm('Удалить контейнер? Данные будут сохранены. Для следующего экземпляра потребуется дополнительный дисковый бюджет.')) return;
+  if (action === 'purge' && !window.confirm('Безвозвратно удалить контейнер и все его сохранённые данные, затем освободить дисковую квоту? Это действие нельзя отменить.')) return;
+  const epoch = identityEpoch;
+  if (action === 'purge' && !targetInstanceId) targetInstanceId = runtimeData.instance_id;
+  const currentPurge = action === 'purge' && targetInstanceId === runtimeData.instance_id;
+  const pendingKey = action === 'create' ? runtimeData.pending_create_key
+    : (currentPurge ? runtimeData.pending_purge_key : savedPurgeKey);
+  const pendingRevision = action === 'create' ? runtimeData.pending_create_revision
+    : (currentPurge ? runtimeData.pending_purge_revision : savedPurgeRevision);
+  const resuming = ['create', 'purge'].includes(action) && typeof pendingKey === 'string'
+    && Number.isSafeInteger(pendingRevision) && pendingRevision > 0;
+  const requestRevision = resuming ? pendingRevision : revision;
+  const targetSuffix = targetInstanceId ? `:${targetInstanceId}` : '';
+  const storageKey = `agent-operation:${currentUser}:${requestRevision}:${action}${targetSuffix}`;
+  let key = resuming ? pendingKey : operationGet(storageKey);
+  if (!key) {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    key = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+    operationSet(storageKey, key);
+  }
+  busy = true;
+  controls();
+  button.disabled = true;
+  notice('loading', 'Supervisor выполняет операцию. Не закрывайте страницу…');
+  try {
+    const payload = { action, idempotency_key: key, settings_revision: requestRevision };
+    if (action === 'purge') payload.instance_id = targetInstanceId || runtimeData.instance_id;
+    const data = await request('/actions', 'POST', payload);
+    if (epoch !== identityEpoch) return;
+    renderRuntime(data);
+    // Failed/ambiguous requests retain the same key so a retry cannot duplicate effects.
+    if (data.operation?.status === 'succeeded' || data.operation?.status === 'completed') {
+      operationSet(storageKey, null);
     }
-    busy = true;
-    controls();
-    notice('loading', 'Supervisor выполняет операцию. Не закрывайте страницу…');
-    try {
-      const data = await request('/actions', 'POST', { action, idempotency_key: key, settings_revision: requestRevision });
-      if (epoch !== identityEpoch) return;
-      renderRuntime(data);
-      // Failed/ambiguous requests retain the same key so a retry cannot duplicate effects.
-      if (data.operation?.status === 'succeeded' || data.operation?.status === 'completed') {
+    notice('saved', 'Ответ supervisor получен. Состояние контейнера показано справа.');
+  } catch (error) {
+    if (epoch === identityEpoch) {
+      if (error.body?.detail?.code === 'instance_retired') {
         operationSet(storageKey, null);
+        notice('error', 'Операция относится к удалённому экземпляру. Обновите состояние и повторите действие.');
+      } else {
+        showError(error);
+        if (error.status === 503) {
+          try {
+            const latest = await request();
+            if (epoch === identityEpoch) renderRuntime(latest);
+          } catch { /* Keep the original operation error visible if refresh also fails. */ }
+        }
       }
-      notice('saved', 'Ответ supervisor получен. Состояние контейнера показано справа.');
-    } catch (error) {
-      if (epoch === identityEpoch) {
-        if (error.body?.detail?.code === 'instance_retired') {
-          operationSet(storageKey, null);
-          notice('error', 'Операция относится к удалённому экземпляру. Обновите состояние и нажмите «Создать» снова.');
-        } else showError(error);
-      }
-    } finally { busy = false; controls(); }
-  });
+    }
+  } finally {
+    busy = false;
+    controls();
+    if (button.isConnected && !button.matches('[data-action]')) {
+      button.disabled = !authenticated || dirty || conflict || revision < 1 || !connected;
+    }
+  }
+}
+
+for (const button of document.querySelectorAll('[data-action]')) {
+  button.addEventListener('click', () => submitAction(button, button.dataset.action));
 }
 $('refresh-runtime').addEventListener('click', async () => {
   if (!authenticated || busy) return;

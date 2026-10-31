@@ -4,7 +4,7 @@
 
 ## Границы этой версии
 
-Это веб-часть Open WebUI с дополнительной страницей `/agent`, серверной проверкой личности и SQLite-хранилищем настроек. В актуальной версии дополнительно реализован opt-in host-supervisor: при отдельном запуске привилегированного компонента и включённом Compose bridge кабинет управляет реальным OpenClaw lifecycle. На ВМ функциональный сценарий create/health/stop/start/restart/remove-retain принят по пользовательскому отчёту для commit `4494d757`; см. `docs/verification.md`. Веб-only режим без override остаётся доступным. Gateway/chat, применение последующих draft changes, Telegram, LLM и purge не подключены.
+Это веб-часть Open WebUI с дополнительной страницей `/agent`, серверной проверкой личности и SQLite-хранилищем настроек. Базовый opt-in host-supervisor и lifecycle create/health/stop/start/restart/remove-retain приняты пользователем на ВМ для commit `4494d757`; см. `docs/verification.md`. Текущий локальный код добавляет отдельный purge, но он не включён в указанную VM-приёмку и не подтверждён на реальном XFS. Веб-only режим без override остаётся доступным. Gateway/chat, применение последующих draft changes, Telegram и LLM не подключены.
 
 Веб-базис и отдельный лабораторный OpenClaw были приняты пользователем ранее; последующий персональный host-runtime также прошёл основной functional scenario на лабораторной ВМ по отчёту для commit `4494d7575b0c7534076684e6d8547477b527a42f`. Это не подтверждает перенос на новую машину, EDQUOT, полный API isolation или production readiness. Если сборка на новом стенде остановится на upstream-check — не отключайте его; выясните отличие образа от закреплённого исходника.
 

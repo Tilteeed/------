@@ -1,6 +1,7 @@
 """FastAPI routes hosted by Open WebUI, not a replacement authentication system."""
 
 import json
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from starlette.concurrency import run_in_threadpool
@@ -101,16 +102,21 @@ def create_router(verified_user, store, *, public_origin: str | None = None, run
     async def lifecycle_action(request: Request, response: Response, user=Depends(actor)):
         response.headers["Cache-Control"] = "no-store"
         payload = await mutation_body(request)
-        allowed_actions = {"create", "start", "stop", "restart", "remove"}
+        allowed_actions = {'create', 'start', 'stop', 'restart', 'remove', 'purge'}
         if runtime is not None:
+            base_keys = {'action', 'idempotency_key', 'settings_revision'}
+            action = payload.get('action') if type(payload) is dict else None
+            expected_keys = base_keys | {'instance_id'} if action == 'purge' else base_keys
             if (type(payload) is not dict
-                    or set(payload) != {"action", "idempotency_key", "settings_revision"}
-                    or type(payload["action"]) is not str or payload["action"] not in allowed_actions
-                    or type(payload["idempotency_key"]) is not str
-                    or not 1 <= len(payload["idempotency_key"]) <= 128
-                    or any(not (c.isascii() and (c.isalnum() or c in "_-")) for c in payload["idempotency_key"])
-                    or type(payload["settings_revision"]) is not int
-                    or not 1 <= payload["settings_revision"] <= 2**53 - 1):
+                    or set(payload) != expected_keys
+                    or type(payload['action']) is not str or payload['action'] not in allowed_actions
+                    or type(payload['idempotency_key']) is not str
+                    or not 1 <= len(payload['idempotency_key']) <= 128
+                    or any(not (c.isascii() and (c.isalnum() or c in '_-')) for c in payload['idempotency_key'])
+                    or type(payload['settings_revision']) is not int
+                    or not 1 <= payload['settings_revision'] <= 2**53 - 1
+                    or (action == 'purge' and (type(payload['instance_id']) is not str
+                        or re.fullmatch(r'[0-9a-f]{32}', payload['instance_id']) is None))):
                 raise HTTPException(400, "Supported action, idempotency_key and saved settings_revision required")
             try:
                 try:
