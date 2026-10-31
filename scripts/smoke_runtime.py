@@ -81,13 +81,20 @@ def main():
                          expected_uuid='11111111-2222-4333-8444-555555555555'),
             agent_limits=dict(ram_bytes=2 * 1024**3, cpu_millicores=1000, pids_limit=256, disk_bytes=10 * 1024**3)))
         config = dict(state_dir=str(folder), image='sha256:' + 'a' * 64,
-                      capacity_ram_bytes=2 * 1024**3, capacity_cpu_millicores=1000,
-                      capacity_disk_bytes=10 * 1024**3, disk_floor_bytes=1024**3)
+                      capacity_ram_bytes=8 * 1024**3, capacity_cpu_millicores=4000,
+                      capacity_disk_bytes=40 * 1024**3, disk_floor_bytes=1024**3)
         fingerprint = hashlib.sha256(canonical(asdict(profile)).encode('ascii')).hexdigest()
         store = RuntimeStore(folder / 'runtime.sqlite3', profile.profile_version, fingerprint)
         engine, volumes = FakeEngine(), FakeVolumes()
+        initialization_attempts = []
+        def initialize(instance, _evidence):
+            import json
+            settings = json.loads(instance['settings'])
+            initialization_attempts.append(settings)
+            if len(initialization_attempts) == 1:
+                raise RuntimeError('synthetic interrupted initialization')
         controller = RuntimeApplication(config, profile, store, volumes, engine, FakeMetrics(),
-                                        clock=lambda: 100.0, initialize=lambda *_: None)
+                                        clock=lambda: 100.0, initialize=initialize)
         token = 'synthetic_smoke_credential_' + 'x' * 40
         (folder / 'token').write_text(token, encoding='ascii')
         server = HTTPServer(('127.0.0.1', 0), create_handler(controller, token))
@@ -104,40 +111,73 @@ def main():
             alice, bob = {'Authorization': 'Bearer smoke-alice'}, {'Authorization': 'Bearer smoke-bob'}
             with patch('control_plane.runtime.UnixConnection', TestTransport), TestClient(app) as web:
                 assert web.get(base).status_code == 401
-                for headers in (alice, bob):
-                    result = web.put(base + '/settings', headers=headers, json=dict(
-                        settings=dict(name='Smoke agent', instructions='Synthetic integration instructions'), revision=0))
-                    assert result.status_code == 200, result.text
-                def action(name, key, headers=alice):
+                saved = web.put(base + '/settings', headers=alice, json=dict(
+                    settings=dict(name='Original snapshot', instructions='Original instructions'), revision=0))
+                assert saved.status_code == 200, saved.text
+                bob_saved = web.put(base + '/settings', headers=bob, json=dict(
+                    settings=dict(name='Bob agent', instructions='Bob instructions'), revision=0))
+                assert bob_saved.status_code == 200, bob_saved.text
+                def action(name, key, headers=alice, settings_revision=1):
                     return web.post(base + '/actions', headers=headers, json=dict(
-                        action=name, idempotency_key=key, settings_revision=1))
-                created = action('create', 'create-1')
+                        action=name, idempotency_key=key, settings_revision=settings_revision))
+                failed = action('create', 'create-1')
+                assert failed.status_code == 503, failed.text
+                pending = web.get(base, headers=alice).json()['runtime']
+                assert pending['state'] == 'failed'
+                assert pending['pending_create_key'] == 'create-1'
+                assert pending['pending_create_revision'] == 1
+                changed = web.put(base + '/settings', headers=alice, json=dict(
+                    settings=dict(name='Newer draft', instructions='Changed after pending create'), revision=1))
+                assert changed.status_code == 200 and changed.json()['draft']['revision'] == 2
+                stale = web.post(base + '/actions', headers=alice, json=dict(
+                    action='create', idempotency_key='stale-new-key', settings_revision=1))
+                assert stale.status_code == 409 and stale.json()['detail']['code'] == 'revision_conflict'
+                resumed = web.post(base + '/actions', headers=alice, json=dict(
+                    action='create', idempotency_key=pending['pending_create_key'], settings_revision=pending['pending_create_revision']))
+                created = resumed
                 assert created.status_code == 200, created.text
                 data = created.json()
                 identifier = data['runtime']['instance_id']
                 assert data['runtime']['state'] == 'running'
                 assert data['capabilities']['provisioning'], 'An existing instance must not reserve a second slot to start'
+                assert initialization_attempts == [
+                    {'name': 'Original snapshot', 'instructions': 'Original instructions'},
+                    {'name': 'Original snapshot', 'instructions': 'Original instructions'},
+                ], 'Recovery must resume using the immutable original settings snapshot'
                 foreign = web.get(base, headers=bob).json()
                 assert foreign['runtime']['instance_id'] is None and identifier not in str(foreign)
                 injected = web.post(base + '/actions', headers=bob, json=dict(
                     action='stop', idempotency_key='spoof-1', settings_revision=1, actor_id='alice'))
                 assert injected.status_code == 400
-                assert action('stop', 'stop-1').json()['runtime']['state'] == 'stopped'
+                assert action('stop', 'stop-1', settings_revision=2).json()['runtime']['state'] == 'stopped'
                 replay = action('create', 'create-1')
                 assert replay.status_code == 200, replay.text
                 assert replay.json()['runtime']['state'] == 'stopped', 'Replay must inspect actual state, not stale running'
                 assert engine.creates == 1
-                assert action('start', 'start-1').json()['runtime']['state'] == 'running'
-                assert action('restart', 'restart-1').json()['runtime']['state'] == 'running'
+                assert action('start', 'start-1', settings_revision=2).json()['runtime']['state'] == 'running'
+                assert action('restart', 'restart-1', settings_revision=2).json()['runtime']['state'] == 'running'
+                engine.containers[identifier]['state'] = 'paused'
+                assert web.get(base, headers=alice).json()['runtime']['state'] == 'paused'
+                engine.containers[identifier]['state'] = 'restarting'
+                assert web.get(base, headers=alice).json()['runtime']['state'] == 'restarting'
+                engine.containers[identifier]['state'] = 'running'
+                bob_create = web.post(base + '/actions', headers=bob, json=dict(
+                    action='create', idempotency_key='bob-create-1', settings_revision=1))
+                assert bob_create.status_code == 200, bob_create.text
+                bob_id = bob_create.json()['runtime']['instance_id']
+                assert bob_id != identifier and engine.creates == 2
                 volumes.verified = False
                 controller.reconcile()
                 assert engine.inspect(identifier)['state'] == 'stopped', 'Unverified storage must not leave an adopted runtime running'
                 volumes.verified = True
-                assert action('remove', 'remove-1').json()['runtime']['state'] == 'removed'
-                assert store.totals() == (0, 0, profile.agent_limits.disk_bytes), 'Retained disk must remain reserved'
-                denied = action('create', 'create-2', bob)
-                assert denied.status_code == 503 and denied.json()['detail']['code'] == 'capacity_exhausted'
-                assert engine.creates == 1
+                assert action('remove', 'remove-1', settings_revision=2).json()['runtime']['state'] == 'removed'
+                assert store.totals() == (profile.agent_limits.ram_bytes, profile.agent_limits.cpu_millicores,
+                                          2 * profile.agent_limits.disk_bytes), 'Retained disk must remain reserved'
+                recreated = web.post(base + '/actions', headers=alice, json=dict(
+                    action='create', idempotency_key='create-after-remove', settings_revision=2))
+                assert recreated.status_code == 200, recreated.text
+                assert recreated.json()['runtime']['instance_id'] not in {identifier, bob_id}
+                assert engine.creates == 3
                 assert token not in str(data) and 'gateway_token' not in str(data)
             unauth = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=5)
             try:
@@ -147,7 +187,7 @@ def main():
                 response.read()
             finally:
                 unauth.close()
-            print('PASS: web -> private HTTP -> durable SQLite lifecycle, replay, owner isolation and retained budget.')
+            print('PASS: lifecycle, replay after draft revision, stale-key rejection, pending-create recovery, owner isolation, paused/restarting state, remove-retain and fresh create.')
             print('Scope: FAKE Docker/XFS/metrics, real HTTP and SQLite. Linux AF_UNIX, Docker image and XFS enforcement NOT verified.')
         finally:
             server.shutdown()

@@ -849,6 +849,19 @@
       "args": [
         {
           "index": 1,
+          "value": 21520,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "ioctl"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 1,
           "value": 21523,
           "op": "SCMP_CMP_EQ"
         }
