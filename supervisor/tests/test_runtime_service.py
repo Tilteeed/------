@@ -57,6 +57,14 @@ class ServiceWorkflowSmoke(unittest.TestCase):
                 return self.verify(instance_id, disk_bytes)
             def verify(self, instance_id, disk_bytes):
                 return dict(host_path=str(Path(tmp) / instance_id), project_id=1, disk_quota_verified=self.valid)
+            def purge(self, instance_id, disk_bytes, expected_project_id=None):
+                self.purge_calls += 1
+                if self.purge_calls == 1:
+                    raise OSError('synthetic incomplete purge')
+                self.purged = True
+                return dict(purged=True, project_id=expected_project_id or 1)
+            purge_calls = 0
+            purged = False
 
         class Engine:
             calls = []
@@ -97,6 +105,20 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             replay = service.action(payload)
             self.assertEqual(replay['runtime']['state'], 'removed')
             self.assertEqual(len(engine.calls), 2)
+            purge = dict(payload, action='purge', idempotency_key='purge-1', instance_id=instance_id)
+            with self.assertRaises(ServiceError):
+                service.action(purge)
+            self.assertEqual(store.totals(), (0, 0, profile.agent_limits.disk_bytes),
+                             'A failed purge must keep the retained disk reservation')
+            self.assertFalse(volumes.purged)
+            result = service.action(purge)
+            self.assertEqual(result['runtime']['state'], 'purged')
+            self.assertEqual(store.totals(), (0, 0, 0), 'Release disk only after storage purge succeeds')
+            self.assertTrue(volumes.purged)
+            calls_after_success = volumes.purge_calls
+            replay = service.action(purge)
+            self.assertEqual(replay['runtime']['state'], 'purged')
+            self.assertEqual(volumes.purge_calls, calls_after_success, 'Exact replay must not repeat purge effects')
             store.close()
 
 
