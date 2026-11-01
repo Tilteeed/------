@@ -3,7 +3,7 @@
 ## Локальная проверка текущих изменений
 
 - `python scripts/smoke_runtime.py`: PASS после текущего кода. Реальные HTTP/SQLite; fake Docker/XFS/metrics. Покрыты lifecycle, replay после новой draft revision, stale rejection, pending-create recovery, owner separation, paused/restarting, remove-retain, новое создание и purge retry/replay.
-- `python -m unittest supervisor.tests.test_runtime_service -v`: 6 тестов, OK. Включают временный SQLite-файл с `mode=ro`/`mode=rw` без создания, сбой после частичного удаления дерева и recovery, очистку runtime snapshot/token/create payload, WAL-checkpoint gating и replay tombstone.
+- `python -m unittest supervisor.tests.test_runtime_service -v`: 6 тестов, OK. Включают временный SQLite-файл с `mode=ro`/`mode=rw` без создания, create→start→stop→remove→purge с разными инструкциями, scrub payload всех операций, частичный purge/retry, WAL-checkpoint gating и retry по redacted purge metadata.
 - `python -m unittest tests.test_api -v`: 8 тестов, OK.
 - `node --check web/agent/app.js` и `node --test tests/ui-state.test.mjs`: 4 теста, OK; не браузерный execution test.
 - `python -m compileall -q supervisor control_plane scripts` и `git diff --check`: OK.
@@ -72,7 +72,7 @@ HTTP-тесты используют тестовую dependency личност�
 - Пользовательский ВМ-отчёт проверял второго владельца только на отображение в UI; локальный fake HTTP/SQLite smoke дополнительно подтвердил отказ чужому purge до вызова storage. Прямой cross-owner API при настоящем Docker/XFS/ВМ не проверялся.
 - Не проверены одновременное создание несколькими владельцами, конкурентные lifecycle-запросы и восстановление supervisor при уже работающем управляемом экземпляре.
 - Автозапуск supervisor после reboot не настроен.
-- Текущий локальный purge owner-scoped и journaled. Storage DB открывается на запись только явным `mode=rw` без создания, обход дерева привязан к directory FDs и проверяет inode/device/mount ID, instance snapshot/token/create payload scrub-ятся, а disk reservation остаётся до успешного WAL checkpoint.
+- Текущий локальный purge owner-scoped и journaled. Storage DB открывается на запись только явным `mode=rw` без создания, обход дерева привязан к directory FDs и проверяет inode/device/mount ID, instance snapshot/token и payload всех операций scrub-ятся, а disk reservation остаётся до успешного WAL checkpoint; retry после scrub использует минимальные purge metadata.
 - Это подтверждено локальными temp-SQLite и syscall-mock тестами. Настоящий Linux `/proc/fdinfo`/dirfd, XFS project quota, Docker removal и фактическое VM purge не запускались; secure forensic erase от SSD не гарантируется.
 - Cleanup после failed create с отсутствующим/неполным XFS journal и reattachment retained dataset отдельно не принимались; автоматической очистки нет.
 - Gateway в кабинет, применение обновлённых настроек, LLM/chat и Telegram не подключены.

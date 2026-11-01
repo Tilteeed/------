@@ -106,14 +106,27 @@ class ServiceWorkflowSmoke(unittest.TestCase):
                                        'idempotency_key': 'key', 'settings_revision': 0})
             self.assertEqual(replayed['runtime']['state'], 'running')
             self.assertEqual(len(engine.calls), calls_before_replay)
-            service.action(dict(payload, action='remove', idempotency_key='remove'))
+            action_payloads: list[dict] = [payload]
+            for action, key, instructions in (
+                    ('start', 'start-1', 'START_PRIVATE_INSTRUCTIONS'),
+                    ('stop', 'stop-1', 'STOP_PRIVATE_INSTRUCTIONS')):
+                request = dict(payload, action=action, idempotency_key=key,
+                               settings={'name': 'Agent', 'instructions': instructions})
+                service.action(request)
+                action_payloads.append(request)
+            remove_request = dict(payload, action='remove', idempotency_key='remove',
+                                  settings={'name': 'Agent', 'instructions': 'REMOVE_PRIVATE_INSTRUCTIONS'})
+            service.action(remove_request)
+            action_payloads.append(remove_request)
             self.assertEqual(store.totals(), (0, 0, profile.agent_limits.disk_bytes))
             self.assertEqual([item['instance_id'] for item in store.retained('alice')], [instance_id])
             self.assertEqual(store.retained('bob'), [])
             replay = service.action(payload)
             self.assertEqual(replay['runtime']['state'], 'removed')
             self.assertEqual(len(engine.calls), 2)
-            purge = dict(payload, action='purge', idempotency_key='purge-1', instance_id=instance_id)
+            purge = dict(payload, action='purge', idempotency_key='purge-1', instance_id=instance_id,
+                         settings={'name': 'Agent', 'instructions': 'PURGE_PRIVATE_INSTRUCTIONS'})
+            action_payloads.append(purge)
             foreign_purge = dict(purge, actor_id='bob', idempotency_key='foreign-purge')
             with self.assertRaises(ServiceError) as foreign_error:
                 service.action(foreign_purge)
@@ -147,8 +160,10 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             self.assertEqual(store.totals(), (0, 0, profile.agent_limits.disk_bytes),
                              'Do not release reservation before SQLite scrub is checkpointed')
             self.assertTrue(volumes.purged)
+            self.assertEqual(store.purge_retry(instance_id), {'key': 'purge-1', 'revision': 0})
+            self.assertEqual(store.retained('alice')[0]['pending_purge_key'], 'purge-1')
 
-            result = service.action(purge)
+            result = service.replay({key: value for key, value in purge.items() if key != 'settings'})
             self.assertEqual(result['runtime']['state'], 'purged')
             self.assertEqual(store.totals(), (0, 0, 0), 'Release disk only after storage purge succeeds')
             self.assertTrue(volumes.purged)
@@ -156,10 +171,18 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             self.assertEqual(purged_instance['settings'], '{}')
             self.assertEqual(purged_instance['gateway_token'], '')
             self.assertIsNone(store.saved_request('alice', 'key'))
-            create_payloads = [row['payload'] for row in store.db.execute(
-                "SELECT payload FROM operations WHERE instance_id=? AND action='create'", (instance_id,))]
-            self.assertNotIn('Hello', ''.join(create_payloads))
-            redacted_record = json.loads(create_payloads[0])
+            operation_rows = list(store.db.execute(
+                "SELECT action,payload FROM operations WHERE instance_id=? ORDER BY rowid", (instance_id,)))
+            self.assertEqual([row['action'] for row in operation_rows],
+                             ['create', 'start', 'stop', 'remove', 'purge'])
+            self.assertEqual(len(action_payloads), len(operation_rows))
+            for row, request in zip(operation_rows, action_payloads):
+                instruction = request['settings']['instructions']
+                self.assertNotIn(instruction, row['payload'], row['action'] + ' payload retained instructions')
+                self.assertEqual(json.loads(row['payload']), {'redacted': True, 'replay': {
+                    'action': request['action'], 'settings_revision': 0,
+                    'instance_id': request.get('instance_id')}})
+            redacted_record = json.loads(operation_rows[0]['payload'])
             self.assertEqual(redacted_record, {'redacted': True,
                 'replay': {'action': 'create', 'settings_revision': 0, 'instance_id': None}})
             replayed_create = service.replay({key: value for key, value in payload.items()

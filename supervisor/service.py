@@ -361,7 +361,16 @@ class RuntimeService:
                 return self._view(instance, previous, None)
             saved = self.store.saved_request(owner, payload['idempotency_key'])
             if saved is None:
-                raise ServiceError('operation_not_found', 404)
+                if (payload['action'] != 'purge' or previous['action'] != 'purge'
+                        or instance['state'] != 'purging'):
+                    raise ServiceError('operation_not_found', 404)
+                # A scrubbed pending purge no longer has its original payload.
+                # Reconstruct only fields consumed by purge; no user settings return.
+                saved = {'actor_id': owner, 'action': 'purge',
+                         'idempotency_key': payload['idempotency_key'],
+                         'settings_revision': payload['settings_revision'],
+                         'instance_id': payload['instance_id'],
+                         'settings': {'name': 'Agent', 'instructions': ''}}
             return self.action(saved)
 
     def action(self, payload):

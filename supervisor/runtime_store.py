@@ -75,8 +75,17 @@ class RuntimeStore:
         with self.lock:
             row = self.db.execute('SELECT * FROM operations WHERE actor=? AND key=?',
                                   (payload['actor_id'], payload['idempotency_key'])).fetchone()
-            if row and row['payload'] != self._payload(payload):
-                raise StoreError('idempotency_conflict')
+            if row:
+                saved = json.loads(row['payload'])
+                if type(saved) is dict and saved.get('redacted') is True:
+                    replay = saved.get('replay')
+                    matches_purge = (type(replay) is dict and replay.get('action') == 'purge'
+                                     and replay.get('settings_revision') == payload['settings_revision']
+                                     and replay.get('instance_id') == payload.get('instance_id'))
+                    if not matches_purge:
+                        raise StoreError('idempotency_conflict')
+                elif row['payload'] != self._payload(payload):
+                    raise StoreError('idempotency_conflict')
             return dict(row) if row else None
 
     def operation(self, actor, key):
@@ -86,7 +95,7 @@ class RuntimeStore:
             return dict(row) if row else None
 
     def request_metadata(self, actor, key):
-        """Minimal replay fields remain available after a create snapshot is scrubbed."""
+        """Minimal replay fields survive purge scrubbing of an operation payload."""
         with self.lock:
             row = self.db.execute('SELECT payload FROM operations WHERE actor=? AND key=?',
                                   (actor, key)).fetchone()
@@ -145,8 +154,23 @@ class RuntimeStore:
                 "AND status IN ('pending','failed') ORDER BY rowid DESC LIMIT 1", (instance_id,)).fetchone()
             if row is None:
                 return None
-            request = json.loads(row['payload'])['request']
-            return {'key': row['key'], 'revision': request['settings_revision']}
+            saved = json.loads(row['payload'])
+            request = saved.get('request') if type(saved) is dict else None
+            if type(request) is dict:
+                action = request.get('action')
+                revision = request.get('settings_revision')
+                target = request.get('instance_id')
+            else:
+                replay = saved.get('replay') if type(saved) is dict else None
+                if type(saved) is not dict or saved.get('redacted') is not True or type(replay) is not dict:
+                    raise StoreError('invalid_transition')
+                action = replay.get('action')
+                revision = replay.get('settings_revision')
+                target = replay.get('instance_id')
+            if (action != 'purge' or target != instance_id
+                    or type(revision) is not int or not 0 <= revision <= 2**63 - 1):
+                raise StoreError('invalid_transition')
+            return {'key': row['key'], 'revision': revision}
 
     def current(self, actor):
         with self.lock:
@@ -254,7 +278,7 @@ class RuntimeStore:
                     self.db.execute("UPDATE instances SET settings='{}',gateway_token='',storage=NULL,container_id=NULL WHERE id=?",
                                     (instance_id,))
                     rows = self.db.execute(
-                        "SELECT id,payload FROM operations WHERE instance_id=? AND action='create'",
+                        'SELECT id,payload FROM operations WHERE instance_id=?',
                         (instance_id,)).fetchall()
                     for row in rows:
                         original = json.loads(row['payload'])

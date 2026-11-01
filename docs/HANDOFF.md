@@ -125,7 +125,7 @@
 
 - `XfsVolumes.purge` теперь открывает существующую SQLite на запись через отдельный `mode=rw` без создания базы; обычный verify остаётся `mode=ro`. Тест использует настоящий временный SQLite-файл и проверяет, что отсутствующая БД не создаётся.
 - Рекурсивное удаление на Linux использует directory descriptors, `O_NOFOLLOW`, inode/device и mount-ID checks; синтетический тест проверяет запрет обхода при подмене каталога. Реальные Linux dirfd/XFS syscall ещё не исполнены на этом Windows-хосте.
-- Перед освобождением RuntimeStore disk reservation очищаются runtime settings, gateway token и create-payload; остаётся минимальная replay-запись. WAL checkpoint обязателен, иначе reservation сохраняется для повтора. Draft в пользовательском кабинете намеренно остаётся.
+- Перед освобождением RuntimeStore disk reservation очищаются runtime settings, gateway token и payload всех операций экземпляра (create/start/stop/restart/remove/purge); остаётся только минимальная replay-запись. WAL checkpoint обязателен, иначе reservation сохраняется и retry восстанавливается по метаданным purge. Draft в пользовательском кабинете намеренно остаётся.
 - Локальные unit/HTTP-smoke проходят с fake quota/xattrs; это не проверка настоящего XFS, физического forensic erase или VM rollout.
 
 ### Не выполнено / не подтверждено
@@ -154,7 +154,7 @@
 
 1. Пользователь подтвердил sequence rollout: old container удалён retain, DB показала inactive/removed до остановки старого supervisor и запуска нового. Это не означает поддержку active old-seccomp adoption; сохранять эту границу.
 2. Базовый VM-сценарий для `4494d757` принят пользователем; не менять его действующие данные. Текущие локальные изменения после этой версии на ВМ не проверены.
-3. Локально исправлен owner-scoped `purge`: writable-no-create storage SQLite, descriptor-relative traversal, runtime snapshot/token/create-payload scrub и WAL checkpoint до release. Targeted HTTP/SQLite smoke и 6 runtime tests прошли; quota/xattrs и Linux FD syscalls остаются имитацией. Не запускать purge на ВМ или действующих данных.
+3. Локально исправлен owner-scoped `purge`: writable-no-create storage SQLite, descriptor-relative traversal, runtime snapshot/token и все instance operation payloads scrub-ятся до освобождения резерва. Retry после scrub-checkpoint failure сохраняет минимальный purge metadata/key. Targeted HTTP/SQLite smoke и runtime tests прошли; quota/xattrs и Linux FD syscalls остаются имитацией. Не запускать purge на ВМ или действующих данных.
 4. Следующий шаг — короткая приёмка текущего кода на Linux-ВМ по `docs/SUPERVISOR_RUN.md`, только после отдельного согласия на публикацию/доставку и привилегированный запуск. Обычная приёмка ограничивается create/lifecycle/remove-retain; purge/EDQUOT — отдельная изолированная проверка с отдельным согласием.
 
 Это рекомендуемый порядок, не разрешение на кодовую миграцию, публикацию, SSH, privileged setup, квоты, системные изменения или удаление данных. Работать в локальной копии, сохраняя пользовательские изменения.

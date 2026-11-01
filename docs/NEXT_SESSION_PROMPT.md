@@ -11,7 +11,7 @@
 
 Базовый create/health/lifecycle/remove-retain на ВМ принят пользователем для `4494d757`. Текущий локальный код после него не развёрнут, поэтому стадия 3 для текущей версии не закрыта.
 
-В текущей копии исправлены purge blockers: существующая volume SQLite открывается `rw` без создания; Linux tree traversal привязан к directory FDs; instance snapshot/token/create payload scrub-ятся до освобождения дискового резерва, checkpoint failure оставляет reservation и retry. Локальные supervisor tests, API tests, UI syntax/state tests и `scripts/smoke_runtime.py` прошли. Smoke использует real HTTP/SQLite и fake Docker/XFS/metrics; Linux dirfd/XFS/Docker/browser behavior не подтверждены. Cleanup partial failed-create journal отдельно не проверен.
+В текущей копии исправлены purge blockers: существующая volume SQLite открывается `rw` без создания; Linux tree traversal привязан к directory FDs; instance snapshot/token и payload всех операций scrub-ятся до освобождения дискового резерва, checkpoint failure сохраняет reservation и позволяет retry по минимальным метаданным purge. Локальные supervisor tests, API tests, UI syntax/state tests и `scripts/smoke_runtime.py` проходят. Smoke использует real HTTP/SQLite и fake Docker/XFS/metrics; Linux dirfd/XFS/Docker/browser behavior не подтверждены. Cleanup partial failed-create journal отдельно не проверен.
 
 Не устанавливай Docker на Windows, не подключайся по SSH и не запускай неизменившийся `hermes verify` по кругу. Не публикуй, не делай privileged setup/start, не меняй квоты/ВМ и не удаляй действующие данные без отдельного согласия. Лабораторные UUID/пути/бюджеты не переносить. Порог 50% — общее правило проекта; сохраняй lab/final semantics.
 
