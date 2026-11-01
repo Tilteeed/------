@@ -5,10 +5,31 @@ import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from starlette.concurrency import run_in_threadpool
+from urllib.parse import quote
 
 from .policy import require_owner, validate_agent_input
 from .store import RevisionConflict
 from .runtime import RuntimeRejected, RuntimeUnavailable
+
+
+def _workspace_path(value, *, allow_empty=False):
+    if type(value) is not str or chr(0) in value or chr(92) in value:
+        raise HTTPException(400, "Invalid workspace path")
+    try:
+        if len(value.encode("utf-8")) > 1024:
+            raise HTTPException(400, "Invalid workspace path")
+    except UnicodeEncodeError:
+        raise HTTPException(400, "Invalid workspace path") from None
+    if not value and allow_empty:
+        return value
+    parts = value.split("/")
+    if (value.startswith("/") or len(parts) > 16
+            or any(part in ("", ".", "..") or part.startswith(".")
+                   or len(part.encode("utf-8")) > 255
+                   or any(ord(char) < 32 or ord(char) == 127 for char in part)
+                   for part in parts)):
+        raise HTTPException(400, "Invalid workspace path")
+    return value
 
 
 def create_router(verified_user, store, *, public_origin: str | None = None, runtime=None):
@@ -98,15 +119,90 @@ def create_router(verified_user, store, *, public_origin: str | None = None, run
         response.headers["Cache-Control"] = "no-store"
         return {"events": store.events(user.id)}
 
+    def require_runtime():
+        if runtime is None:
+            raise HTTPException(503, {"code": "runtime_not_connected", "message": "Supervisor недоступен."})
+        return runtime
+
+    def retained_target(instance_id):
+        if type(instance_id) is not str or re.fullmatch(r"[0-9a-f]{32}", instance_id) is None:
+            raise HTTPException(400, "Valid retained instance ID required")
+        require_runtime()
+        return instance_id
+
+    @router.get("/me/retained/{instance_id}/files")
+    async def get_retained_files(instance_id: str, request: Request, response: Response,
+                                 user=Depends(actor)):
+        client = require_runtime()
+        instance_id = retained_target(instance_id)
+        values = request.query_params.getlist("directory")
+        offset_values = request.query_params.getlist("offset")
+        if len(values) > 1 or len(offset_values) > 1:
+            raise HTTPException(400, "Only one directory and offset are accepted")
+        directory = _workspace_path(values[0] if values else "", allow_empty=True)
+        raw_offset = offset_values[0] if offset_values else "0"
+        if not raw_offset.isascii() or not raw_offset.isdecimal() or len(raw_offset) > 5:
+            raise HTTPException(400, "Invalid workspace offset")
+        offset = int(raw_offset)
+        if offset > 10000:
+            raise HTTPException(400, "Invalid workspace offset")
+        try:
+            result = await run_in_threadpool(client.workspace_list, user.id, instance_id, directory, offset)
+        except RuntimeUnavailable:
+            raise HTTPException(503, {"code": "supervisor_unavailable", "message": "Supervisor недоступен."}) from None
+        except RuntimeRejected as error:
+            raise HTTPException(error.status, {"code": error.code, "message": error.message}) from None
+        response.headers["Cache-Control"] = "no-store"
+        return result
+
+    @router.get("/me/retained/{instance_id}/files/preview")
+    async def preview_retained_file(instance_id: str, request: Request, response: Response,
+                                    user=Depends(actor)):
+        client = require_runtime()
+        instance_id = retained_target(instance_id)
+        values = request.query_params.getlist("path")
+        if len(values) != 1:
+            raise HTTPException(400, "One file path is required")
+        path = _workspace_path(values[0])
+        try:
+            result = await run_in_threadpool(client.workspace_preview, user.id, instance_id, path)
+        except RuntimeUnavailable:
+            raise HTTPException(503, {"code": "supervisor_unavailable", "message": "Supervisor недоступен."}) from None
+        except RuntimeRejected as error:
+            raise HTTPException(error.status, {"code": error.code, "message": error.message}) from None
+        response.headers["Cache-Control"] = "no-store"
+        return result
+
+    @router.get("/me/retained/{instance_id}/files/download")
+    async def download_retained_file(instance_id: str, request: Request,
+                                     user=Depends(actor)):
+        client = require_runtime()
+        instance_id = retained_target(instance_id)
+        values = request.query_params.getlist("path")
+        if len(values) != 1:
+            raise HTTPException(400, "One file path is required")
+        path = _workspace_path(values[0])
+        try:
+            content = await run_in_threadpool(client.workspace_download, user.id, instance_id, path)
+        except RuntimeUnavailable:
+            raise HTTPException(503, {"code": "supervisor_unavailable", "message": "Supervisor недоступен."}) from None
+        except RuntimeRejected as error:
+            raise HTTPException(error.status, {"code": error.code, "message": error.message}) from None
+        filename = quote(path.rsplit("/", 1)[-1], safe="")
+        return Response(content=content, media_type="application/octet-stream", headers={
+            "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": f"attachment; filename=download; filename*=UTF-8''{filename}",
+        })
+
     @router.post("/me/actions")
     async def lifecycle_action(request: Request, response: Response, user=Depends(actor)):
         response.headers["Cache-Control"] = "no-store"
         payload = await mutation_body(request)
-        allowed_actions = {'create', 'start', 'stop', 'restart', 'remove', 'purge'}
+        allowed_actions = {'create', 'start', 'stop', 'restart', 'remove', 'purge', 'restore'}
         if runtime is not None:
             base_keys = {'action', 'idempotency_key', 'settings_revision'}
             action = payload.get('action') if type(payload) is dict else None
-            expected_keys = base_keys | {'instance_id'} if action == 'purge' else base_keys
+            expected_keys = base_keys | {'instance_id'} if type(action) is str and action in {'purge', 'restore'} else base_keys
             if (type(payload) is not dict
                     or set(payload) != expected_keys
                     or type(payload['action']) is not str or payload['action'] not in allowed_actions
@@ -115,7 +211,7 @@ def create_router(verified_user, store, *, public_origin: str | None = None, run
                     or any(not (c.isascii() and (c.isalnum() or c in '_-')) for c in payload['idempotency_key'])
                     or type(payload['settings_revision']) is not int
                     or not 1 <= payload['settings_revision'] <= 2**53 - 1
-                    or (action == 'purge' and (type(payload['instance_id']) is not str
+                    or (action in {'purge', 'restore'} and (type(payload['instance_id']) is not str
                         or re.fullmatch(r'[0-9a-f]{32}', payload['instance_id']) is None))):
                 raise HTTPException(400, "Supported action, idempotency_key and saved settings_revision required")
             try:

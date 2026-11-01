@@ -77,6 +77,16 @@ class AdmissionTests(unittest.TestCase):
                 self.assertIn(reason, decision.reasons)
         boundary = base | {'free_disk_bytes': 12*gib, 'available_ram_bytes': 2*gib}
         self.assertTrue(evaluate_admission(**boundary).allowed)
+    def test_zero_new_disk_request_is_valid_when_reusing_a_retained_quota(self):
+        from supervisor.policy import evaluate_admission
+        gib = 1024 ** 3
+        inputs = dict(mode='final', now=100.0, sampled_at=95.0, cpu_window_seconds=60,
+                      total_ram_bytes=8*gib, available_ram_bytes=6*gib, cpu_percent=10.0,
+                      requested_ram_bytes=2*gib, free_disk_bytes=2*gib,
+                      requested_disk_bytes=0, disk_floor_bytes=2*gib,
+                      disk_quota_verified=True)
+        self.assertTrue(evaluate_admission(**inputs).allowed)
+
     def test_invalid_observations_and_profiles_are_rejected(self):
         from supervisor.policy import evaluate_admission
         gib = 1024 ** 3
@@ -90,7 +100,7 @@ class AdmissionTests(unittest.TestCase):
                    'total_ram_bytes': [0, True, 1.0, 2**64],
                    'available_ram_bytes': [-1, 9*gib], 'cpu_percent': [float('nan'), 101, -1, True],
                    'requested_ram_bytes': [0, True, 1.5], 'free_disk_bytes': [-1, None],
-                   'requested_disk_bytes': [0, True], 'disk_floor_bytes': [-1, False],
+                   'requested_disk_bytes': [True, -1], 'disk_floor_bytes': [-1, False],
                    'disk_quota_verified': [1, 'true', None]}
         for field, values in invalid.items():
             for value in values:

@@ -2,13 +2,14 @@
 
 ## Локальная проверка текущих изменений
 
-- `python scripts/smoke_runtime.py`: PASS после текущего кода. Реальные HTTP/SQLite; fake Docker/XFS/metrics. Покрыты lifecycle, replay после новой draft revision, stale rejection, pending-create recovery, owner separation, paused/restarting, remove-retain, новое создание и purge retry/replay.
-- `python -m unittest supervisor.tests.test_runtime_service -v`: 6 тестов, OK. Включают временный SQLite-файл с `mode=ro`/`mode=rw` без создания, create→start→stop→remove→purge с разными инструкциями, scrub payload всех операций, частичный purge/retry, WAL-checkpoint gating и retry по redacted purge metadata.
-- `python -m unittest tests.test_api -v`: 8 тестов, OK.
+- `python scripts/smoke_runtime.py`: последний разрешённый PASS был до добавления restore; сценарий не обновлялся и не запускался повторно, поэтому не подтверждает restore.
+- `python -m unittest supervisor.tests.test_runtime_service -v`: 6 тестов, OK. Включают create→start→stop→remove→restore→remove→purge, same instance/storage path и marker preservation, отсутствие новой disk allocation, owner rejection, restore retry после quota verification failure, scrub operation payloads, частичный purge/retry и WAL-checkpoint gating.
+- `python -m unittest supervisor.tests.test_policy -v`: 7 тестов, OK; включая валидный нулевой новый disk request для reuse retained quota.
+- `python -m unittest tests.test_api -v`: 9 тестов, OK.
 - `node --check web/agent/app.js` и `node --test tests/ui-state.test.mjs`: 4 теста, OK; не браузерный execution test.
 - `python -m compileall -q supervisor control_plane scripts` и `git diff --check`: OK.
 
-Python/HTTP smoke использует настоящие SQLite/HTTP и удаляет только временные fixtures; Docker, XFS quota/xattrs, Linux directory-descriptor syscalls и AF_UNIX имитируются или не вызываются. Это **не** ВМ-приёмка и не forensic secure-erase proof.
+Только созданный для service workflow тестовый каталог/marker временный и синтетический; настоящий Docker, XFS quota/xattrs, Linux directory-descriptor syscalls и AF_UNIX не вызваны для restore. Это не ВМ-приёмка и не forensic secure-erase proof.
 
 ## Успешные локальные проверки (исторический базис первой части)
 
@@ -51,7 +52,7 @@ HTTP-тесты используют тестовую dependency личност�
 
 ## Этапы 3–4: функциональная приёмка host-runtime на ВМ
 
-**Источник свидетельств:** отчёт пользователя о проверке commit `4494d7575b0c7534076684e6d8547477b527a42f` на Linux-ВМ с Docker/XFS. На момент отчёта локальный `main` совпадал с этим commit; текущий HEAD `e3533e99b36ac9265426c36f1ee2b3c9f14303cf` содержит последующие purge-изменения, а текущие локальные исправления после него не проверялись на ВМ. Это пользовательская приёмка; помощник не подключался к ВМ и не повторял её.
+**Исторический источник:** отчёт пользователя о commit `4494d7575b0c7534076684e6d8547477b527a42f` на Linux-ВМ с Docker/XFS; на момент того отчёта локальный `main` совпадал с тестируемой версией. Текущий базовый HEAD — `2afe2b5b4da9d5ea1dde1acdac8da015fe591eb7`, для него ниже добавлен отдельный новый отчёт с purge/XFS проверками. После `2afe2b5` появились незакоммиченные restore/UI изменения, которые на ВМ не проверялись. Это свидетельства пользователя; помощник не подключался к ВМ и не повторял приёмку.
 
 В отчёте указано:
 
@@ -68,13 +69,13 @@ HTTP-тесты используют тестовую dependency личност�
 
 ### Оставшиеся непроверенные/нереализованные пункты
 
-- EDQUOT при достижении hard limit реальным экземпляром не проверен. Отчёт фиксирует назначение/readback квоты 10 GiB, но это не испытание отказа записи.
-- Пользовательский ВМ-отчёт проверял второго владельца только на отображение в UI; локальный fake HTTP/SQLite smoke дополнительно подтвердил отказ чужому purge до вызова storage. Прямой cross-owner API при настоящем Docker/XFS/ВМ не проверялся.
+- EDQUOT при достижении hard limit настоящим экземпляром не проверен. Отчёт `2afe2b5` подтверждает quota assignment/readback и запись marker на XFS, но не испытание отказа записи.
+- Отчёт `4494d757` проверял второго владельца только на отображение в UI; новый report `2afe2b5` дополнительно зафиксировал один отказ cross-owner purge до изменения чужого контейнера/quota. Это не полный authorization audit всех операций и endpoints.
 - Не проверены одновременное создание несколькими владельцами, конкурентные lifecycle-запросы и восстановление supervisor при уже работающем управляемом экземпляре.
 - Автозапуск supervisor после reboot не настроен.
 - Текущий локальный purge owner-scoped и journaled. Storage DB открывается на запись только явным `mode=rw` без создания, обход дерева привязан к directory FDs и проверяет inode/device/mount ID, instance snapshot/token и payload всех операций scrub-ятся, а disk reservation остаётся до успешного WAL checkpoint; retry после scrub использует минимальные purge metadata.
-- Это подтверждено локальными temp-SQLite и syscall-mock тестами. Настоящий Linux `/proc/fdinfo`/dirfd, XFS project quota, Docker removal и фактическое VM purge не запускались; secure forensic erase от SSD не гарантируется.
-- Cleanup после failed create с отсутствующим/неполным XFS journal и reattachment retained dataset отдельно не принимались; автоматической очистки нет.
+- Это подтверждено локальными temp-SQLite и syscall-mock тестами; пользовательский отчёт для `2afe2b5` дополнительно подтверждает один реальный purge/quota reset на Linux/XFS. Report не проверяет adversarial mount/symlink race и EDQUOT; secure forensic erase от SSD не гарантируется.
+- Restore retained storage — отдельная операция, локально реализована для прежних instance ID/path/quota; новые тесты не проверяют реальный Docker/XFS. Workspace browser теперь существует в локальном коде и ограничен `state/workspace`: owner-scoped, no-follow, без dotfiles/credentials/secrets, preview до 256 KiB и download до 16 MiB с пагинацией. Его browser/Linux VM acceptance ещё не проводилась. Cleanup после failed create с отсутствующим/неполным XFS journal отдельно не проверен.
 - Gateway в кабинет, применение обновлённых настроек, LLM/chat и Telegram не подключены.
 
 Не запускать очистку существующего Project ID/каталога или сброс SQLite для проверки. Для реального EDQUOT и purge нужен отдельный изолированный набор данных/проект и согласованный сценарий.
@@ -93,3 +94,20 @@ HTTP-тесты используют тестовую dependency личност�
 Следовательно, reconciliation не должен был принимать старый seccomp-профиль: на старте новой службы старый контейнер уже отсутствовал, а запись была неактивной. Операции retain сохранили старые данные и диск-резерв; новый экземпляр получил отдельный Project ID.
 
 Это подтверждает именно такой порядок обновления на этой ВМ. Оно **не** доказывает, что новую версию можно запустить поверх активного контейнера, созданного со старым seccomp: current DockerEngine exact-check/reconcile по-прежнему может блокировать такой запуск. Не очищать SQLite или retained data ради обхода; активный старый экземпляр требует отдельного безопасного плана.
+
+## Новый пользовательский отчёт для commit `2afe2b5`
+
+**Источник:** приложенный пользователем отчёт от 1 ноября 2026 года о Linux-ВМ. Коммит совпадает с локальным базовым HEAD `2afe2b5b4da9d5ea1dde1acdac8da015fe591eb7`; последующие незакоммиченные изменения, включая restore retained storage, в отчёте не проверялись. Это свидетельство пользователя, не собственный запуск помощника.
+
+Отчёт подтверждает для испытанной версии:
+
+- Open WebUI, supervisor и два персональных контейнера были `healthy`; отдельные owner/project/quota/reservations зафиксированы.
+- Для временного `Purge Smoke Test` выполнена запись через container bind mount и обнаружен marker на host XFS; реальный `EDQUOT` не проверяли.
+- `remove` сохранил каталог/marker и 10 GiB quota, перевёл запись в `removed/inactive` и освободил RAM/CPU; затем `purge` удалил тестовый каталог, сбросил quota, очистил instance snapshot/token/operation payloads и storage DB rows, не затронув два других агента.
+- Проверены чужой purge (включая админский аккаунт), API input/Origin validation, replay/conflict idempotency и восемь параллельных повторов уже завершённого create.
+- Resource admission отказал четырём create запросам при низком `MemAvailable`; внутренняя причина отдельно не извлекалась. Эти запросы не проверяли конкурентное первоначальное создание без существующего экземпляра.
+- Supervisor autostart, restart/reconcile с работающими контейнерами, recovery после прерванной операции, EDQUOT и конкурентный первоначальный create остались непроверенными.
+
+Отчёт фиксирует очистку временного Purge Smoke Test и старых тестовых Project ID; не считать тот тестовый dataset доступным для будущего restore. Вывод отчёта — успешная функциональная приёмка перечисленных Stage 3 сценариев на `2afe2b5`, но не полная security/operations acceptance. Локальный тест `SupervisorRestartRecoveryTests.test_reconcile_after_store_reopen_preserves_running_instance_and_reservations` прошёл с fake adapters; это не реальный Supervisor/Docker/XFS restart.
+
+**Позднее уточнение пользователя:** текущая серия Stage 3 функциональных проверок уже выполнена; переходим к разработке и не повторяем эти проверки как следующий шаг. Подробные новые результаты после приложенного отчёта не предоставлены, поэтому их точные сценарии/выводы здесь не дополняются. Новые локальные изменения restore/workspace browser требуют собственной целевой browser/VM приёмки после согласованной доставки.

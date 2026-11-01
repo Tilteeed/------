@@ -76,7 +76,15 @@ dd { margin: 0; text-align: right; color: #c9ccd8; }
 #retained-list { list-style: none; padding: 0; margin: 16px 0 0; }
 #retained-list li { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; border-top: 1px solid var(--border); padding: 12px 0; }
 #retained-list li span { min-width: 0; overflow-wrap: anywhere; }
+.retained-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 #retained-list button { font-size: 12px; }
+.workspace-browser { flex: 1 0 100%; min-width: 0; margin: 8px 0 4px; padding: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.workspace-browser nav { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+.workspace-browser ul { list-style: none; padding: 0; margin: 8px 0; }
+.workspace-browser li { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-top: 1px solid var(--border); padding: 8px 0; }
+.workspace-browser li span { min-width: 0; overflow-wrap: anywhere; }
+.workspace-browser .file-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.workspace-browser pre { max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; border: 1px solid var(--border); border-radius: 6px; background: #0c0d10; }
 .lifecycle button { font-size: 12px; padding: 8px 10px; }
 #lifecycle-help { margin-bottom: 0; }
 .events { grid-column: 1 / -1; }

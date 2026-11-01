@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from control_plane import api
 from control_plane.policy import validate_agent_input
-from control_plane.runtime import RuntimeRejected
+from control_plane.runtime import RuntimeRejected, SupervisorClient
 from control_plane.store import DraftStore
 
 
@@ -51,6 +51,16 @@ class PlatformApiTests(unittest.TestCase):
         self.base = "/api/v1/agent-platform/me"
         self.alice = {"Authorization": "Bearer alice-session"}
         self.bob = {"Authorization": "Bearer bob-session"}
+
+    def test_restore_does_not_forward_current_draft_to_supervisor(self):
+        client = SupervisorClient('unused.sock', 'unused.token')
+        sent = {}
+        client._request = lambda path, payload: sent.update(path=path, payload=payload) or {}
+        request = {'action': 'restore', 'idempotency_key': 'restore-key',
+                   'settings_revision': 2, 'instance_id': 'b' * 32}
+        client.action('alice', request, {'name': 'Draft', 'instructions': 'PRIVATE_DRAFT_TEXT'})
+        self.assertEqual(sent, {'path': '/v1/actions', 'payload': {
+            **request, 'actor_id': 'alice'}})
 
     def test_unauthenticated_requests_are_denied(self):
         self.assertEqual(self.client.get(self.base).status_code, 401)
@@ -153,9 +163,65 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(len(runtime.calls), 1)
         malformed = {**payload, 'instance_id': '../other'}
         self.assertEqual(client.post(path, headers=self.alice, json=malformed).status_code, 400)
+        restore = {'action': 'restore', 'idempotency_key': 'restore-key-1',
+                   'settings_revision': 2, 'instance_id': 'b' * 32}
+        restored = client.post(path, headers=self.alice, json=restore)
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertEqual(runtime.calls[-1]['action'], 'restore')
+        self.assertEqual(runtime.calls[-1]['instance_id'], 'b' * 32)
+        missing_target = dict(restore)
+        missing_target.pop('instance_id')
+        self.assertEqual(client.post(path, headers=self.alice, json=missing_target).status_code, 400)
+        bad_target = {**restore, 'idempotency_key': 'restore-key-2', 'instance_id': '../other'}
+        self.assertEqual(client.post(path, headers=self.alice, json=bad_target).status_code, 400)
+
+    def test_retained_workspace_routes_require_owner_session_and_set_download_headers(self):
+        class Runtime:
+            def __init__(self):
+                self.calls = []
+            def workspace_list(self, actor_id, instance_id, directory, offset):
+                self.calls.append(("list", actor_id, instance_id, directory, offset))
+                return {"directory": directory, "entries": [{"name": "note.md", "kind": "file", "size": 5}],
+                        "next_offset": None}
+            def workspace_preview(self, actor_id, instance_id, path):
+                self.calls.append(("preview", actor_id, instance_id, path))
+                return {"text": "hello"}
+            def workspace_download(self, actor_id, instance_id, path):
+                self.calls.append(("download", actor_id, instance_id, path))
+                return b"\\x00file"
+
+        runtime = Runtime()
+        app = FastAPI()
+        app.include_router(api.create_router(verified_test_user, self.store, runtime=runtime))
+        client = TestClient(app)
+        self.addCleanup(client.close)
+        base = self.base + "/retained/" + "a" * 32 + "/files"
+        listing = client.get(base, params={"directory": "notes"}, headers=self.alice)
+        self.assertEqual(listing.status_code, 200, listing.text)
+        self.assertEqual(listing.json()["entries"][0]["name"], "note.md")
+        preview = client.get(base + "/preview", params={"path": "notes/note.md"}, headers=self.alice)
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(preview.json(), {"text": "hello"})
+        download = client.get(base + "/download", params={"path": "notes/note.md"}, headers=self.alice)
+        self.assertEqual(download.status_code, 200)
+        self.assertEqual(download.content, b"\\x00file")
+        self.assertEqual(download.headers["cache-control"], "no-store")
+        self.assertEqual(download.headers["x-content-type-options"], "nosniff")
+        self.assertIn("filename*=UTF-8''note.md", download.headers["content-disposition"])
+        self.assertEqual(runtime.calls, [
+            ("list", "alice", "a" * 32, "notes", 0),
+            ("preview", "alice", "a" * 32, "notes/note.md"),
+            ("download", "alice", "a" * 32, "notes/note.md"),
+        ])
+        before_bad_path = len(runtime.calls)
+        self.assertEqual(client.get(base + "/download", params={"path": "../secrets/token"},
+                                   headers=self.alice).status_code, 400)
+        self.assertEqual(len(runtime.calls), before_bad_path)
+        self.assertEqual(client.get(base, params={"directory": ""}).status_code, 401)
+        self.assertEqual(client.get(self.base + "/retained/../files", headers=self.alice).status_code, 404)
 
     def test_lifecycle_refuses_unconnected_runtime_without_faking_success(self):
-        for action in ("create", "start", "stop", "restart", "remove", "purge"):
+        for action in ("create", "start", "stop", "restart", "remove", "purge", "restore"):
             with self.subTest(action=action):
                 result = self.client.post(self.base + "/actions", headers=self.alice, json={"action": action})
                 self.assertEqual(result.status_code, 503, result.text)

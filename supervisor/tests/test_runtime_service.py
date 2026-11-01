@@ -55,7 +55,14 @@ class ServiceWorkflowSmoke(unittest.TestCase):
 
         class Volumes:
             valid = False
+            prepare_calls = 0
             def prepare(self, instance_id, disk_bytes):
+                self.prepare_calls += 1
+                workspace = Path(tmp) / instance_id / 'state' / 'workspace'
+                workspace.mkdir(parents=True, exist_ok=True)
+                marker = workspace / 'retained-data.txt'
+                if not marker.exists():
+                    marker.write_text('SYNTHETIC_RETAINED_DATA', encoding='utf-8')
                 return self.verify(instance_id, disk_bytes)
             def verify(self, instance_id, disk_bytes):
                 return dict(host_path=str(Path(tmp) / instance_id), project_id=1, disk_quota_verified=self.valid)
@@ -70,11 +77,13 @@ class ServiceWorkflowSmoke(unittest.TestCase):
 
         class Engine:
             calls = []
+            host_paths = []
             state = 'absent'
             def inspect(self, instance_id):
                 return dict(state=self.state, gateway='unknown', container_id='c' if self.state != 'absent' else None)
             def create(self, instance_id, host_path, limits, token):
                 self.calls.append(('create', instance_id))
+                self.host_paths.append(host_path)
                 self.state = 'stopped'
                 return 'c'
             def start(self, instance_id):
@@ -124,6 +133,45 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             replay = service.action(payload)
             self.assertEqual(replay['runtime']['state'], 'removed')
             self.assertEqual(len(engine.calls), 2)
+            prepares_before_restore = volumes.prepare_calls
+            restore_request = {key: value for key, value in payload.items() if key != 'settings'}
+            restore_request.update(action='restore', idempotency_key='restore-1', instance_id=instance_id)
+            calls_before_foreign_restore = list(engine.calls)
+            foreign_restore = dict(restore_request, actor_id='bob', idempotency_key='restore-foreign')
+            with self.assertRaises(ServiceError) as foreign_restore_error:
+                service.action(foreign_restore)
+            self.assertEqual(foreign_restore_error.exception.code, 'instance_not_found')
+            self.assertEqual(volumes.prepare_calls, prepares_before_restore)
+            self.assertEqual(engine.calls, calls_before_foreign_restore)
+            volumes.valid = False
+            with self.assertRaises(ServiceError) as restore_error:
+                service.action(restore_request)
+            self.assertEqual(restore_error.exception.code, 'quota_unverified')
+            self.assertEqual(store.restore_retry(instance_id), {'key': 'restore-1', 'revision': 0})
+            self.assertEqual(service.me({'actor_id': 'alice'})['runtime']['pending_restore_key'], 'restore-1')
+            volumes.valid = True
+            restored = service.replay({key: value for key, value in restore_request.items() if key != 'settings'})
+            self.assertEqual(restored['runtime']['state'], 'running')
+            self.assertEqual(restored['runtime']['instance_id'], instance_id)
+            restore_operation = store.operation('alice', 'restore-1')
+            assert restore_operation is not None
+            self.assertNotIn('RESTORE_PRIVATE_INSTRUCTIONS', restore_operation['payload'])
+            self.assertEqual(json.loads(restore_operation['payload']), {'redacted': True, 'replay': {
+                'action': 'restore', 'settings_revision': 0, 'instance_id': instance_id}})
+            self.assertEqual(volumes.prepare_calls, prepares_before_restore,
+                             'Restoring a retained dataset must not allocate another volume')
+            self.assertEqual(engine.host_paths[-1], engine.host_paths[0])
+            marker = Path(engine.host_paths[-1]) / 'state' / 'workspace' / 'retained-data.txt'
+            self.assertEqual(marker.read_text(encoding='utf-8'), 'SYNTHETIC_RETAINED_DATA')
+            self.assertEqual(store.totals(), (profile.agent_limits.ram_bytes,
+                                              profile.agent_limits.cpu_millicores,
+                                              profile.agent_limits.disk_bytes))
+            action_payloads.append(restore_request)
+            remove_again = dict(payload, action='remove', idempotency_key='remove-2',
+                                settings={'name': 'Agent', 'instructions': 'REMOVE_AGAIN_PRIVATE_INSTRUCTIONS'})
+            service.action(remove_again)
+            action_payloads.append(remove_again)
+            self.assertEqual(store.totals(), (0, 0, profile.agent_limits.disk_bytes))
             purge = dict(payload, action='purge', idempotency_key='purge-1', instance_id=instance_id,
                          settings={'name': 'Agent', 'instructions': 'PURGE_PRIVATE_INSTRUCTIONS'})
             action_payloads.append(purge)
@@ -174,11 +222,12 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             operation_rows = list(store.db.execute(
                 "SELECT action,payload FROM operations WHERE instance_id=? ORDER BY rowid", (instance_id,)))
             self.assertEqual([row['action'] for row in operation_rows],
-                             ['create', 'start', 'stop', 'remove', 'purge'])
+                             ['create', 'start', 'stop', 'remove', 'restore', 'remove', 'purge'])
             self.assertEqual(len(action_payloads), len(operation_rows))
             for row, request in zip(operation_rows, action_payloads):
-                instruction = request['settings']['instructions']
-                self.assertNotIn(instruction, row['payload'], row['action'] + ' payload retained instructions')
+                instructions = request.get('settings', {}).get('instructions')
+                if instructions:
+                    self.assertNotIn(instructions, row['payload'], row['action'] + ' payload retained instructions')
                 self.assertEqual(json.loads(row['payload']), {'redacted': True, 'replay': {
                     'action': request['action'], 'settings_revision': 0,
                     'instance_id': request.get('instance_id')}})
@@ -196,6 +245,118 @@ class ServiceWorkflowSmoke(unittest.TestCase):
                                      if key != 'settings'})
             self.assertEqual(replay['runtime']['state'], 'purged')
             self.assertEqual(volumes.purge_calls, calls_after_success, 'Exact replay must not repeat purge effects')
+
+
+class SupervisorRestartRecoveryTests(unittest.TestCase):
+    def test_reconcile_after_store_reopen_preserves_running_instance_and_reservations(self):
+        import hashlib
+        from dataclasses import asdict
+        from supervisor.config import validate_profile
+        from supervisor.runtime_store import RuntimeStore, canonical
+        from supervisor.service import RuntimeService
+
+        gib = 1024 ** 3
+        profile = validate_profile(dict(schema_version=1, profile_version='restart-recovery-test', mode='lab',
+            storage=dict(backend='xfs_project_quota', mountpoint='/mnt/recovery-test',
+                         expected_uuid='11111111-2222-4333-8444-555555555555'),
+            agent_limits=dict(ram_bytes=1024, cpu_millicores=100, pids_limit=32, disk_bytes=4096)))
+        fingerprint = hashlib.sha256(canonical(asdict(profile)).encode('ascii')).hexdigest()
+        capacities = (4*gib, 4000, 40*gib)
+
+        class Metrics:
+            def snapshot(self):
+                return dict(sampled_at=100, cpu_window_seconds=60, total_ram_bytes=8*gib,
+                            available_ram_bytes=7*gib, cpu_percent=5, free_disk_bytes=50*gib,
+                            total_cpu_millicores=8000, total_disk_bytes=60*gib)
+
+        class Volumes:
+            def __init__(self, root):
+                self.root = root
+                self.prepare_calls = 0
+                self.verify_calls = 0
+            def prepare(self, instance_id, _disk_bytes):
+                self.prepare_calls += 1
+                workspace = self.root / instance_id / 'state' / 'workspace'
+                workspace.mkdir(parents=True, exist_ok=True)
+                (workspace / 'recovery-marker.txt').write_text('SYNTHETIC_RECOVERY_DATA', encoding='utf-8')
+            def verify(self, instance_id, _disk_bytes):
+                self.verify_calls += 1
+                path = self.root / instance_id
+                marker = path / 'state' / 'workspace' / 'recovery-marker.txt'
+                return dict(host_path=str(path), project_id=17,
+                            disk_quota_verified=marker.is_file())
+
+        class Engine:
+            def __init__(self, host_state):
+                self.host_state = host_state
+                self.calls = []
+            def inspect(self, instance_id):
+                state = self.host_state.get(instance_id, 'absent')
+                return dict(state=state, gateway='unknown',
+                            container_id=('container-' + instance_id[:8]) if state != 'absent' else None)
+            def create(self, instance_id, _host_path, _limits, _token):
+                self.calls.append(('create', instance_id))
+                self.host_state[instance_id] = 'stopped'
+                return 'container-' + instance_id[:8]
+            def start(self, instance_id):
+                self.calls.append(('start', instance_id))
+                self.host_state[instance_id] = 'running'
+            def stop(self, instance_id):
+                self.calls.append(('stop', instance_id))
+                self.host_state[instance_id] = 'stopped'
+            def remove(self, instance_id):
+                self.calls.append(('remove', instance_id))
+                self.host_state[instance_id] = 'absent'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'volumes'
+            root.mkdir()
+            db_path = Path(tmp) / 'runtime.sqlite3'
+            host_state = {}
+            volumes_before = Volumes(root)
+            engine_before = Engine(host_state)
+            store_before = RuntimeStore(db_path, profile.profile_version, fingerprint)
+            try:
+                service_before = RuntimeService(profile, store_before, volumes_before, engine_before, Metrics(),
+                    capacities=capacities, disk_floor_bytes=0, clock=lambda: 100,
+                    initialize=lambda *_args: None)
+                request = {'actor_id': 'alice', 'action': 'create', 'idempotency_key': 'restart-create',
+                           'settings_revision': 1,
+                           'settings': {'name': 'Agent', 'instructions': 'keep this workspace'}}
+                created = service_before.action(request)
+                instance_id = created['runtime']['instance_id']
+                self.assertEqual(created['runtime']['state'], 'running')
+                original_instance = store_before.instance(instance_id)
+                original_totals = store_before.totals()
+                original_container_id = original_instance['container_id']
+            finally:
+                store_before.close()
+
+            store_after = RuntimeStore(db_path, profile.profile_version, fingerprint)
+            try:
+                volumes_after = Volumes(root)
+                engine_after = Engine(host_state)
+                service_after = RuntimeService(profile, store_after, volumes_after, engine_after, Metrics(),
+                    capacities=capacities, disk_floor_bytes=0, clock=lambda: 100,
+                    initialize=lambda *_args: None)
+                service_after.reconcile()
+                view = service_after.me({'actor_id': 'alice'})
+                recovered = store_after.current('alice')
+                assert recovered is not None
+                self.assertEqual(view['runtime']['state'], 'running')
+                self.assertEqual(view['runtime']['instance_id'], instance_id)
+                self.assertEqual(recovered['container_id'], original_container_id)
+                self.assertEqual(store_after.totals(), original_totals)
+                self.assertEqual(engine_after.calls, [], 'Reconciliation must inspect, not recreate or restart')
+                self.assertEqual(volumes_after.prepare_calls, 0, 'Reconciliation must not re-prepare existing storage')
+                self.assertGreater(volumes_after.verify_calls, 0)
+                self.assertEqual((root / instance_id / 'state' / 'workspace' / 'recovery-marker.txt')
+                                 .read_text(encoding='utf-8'), 'SYNTHETIC_RECOVERY_DATA')
+                self.assertEqual(store_after.db.execute(
+                    "SELECT count(*) FROM operations WHERE instance_id=? AND action='create'",
+                    (instance_id,)).fetchone()[0], 1)
+            finally:
+                store_after.close()
 
 
 class XfsPurgeTests(unittest.TestCase):

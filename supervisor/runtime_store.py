@@ -79,10 +79,11 @@ class RuntimeStore:
                 saved = json.loads(row['payload'])
                 if type(saved) is dict and saved.get('redacted') is True:
                     replay = saved.get('replay')
-                    matches_purge = (type(replay) is dict and replay.get('action') == 'purge'
-                                     and replay.get('settings_revision') == payload['settings_revision']
-                                     and replay.get('instance_id') == payload.get('instance_id'))
-                    if not matches_purge:
+                    matches_targeted = (type(replay) is dict and payload['action'] in {'purge', 'restore'}
+                                        and replay.get('action') == payload['action']
+                                        and replay.get('settings_revision') == payload['settings_revision']
+                                        and replay.get('instance_id') == payload.get('instance_id'))
+                    if not matches_targeted:
                         raise StoreError('idempotency_conflict')
                 elif row['payload'] != self._payload(payload):
                     raise StoreError('idempotency_conflict')
@@ -125,6 +126,40 @@ class RuntimeStore:
         with self.lock:
             row = self.db.execute("SELECT key FROM operations WHERE instance_id=? AND action='create' AND status IN ('pending','failed') LIMIT 1", (instance_id,)).fetchone()
             return row['key'] if row else None
+
+    def restore_retry(self, instance_id):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT key,payload FROM operations WHERE instance_id=? AND action='restore' "
+                "AND status IN ('pending','failed') ORDER BY rowid DESC LIMIT 1", (instance_id,)).fetchone()
+            if row is None:
+                return None
+            saved = json.loads(row['payload'])
+            request = saved.get('request') if type(saved) is dict else None
+            if type(request) is dict:
+                action = request.get('action')
+                revision = request.get('settings_revision')
+                target = request.get('instance_id')
+            else:
+                replay = saved.get('replay') if type(saved) is dict else None
+                if type(saved) is not dict or saved.get('redacted') is not True or type(replay) is not dict:
+                    raise StoreError('invalid_transition')
+                action = replay.get('action')
+                revision = replay.get('settings_revision')
+                target = replay.get('instance_id')
+            if (action != 'restore' or target != instance_id
+                    or type(revision) is not int or not 0 <= revision <= 2**63 - 1):
+                raise StoreError('invalid_transition')
+            return {'key': row['key'], 'revision': revision}
+
+    def retained_instance(self, actor, instance_id):
+        """Return only an owner's inactive, non-purging retained instance."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM instances WHERE actor=? AND id=? AND active=0 AND disk>0 "
+                "AND state='removed' AND storage IS NOT NULL",
+                (actor, instance_id)).fetchone()
+            return dict(row) if row else None
 
     def retained(self, actor):
         """Owner-scoped retained datasets; never expose host paths or project IDs."""
@@ -202,7 +237,7 @@ class RuntimeStore:
                     raise StoreError('operation_pending')
                 return replay
             actor, action = payload['actor_id'], payload['action']
-            if action not in {'create', 'start', 'stop', 'restart', 'remove', 'purge'}:
+            if action not in {'create', 'start', 'stop', 'restart', 'remove', 'purge', 'restore'}:
                 raise StoreError('invalid_action')
             instance_id = None
             instance = None
@@ -214,6 +249,21 @@ class RuntimeStore:
                     raise StoreError('instance_not_found')
                 if not instance['active'] and instance['state'] not in {'removed', 'purging'}:
                     raise StoreError('instance_not_found')
+                instance_id = instance['id']
+            elif action == 'restore':
+                row = self.db.execute('SELECT * FROM instances WHERE id=? AND actor=?',
+                                      (payload['instance_id'], actor)).fetchone()
+                instance = dict(row) if row else None
+                if (instance is None or instance['active'] or instance['state'] != 'removed'
+                        or instance['ram'] != 0 or instance['cpu'] != 0
+                        or instance['disk'] <= 0 or instance['storage'] is None):
+                    raise StoreError('instance_not_found')
+                if self.current(actor) is not None:
+                    raise StoreError('owner_has_instance')
+                used = self.totals()
+                if (used[0] + limits[0] > capacities[0]
+                        or used[1] + limits[1] > capacities[1]):
+                    raise StoreError('capacity_exhausted')
                 instance_id = instance['id']
             else:
                 instance = self.current(actor)
@@ -227,7 +277,7 @@ class RuntimeStore:
                 self.db.execute('INSERT INTO instances (id,actor,active,state,settings,revision,ram,cpu,disk,gateway_token,storage,container_id) VALUES (?,?,1,?,?,?,?,?,?,?,NULL,NULL)',
                                 (instance_id, actor, 'preparing', canonical(payload['settings']),
                                  payload['settings_revision'], *limits, secrets.token_urlsafe(32)))
-            elif action != 'purge':
+            elif action not in {'purge', 'restore'}:
                 if instance is None:
                     raise StoreError('instance_not_found')
                 instance_id = instance['id']
@@ -239,10 +289,20 @@ class RuntimeStore:
             if instance_id is None:
                 raise StoreError('invalid_action')
             operation_id = uuid.uuid4().hex
+            saved_payload = (canonical({'redacted': True, 'replay': {
+                'action': action, 'settings_revision': payload['settings_revision'],
+                'instance_id': payload.get('instance_id')}}) if action == 'restore' else self._payload(payload))
             self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?,?,NULL)',
-                            (operation_id, actor, payload['idempotency_key'], self._payload(payload), instance_id, action, 'pending'))
+                            (operation_id, actor, payload['idempotency_key'], saved_payload, instance_id, action, 'pending'))
             if action == 'purge':
                 self.db.execute("UPDATE instances SET state='purging' WHERE id=?", (instance_id,))
+            elif action == 'restore':
+                changed = self.db.execute(
+                    "UPDATE instances SET active=1,state='preparing',ram=?,cpu=? "
+                    "WHERE id=? AND actor=? AND active=0 AND state='removed'",
+                    (limits[0], limits[1], instance_id, actor)).rowcount
+                if changed != 1:
+                    raise StoreError('instance_not_found')
             return self.lookup(payload)
 
     def pending(self, operation_id):

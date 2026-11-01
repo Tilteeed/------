@@ -39,7 +39,7 @@
 
 ## Модель данных
 
-Текущая локальная реализация хранит один документ настроек на пользователя в DraftStore, а отдельный RuntimeStore ведёт один активный экземпляр на владельца и retained disk после remove. Это не multi-instance-per-owner. Отдельный owner-scoped purge retained dataset добавлен в текущей локальной копии и не принят на ВМ; переподключение retained storage отсутствует. Допустимые поля формы — name и instructions; сохранение draft не означает применения настроек в уже созданном агенте.
+Текущая локальная реализация хранит один документ настроек на пользователя в DraftStore, а отдельный RuntimeStore ведёт один активный экземпляр на владельца и retained disk после remove. Это не multi-instance-per-owner. Restore retained данных и workspace-only file browser реализованы локально: тот же instance ID/path/quota, только `state/workspace` для list/preview/download; credentials/secrets и внутреннее state скрыты. Новые функции не проверены на ВМ/browser E2E. Просмотр/скачивание остальных хранилищ не предусмотрены.
 
 ## Исследованные первичные источники
 

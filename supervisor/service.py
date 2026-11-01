@@ -5,7 +5,7 @@ The trusted parent authenticates users; actor_id is accepted only with the
 service bearer secret. This is not a browser-facing authentication API.
 """
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import hashlib
 import hmac
 from http.server import BaseHTTPRequestHandler
@@ -22,17 +22,25 @@ import sys
 import threading
 import time
 from typing import Any
+from urllib.parse import quote
 
 from .config import load_profile, _unique_object, _reject_constant
 from .metrics import HostMetrics, MetricsUnavailable
 from .policy import evaluate_admission
 from .runtime_store import RuntimeStore, StoreError, canonical
+from .workspace_files import RetainedWorkspace, WorkspaceFileError
 
 
 class ServiceError(Exception):
     def __init__(self, code, status=409):
         self.code, self.status = code, status
         super().__init__(code)
+
+
+@dataclass(frozen=True)
+class WorkspaceDownload:
+    name: str
+    content: bytes
 
 
 MESSAGES = {
@@ -55,6 +63,12 @@ MESSAGES = {
     'profile_drift': 'Deployment profile differs from the durable binding.',
     'unsafe_initialization': 'Initial private runtime files could not be verified.',
     'internal_error': 'Service operation failed.',
+    'invalid_file_path': 'Invalid workspace path.',
+    'file_not_found': 'Workspace file not found.',
+    'file_too_large': 'Workspace file exceeds the download limit.',
+    'preview_not_supported': 'File cannot be previewed as UTF-8 text.',
+    'file_changed': 'Workspace file changed while it was being read.',
+    'workspace_unavailable': 'Retained workspace is unavailable or failed verification.',
 }
 
 
@@ -74,17 +88,19 @@ def actor(value):
 
 
 def validate_action(payload):
-    common = {'actor_id', 'action', 'idempotency_key', 'settings_revision', 'settings'}
+    common = {'actor_id', 'action', 'idempotency_key', 'settings_revision'}
     if type(payload) is not dict:
         raise ServiceError('invalid_request', 400)
     action = payload.get('action')
-    expected = common | {'instance_id'} if action == 'purge' else common
+    expected = common | ({'settings'} if action != 'restore' else set())
+    if type(action) is str and action in {'purge', 'restore'}:
+        expected.add('instance_id')
     if set(payload) != expected:
         raise ServiceError('invalid_request', 400)
     actor(payload['actor_id'])
-    if type(action) is not str or action not in {'create', 'start', 'stop', 'restart', 'remove', 'purge'}:
+    if type(action) is not str or action not in {'create', 'start', 'stop', 'restart', 'remove', 'purge', 'restore'}:
         raise ServiceError('invalid_request', 400)
-    if action == 'purge' and (type(payload['instance_id']) is not str
+    if action in {'purge', 'restore'} and (type(payload['instance_id']) is not str
             or re.fullmatch(r'[0-9a-f]{32}', payload['instance_id']) is None):
         raise ServiceError('invalid_request', 400)
     key = payload['idempotency_key']
@@ -93,13 +109,14 @@ def validate_action(payload):
     revision = payload['settings_revision']
     if type(revision) is not int or not 0 <= revision <= 2**63 - 1:
         raise ServiceError('invalid_request', 400)
-    settings = payload['settings']
-    if (type(settings) is not dict or set(settings) != {'name', 'instructions'}
-            or type(settings['name']) is not str or not 1 <= len(settings['name']) <= 128
-            or any(ord(c) < 32 for c in settings['name'])
-            or type(settings['instructions']) is not str or len(settings['instructions']) > 32768
-            or '\x00' in settings['instructions']):
-        raise ServiceError('invalid_request', 400)
+    if action != 'restore':
+        settings = payload['settings']
+        if (type(settings) is not dict or set(settings) != {'name', 'instructions'}
+                or type(settings['name']) is not str or not 1 <= len(settings['name']) <= 128
+                or any(ord(c) < 32 for c in settings['name'])
+                or type(settings['instructions']) is not str or len(settings['instructions']) > 32768
+                or '\x00' in settings['instructions']):
+            raise ServiceError('invalid_request', 400)
     # Snapshot mutable caller input before exact-payload persistence.
     return decode_json(canonical(payload).encode('ascii'))
 
@@ -208,13 +225,14 @@ class RuntimeService:
         except (MetricsUnavailable, OSError, ValueError, KeyError):
             raise ServiceError('metrics_unavailable', 503) from None
 
-    def _admit(self, *, quota, preparing=False):
+    def _admit(self, *, quota, preparing=False, requested_disk_bytes=None):
         sample, limits = self._sample(), self.profile.agent_limits
+        disk_request = limits.disk_bytes if requested_disk_bytes is None else requested_disk_bytes
         decision = evaluate_admission(mode=self.profile.mode, now=self.clock(),
             sampled_at=sample['sampled_at'], cpu_window_seconds=sample['cpu_window_seconds'],
             total_ram_bytes=sample['total_ram_bytes'], available_ram_bytes=sample['available_ram_bytes'],
             cpu_percent=sample['cpu_percent'], requested_ram_bytes=limits.ram_bytes,
-            free_disk_bytes=sample['free_disk_bytes'], requested_disk_bytes=limits.disk_bytes,
+            free_disk_bytes=sample['free_disk_bytes'], requested_disk_bytes=disk_request,
             disk_floor_bytes=self.disk_floor_bytes, disk_quota_verified=quota)
         reasons = set(decision.reasons)
         if preparing:
@@ -295,6 +313,10 @@ class RuntimeService:
                 # recovery from another tab/device without changing the snapshot.
                 runtime['pending_create_key'] = retry_key
                 runtime['pending_create_revision'] = instance['revision']
+            restore_retry = self.store.restore_retry(instance['id'])
+            if restore_retry:
+                runtime['pending_restore_key'] = restore_retry['key']
+                runtime['pending_restore_revision'] = restore_retry['revision']
             purge_retry = self.store.purge_retry(instance['id'])
             if purge_retry:
                 runtime['pending_purge_key'] = purge_retry['key']
@@ -323,23 +345,61 @@ class RuntimeService:
                 result['capabilities']['metrics'] = False
             return result
 
+    def retained_workspace(self, payload):
+        """Browse an owner's removed workspace only; never expose paths or private state."""
+        if type(payload) is not dict:
+            raise ServiceError('invalid_request', 400)
+        action = payload.get('action')
+        if type(action) is not str or action not in {'list', 'preview', 'download'}:
+            raise ServiceError('invalid_request', 400)
+        fields = {'actor_id', 'instance_id', 'action'}
+        if action == 'list':
+            fields.update({'directory', 'offset'})
+        elif action in {'preview', 'download'}:
+            fields.add('path')
+        if set(payload) != fields or action not in {'list', 'preview', 'download'}:
+            raise ServiceError('invalid_request', 400)
+        owner = actor(payload['actor_id'])
+        instance_id = payload['instance_id']
+        if type(instance_id) is not str or re.fullmatch(r'[0-9a-f]{32}', instance_id) is None:
+            raise ServiceError('invalid_request', 400)
+        with self.lock:
+            instance = self.store.retained_instance(owner, instance_id)
+            if instance is None:
+                raise ServiceError('instance_not_found', 404)
+            evidence = self._storage(instance)
+            reader = RetainedWorkspace(evidence['host_path'],
+                                       mount_id=getattr(self.volumes, '_mount_id', None))
+            try:
+                if action == 'list':
+                    return reader.list_directory(payload['directory'], payload['offset'])
+                if action == 'preview':
+                    return {'text': reader.preview(payload['path'])}
+                name, content = reader.download(payload['path'])
+                return WorkspaceDownload(name, content)
+            except WorkspaceFileError as error:
+                statuses = {'invalid_file_path': 400, 'file_not_found': 404,
+                            'file_too_large': 413, 'preview_not_supported': 415,
+                            'file_changed': 409, 'workspace_unavailable': 503}
+                raise ServiceError(error.code, statuses.get(error.code, 503)) from None
+
     def replay(self, payload):
         common = {'actor_id', 'action', 'idempotency_key', 'settings_revision'}
         if type(payload) is not dict:
             raise ServiceError('invalid_request', 400)
         action = payload.get('action')
-        expected = common | {'instance_id'} if action == 'purge' else common
+        expected = common | {'instance_id'} if type(action) is str and action in {'purge', 'restore'} else common
         if set(payload) != expected:
             raise ServiceError('invalid_request', 400)
         owner = actor(payload['actor_id'])
         if (type(payload['action']) is not str
-                or payload['action'] not in {'create', 'start', 'stop', 'restart', 'remove', 'purge'}
+                or payload['action'] not in {'create', 'start', 'stop', 'restart', 'remove', 'purge', 'restore'}
                 or type(payload['idempotency_key']) is not str
                 or re.fullmatch(r'[A-Za-z0-9_-]{1,128}', payload['idempotency_key']) is None
                 or type(payload['settings_revision']) is not int
                 or not 0 <= payload['settings_revision'] <= 2**63 - 1):
             raise ServiceError('invalid_request', 400)
-        if action == 'purge' and (type(payload['instance_id']) is not str
+        if action in {'purge', 'restore'} and (type(payload['instance_id']) is not str
                 or re.fullmatch(r'[0-9a-f]{32}', payload['instance_id']) is None):
             raise ServiceError('invalid_request', 400)
         with self.lock:
@@ -361,16 +421,23 @@ class RuntimeService:
                 return self._view(instance, previous, None)
             saved = self.store.saved_request(owner, payload['idempotency_key'])
             if saved is None:
-                if (payload['action'] != 'purge' or previous['action'] != 'purge'
-                        or instance['state'] != 'purging'):
+                if previous['status'] == 'completed':
+                    info = self._inspect(instance['id']) if instance['active'] else None
+                    return self._view(instance, previous, info)
+                retryable_purge = (payload['action'] == 'purge' and previous['action'] == 'purge'
+                                   and instance['state'] == 'purging')
+                retryable_restore = (payload['action'] == 'restore' and previous['action'] == 'restore'
+                                     and bool(instance['active']))
+                if not (retryable_purge or retryable_restore):
                     raise ServiceError('operation_not_found', 404)
-                # A scrubbed pending purge no longer has its original payload.
-                # Reconstruct only fields consumed by purge; no user settings return.
-                saved = {'actor_id': owner, 'action': 'purge',
+                # A scrubbed pending operation has no user payload. Reconstruct
+                # only fields consumed by the matching restore/purge action.
+                saved = {'actor_id': owner, 'action': payload['action'],
                          'idempotency_key': payload['idempotency_key'],
                          'settings_revision': payload['settings_revision'],
-                         'instance_id': payload['instance_id'],
-                         'settings': {'name': 'Agent', 'instructions': ''}}
+                         'instance_id': payload.get('instance_id')}
+                if payload['action'] != 'restore':
+                    saved['settings'] = {'name': 'Agent', 'instructions': ''}
             return self.action(saved)
 
     def action(self, payload):
@@ -393,41 +460,49 @@ class RuntimeService:
                     if payload['action'] != 'purge' and (
                             not instance['active'] or current is None or current['id'] != instance['id']):
                         raise ServiceError('instance_retired')
-                if payload['action'] == 'create':
-                    self._admit(quota=False, preparing=True)
+                if payload['action'] in {'create', 'restore'}:
+                    self._admit(quota=False, preparing=True,
+                                requested_disk_bytes=0 if payload['action'] == 'restore' else None)
                 limits = self.profile.agent_limits
                 operation = self.store.intent(payload, (limits.ram_bytes, limits.cpu_millicores, limits.disk_bytes), self.capacities)
                 self.store.pending(operation['id'])
                 instance = self.store.instance(operation['instance_id'])
                 instance_id, action = instance['id'], payload['action']
-                if action in {'create', 'start', 'restart'}:
+                evidence = None
+                if action in {'create', 'start', 'restart', 'restore'}:
                     evidence = self._storage(instance, prepare=action == 'create')
                     if not instance['initialized']:
                         self.initialize(instance, evidence)
                         self.store.initialized(instance_id)
                     # Re-observe AFTER real quota verification. Intent is not a permit.
-                    self._admit(quota=evidence['disk_quota_verified'])
+                    self._admit(quota=evidence['disk_quota_verified'],
+                                requested_disk_bytes=0 if action == 'restore' else None)
                 info = self._inspect(instance_id)
-                if action == 'create':
-                    # create is idempotent and verifies the EXACT expected spec/token
-                    # when recovering an existing labelled container.
-                    self._admit(quota=evidence['disk_quota_verified'])
+                if action in {'create', 'restore'}:
+                    assert evidence is not None
+                    # create/restore are idempotent and verify the EXACT expected
+                    # spec/token; restore reuses the existing instance and its data.
+                    self._admit(quota=evidence['disk_quota_verified'],
+                                requested_disk_bytes=0 if action == 'restore' else None)
                     self.engine.create(instance_id, evidence['host_path'], limits, instance['gateway_token'])
                     info = self._inspect(instance_id)
                     if self._absent(info):
                         raise ServiceError('runtime_unavailable', 503)
                     # Also on crash recovery/adoption, verify and re-evaluate right before start.
                     evidence = self._storage(self.store.instance(instance_id))
-                    self._admit(quota=evidence['disk_quota_verified'])
+                    self._admit(quota=evidence['disk_quota_verified'],
+                                requested_disk_bytes=0 if action == 'restore' else None)
                     if info['state'] != 'running':
                         self.engine.start(instance_id)
                 elif action == 'start':
+                    assert evidence is not None
                     if self._absent(info):
                         raise ServiceError('runtime_unavailable', 503)
                     self._admit(quota=evidence['disk_quota_verified'])
                     if info['state'] != 'running':
                         self.engine.start(instance_id)
                 elif action == 'restart':
+                    assert evidence is not None
                     if self._absent(info):
                         raise ServiceError('runtime_unavailable', 503)
                     self._admit(quota=evidence['disk_quota_verified'])
@@ -454,7 +529,7 @@ class RuntimeService:
                         return self._view(current, operation, self._inspect(current['id']))
                     return self._view(self.store.instance(instance_id), operation, info)
                 info = self._inspect(instance_id)
-                if action in {'create', 'start', 'restart'} and info['state'] != 'running':
+                if action in {'create', 'start', 'restart', 'restore'} and info['state'] != 'running':
                     raise ServiceError('runtime_unavailable', 503)
                 if action == 'stop' and not (self._absent(info) or info['state'] in {'stopped', 'exited', 'created', 'failed'}):
                     raise ServiceError('runtime_unavailable', 503)
@@ -470,7 +545,7 @@ class RuntimeService:
             except Exception as error:
                 safe = error if isinstance(error, ServiceError) else ServiceError('runtime_unavailable', 503)
                 if operation:
-                    if safe.code in {'quota_unverified', 'storage_unavailable'} and payload['action'] in {'create', 'start', 'restart'}:
+                    if safe.code in {'quota_unverified', 'storage_unavailable'} and payload['action'] in {'create', 'start', 'restart', 'restore'}:
                         # A crash-recovered container may already be running. Do
                         # not leave it running after failed storage verification.
                         try:
@@ -655,6 +730,20 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         self.close_connection = True
 
+    def _binary(self, status, result):
+        body = result.content
+        filename = quote(result.name, safe="")
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Content-Disposition', f"attachment; filename=download; filename*=UTF-8''{filename}")
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
     def send_error(self, code, message=None, explain=None):
         self._json(code, {'code': 'invalid_request', 'message': MESSAGES['invalid_request']})
 
@@ -665,7 +754,7 @@ class APIHandler(BaseHTTPRequestHandler):
             supplied = headers[0].encode('utf-8') if len(headers) == 1 else b''
             if not hmac.compare_digest(supplied, expected):
                 raise ServiceError('unauthorized', 401)
-            if self.path not in ('/v1/me', '/v1/actions', '/v1/replay'):
+            if self.path not in ('/v1/me', '/v1/actions', '/v1/replay', '/v1/retained/workspace'):
                 raise ServiceError('not_found', 404)
             lengths = self.headers.get_all('Content-Length', [])
             if (len(lengths) != 1 or re.fullmatch(r'[0-9]{1,10}', lengths[0]) is None
@@ -682,8 +771,14 @@ class APIHandler(BaseHTTPRequestHandler):
             controller = self.controller
             dispatch = {'/v1/me': controller.me, '/v1/actions': controller.action,
                         '/v1/replay': controller.replay}
-            result = dispatch[self.path](payload)
-            self._json(200, result)
+            if self.path == '/v1/retained/workspace':
+                result = controller.retained_workspace(payload)
+                if isinstance(result, WorkspaceDownload):
+                    self._binary(200, result)
+                else:
+                    self._json(200, result)
+            else:
+                self._json(200, dispatch[self.path](payload))
         except ServiceError as error:
             self._json(error.status, {'code': error.code, 'message': MESSAGES.get(error.code, MESSAGES['internal_error'])})
         except Exception:

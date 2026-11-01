@@ -100,7 +100,7 @@ Host-service и opt-in Compose bridge реализованы; основной l
 | Метрики/admission | Есть collector `/proc`/`statvfs`, 60-секундное CPU window, freshness 10 секунд, 50% lab/final policy и durable reservations. | Численные budgets для отдельной машины/модели задавать по её ресурсам. |
 | Per-instance resources | На лабораторной ВМ в отчёте показаны 2 GiB RAM, 1 CPU, 256 PIDs, 10 GiB XFS quota assignment/readback. | EDQUOT и полный охват записи не проверены; это не proof для нового host. |
 | Host bridge | AF_UNIX + backend credential, web-only default и opt-in Compose bridge; create/lifecycle подтверждены user report. | Есть вопрос по старому контейнеру со старой seccomp при старте нового supervisor; выяснить до следующего rollout, не очищая DB. |
-| Data lifecycle | Remove-retain сохраняет данные и учитывает disk reservation. | Purge/project release, reattach retained data и recoverable cleanup failed create не реализованы. |
+| Data lifecycle | Для commit `2afe2b5` user report подтверждает remove-retain и purge test. Локально есть restore и owner-scoped workspace-only browser с preview/download. | Новые restore/browser изменения не приняты на ВМ; secrets/state исключены; browser E2E/real XFS всё ещё нужен после согласованной доставки. |
 | Gateway/model | Gateway health показан отдельно от container state; сеть runtime — none. | Browser Gateway/chat, apply draft updates, model and Telegram не подключены. |
 
 ## Проверки перед допуском на новом стенде

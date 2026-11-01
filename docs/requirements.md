@@ -51,13 +51,13 @@
 
 ## Принятые решения и оставшиеся открытые пункты
 
-- OpenClaw baseline: `7c12438929e5d198616fe8f602d896e011647d39`; реальный кабинетный запуск на VM и Docker health подтверждены пользовательским отчётом для commit `4494d7575b0c7534076684e6d8547477b527a42f`. Gateway в браузер и модель не подключены.
+- OpenClaw baseline: `7c12438929e5d198616fe8f602d896e011647d39`; отчёт пользователя для `2afe2b5` подтверждает два контейнера healthy, реальные XFS write/quota, remove/purge тестового набора и отдельные API/idempotency проверки. Gateway в браузер и модель не подключены.
 - Основа веба: Open WebUI v0.12.5-slim, дополнительная страница/API; host-supervisor — opt-in. Основной lifecycle функционально принят на лабораторной ВМ.
 - Один активный экземпляр на владельца принят; multiple instances per owner не поддерживаются.
 - Поля draft: name/instructions. Изменения после создания пока остаются draft и не применяются к OpenClaw.
 - Порог 50% по RAM/средней CPU принят; окно CPU 60 секунд и свежесть 10 секунд. Переносимый конечный budget и резервы модели должны быть заданы отдельно.
 - На лабораторной ВМ report указывает 2 GiB RAM, 1 vCPU, 256 PIDs и XFS quota 10 GiB для экземпляра. EDQUOT, полный охват записи и disk budget на конечной машине остаются открытыми.
-- `remove-retain` на ВМ принят для commit `4494d757`. В текущем локальном коде отдельно добавлен owner-scoped purge retained dataset с retry/replay; он прошёл synthetic checks, но не проверялся на ВМ. Частично подготовленный failed-create cleanup требует отдельной проверки; retained storage не переподключается.
+- `remove-retain` и `purge` на disposable test set подтверждены пользователем на ВМ для `2afe2b5`. В локальном коде есть owner-scoped restore того же ID/storage/quota и workspace-only file browser для list/preview/download. Ни restore, ни новые файловые routes не были на ВМ приняты. Просмотр ограничен рабочей папкой; остальные state/secrets не выдаются. Частично подготовленный failed-create cleanup требует отдельной проверки.
 - Совместная/раздельная история веба и Telegram открыта; Telegram/LLM ещё не реализованы.
 - Секреты не сохранять в репозитории/логах. Состав платформенных событий не включает обнаружение или автоматическое реагирование.
 

@@ -37,9 +37,11 @@ def evaluate_admission(*, mode, now, sampled_at, cpu_window_seconds,
     """Pure decision only; requires trusted observations and separate atomic budgets."""
     if not isinstance(mode, str) or mode not in {'lab', 'final'}:
         raise ValueError('Unknown server policy mode')
-    for value in (total_ram_bytes, requested_ram_bytes, requested_disk_bytes):
+    for value in (total_ram_bytes, requested_ram_bytes):
         if type(value) is not int or not 0 < value <= 2**63 - 1:
             raise ValueError('Positive bounded integer resource amount required')
+    if type(requested_disk_bytes) is not int or not 0 <= requested_disk_bytes <= 2**63 - 1:
+        raise ValueError('Non-negative bounded integer resource amount required')
     for value in (available_ram_bytes, free_disk_bytes, disk_floor_bytes):
         if type(value) is not int or not 0 <= value <= 2**63 - 1:
             raise ValueError('Non-negative bounded integer resource amount required')

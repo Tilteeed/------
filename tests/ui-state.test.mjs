@@ -42,4 +42,12 @@ test('runtime never claims an agent is running without a connection', () => {
   }
   assert.equal(ui.runtimeView({ state: 'purging' }, true).label, 'Удаление данных');
   assert.equal(ui.runtimeView({ state: 'purged' }, true).label, 'Полностью удалён');
+  assert.deepEqual(ui.runtimeView({ state: 'preparing', pending_restore_key: 'restore-1' }, true), {
+    label: 'Восстановление',
+    description: 'Повторно подключаем сохранённые данные к тому же экземпляру; черновик не применяется.',
+  });
+  assert.deepEqual(ui.runtimeView({ state: 'failed', pending_restore_key: 'restore-1' }, true), {
+    label: 'Восстановление не завершено',
+    description: 'Сохранённые данные не удалены. Продолжите восстановление или удалите экземпляр с сохранением данных.',
+  });
 });

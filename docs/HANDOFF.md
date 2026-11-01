@@ -2,14 +2,14 @@
 
 ## 1. Главная задача и статус
 
-Базовый сценарий host-runtime из кабинета **пройден на лабораторной Linux-ВМ по отчёту пользователя** для commit `4494d7575b0c7534076684e6d8547477b527a42f`: настоящий OpenClaw → running/healthy → stop/start/restart → remove-retain → новое создание. Текущая локальная ветка содержит последующие изменения; они не развёрнуты и не приняты на ВМ, поэтому текущую стадию 3 не считать закрытой.
+Пользователь подтвердил, что текущая серия функциональных проверок Stage 3 завершена и пора переходить к разработке. Более ранний отчёт `2afe2b5` перечислял проверки, ещё не выполненные на дату отчёта; актуальные результаты после него подробно не приложены — считать это сообщением пользователя, не просить повторять уже пройденную серию. Текущая локальная рабочая копия содержит незакоммиченные restore и workspace-browser изменения; они не развёрнуты на ВМ.
 
-Базовый сценарий из пользовательского отчёта принят для той версии. Не объявлять доказанными EDQUOT, прямую owner isolation на ВМ, конкуренцию, recovery supervisor или общую невозможность обхода ограничений. Текущая локальная версия требует отдельной приёмки; актуальные границы и следующий шаг — `docs/ROADMAP.md` и `docs/verification.md`.
+В отчёте `2afe2b5` были открыты EDQUOT, конкурентное первоначальное создание и supervisor restart/reconcile. Пользователь позже сообщил, что вся текущая серия функциональных проверок завершена; точные новые результаты не приложены. Не трактовать старый перечень как команду повторить проверки.
 
 ## 2. Где находится проект
 
 - Локальный корень: `C:/Users/SystemX/Downloads/Диплом/Практика/Вебчик`.
-- Текущая локальная ветка `main`, HEAD **`e3533e99b36ac9265426c36f1ee2b3c9f14303cf`**, с незакоммиченными исправлениями purge. Локальный ref `origin/main` не проверялся заново; сеть не опрашивалась. Пользовательский VM-отчёт относится к более раннему `4494d7575b0c7534076684e6d8547477b527a42f`.
+- Текущая локальная ветка `main`, HEAD **`2afe2b5b4da9d5ea1dde1acdac8da015fe591eb7`**, с незакоммиченными исправлениями purge и добавлением restore retained-хранилища. Пользовательский VM-отчёт относится к более раннему `4494d7575b0c7534076684e6d8547477b527a42f`; сеть не опрашивалась.
 - Пользовательский отчёт заявляет проверку этого commit на ВМ. Сопоставить отчёт и локальный код; не переносить лабораторные параметры на другой стенд.
 - После получения отчёта актуализируются документы приёмки/roadmap. Проверить текущий `git status/diff`; не публиковать без отдельного разрешения.
 - Доставка согласована: локальный проект → GitHub после разрешения → clone/build на ВМ. На основном Windows-хосте Docker отсутствует; развёртывание туда не переносить.
@@ -28,7 +28,7 @@
 - Один не удалённый экземпляр на владельца, включая остановленный.
 - Порог RAM/средней CPU **50% — единое правило проекта**. В `final` отказ, в `lab` — `would_deny`. Не превращать его в произвольный пользовательский/host override и не распространять автоматически на диск.
 - Метрики CPU: окно 60 секунд, свежесть 10 секунд; swap не добавляется в физическую RAM.
-- Обычный `remove` сохраняет данные. Явный owner-scoped `purge` и повторяемая очистка реализованы в текущей локальной копии и прошли fake-backend проверки; на ВМ не проверялись. Автоматической очистки нет. Retained storage не подключается к новому экземпляру.
+- Обычный `remove` сохраняет данные. Restore того же retained instance реализован локально. Добавлен локальный файловый браузер только для `state/workspace`: обычная навигация, UTF-8 preview и attachment download с лимитами; hidden files, symlinks, hardlinks, credentials, secrets и внутреннее state исключены. Это не развёрнуто и не принято на ВМ/browser E2E. Полные содержимое и пути хоста пользователю не раскрываются.
 - Модели пока нет. Работа контейнера не означает работающий LLM-чат.
 - Не объявлять проект соответствующим КИИ/ГИС/ИСПДН: нормативные идеи адаптируются, применимость отдельно обосновывается.
 
@@ -37,8 +37,9 @@
 1. Веб-базис: регистрация, вход/выход, сохранение настроек, разделение двух аккаунтов, отказ API без токена.
 2. Отдельный лабораторный OpenClaw без модели: реальный запуск, health/readiness, token auth/pairing, сохранение данных после пересоздания.
 3. Предшествующие config/coordinator-срезы: пользователь предоставил Linux-результаты, в том числе 57 supervisor / 15 lab/storage OK и ожидаемый отказ синтетического create при неподтверждённой квоте.
-4. Новый runtime по пользовательскому отчёту: настоящий create из `/agent`, running/healthy, stop/start/restart, проверенные Docker security settings, XFS project ID/quota assignment/readback и remove-retain с последующим новым create. Отчёт не подтверждает EDQUOT.
+4. По первоначальному пользовательскому отчёту для `4494d757`: create из `/agent`, running/healthy, stop/start/restart, Docker security settings, XFS quota readback, remove-retain и новое создание.
 5. Подготовленный пользователем XFS-том с project Accounting/Enforcement ON. Старое root ext4 discovery завершено; возвращаться к подготовке ext4 не нужно.
+6. По новому пользовательскому отчёту для `2afe2b5b4da9d5ea1dde1acdac8da015fe591eb7`: два активных owner-scoped агента; real XFS write; remove/purge на временном test dataset; cross-owner purge refusal; API validation, replay/idempotency и повторные параллельные replay. EDQUOT, конкурентное первоначальное создание, supervisor restart/reconcile и прерванные операции остались непроверенными. Отчёт говорит, что dataset и старые тестовые project IDs очищены; не считать их доступными для restore.
 
 Подробные свидетельства, точный commit и ограничения — `docs/verification.md`; лабораторные storage параметры — `docs/VM_STORAGE.md`.
 
@@ -106,8 +107,9 @@
 ### Подтверждено
 
 - Пользователь сообщил о ВМ-приёмке настоящего OpenClaw на commit `4494d7575b0c7534076684e6d8547477b527a42f`: create из кабинета, running/healthy, stop/start/restart, remove-retain, новая instance после remove; 73 supervisor tests OK. Ограничения отчёта — `docs/verification.md`.
-- Локально после последних исправлений прошёл `scripts/smoke_runtime.py`: настоящий HTTP/SQLite, fake Docker/XFS/metrics; lifecycle, replay после смены draft, отказ новому stale request, pending-create recovery по исходному snapshot, owner split, paused/restarting, remove-retain, новое создание, owner-scoped purge, отказ чужому владельцу, retry после синтетического сбоя и exact replay.
-- Локально прошли `supervisor.tests.test_runtime_service` (6 тестов), `tests.test_api` (8), `node --check web/agent/app.js`, 4 UI state tests, `compileall` и `git diff --check`. Для XFS purge database-mode теста использован реальный временный SQLite-файл; quota/xattrs и Linux dirfd syscalls имитированы. Браузерный end-to-end, настоящий AF_UNIX, Docker/OpenClaw или XFS не проверены.
+- Последний разрешённый `scripts/smoke_runtime.py` прошёл до добавления restore; сценарий не обновлялся и не запускался повторно. Он не подтверждает восстановление.
+- После добавления restore локально прошёл `ServiceWorkflowSmoke`: retained instance возвращается с тем же ID и host path, marker-файл сохраняется, `prepare` не вызывается повторно, disk reservation не удваивается; проверены owner rejection и retry после quota-проверки failure. Целевая среда fake, файл синтетический.
+- Локально прошли `supervisor.tests.test_runtime_service` (6 тестов), `supervisor.tests.test_policy` (7), `tests.test_api` (9), `node --check web/agent/app.js`, 4 UI state tests, `compileall` и `git diff --check`. Это не браузерный end-to-end, настоящий AF_UNIX, Docker/OpenClaw или XFS.
 - Временный HTTP server и SQLite из smoke удалены; пользовательские VM-данные не затрагивались.
 
 ### Последнее независимое ручное ревью и внесённые после него правки
@@ -119,21 +121,21 @@
 3. Восстановление из другой вкладки/после смены draft: service сообщает владельцу `pending_create_key` / `pending_create_revision`, кабинет предлагает «Продолжить создание» по исходному snapshot.
 4. `paused` / `restarting` больше не подменяются `failed`; Docker adapter обрабатывает unpause внутри авторизованного lifecycle, reconciliation может проверять квоту этих состояний.
 
-Эти исправления исполнены в локальном обновлённом smoke; их backend-путь прошёл fake-adapter HTTP/SQLite сценарий. Реальный браузерный JS-generation и настоящий Docker/XFS/AF_UNIX этим не подтверждены. Пользовательский ВМ-отчёт подтверждает реальный happy path для commit `4494d7575b0c7534076684e6d8547477b527a42f`, но не перечисленные ниже негативные проверки.
+Эти исправления прошли локальный fake-adapter HTTP/SQLite smoke до последующего restore изменения. Новый пользовательский отчёт подтверждает часть purge/lifecycle на реальном Linux/XFS для `2afe2b5`, но не browser end-to-end, adversarial path-race testing, конкурентные первоначальные создания или recovery supervisor. Незакоммиченный restore/UI slice в отчёте не проверялся.
 
 ### Дополнительные исправления purge в локальном checkout
 
 - `XfsVolumes.purge` теперь открывает существующую SQLite на запись через отдельный `mode=rw` без создания базы; обычный verify остаётся `mode=ro`. Тест использует настоящий временный SQLite-файл и проверяет, что отсутствующая БД не создаётся.
-- Рекурсивное удаление на Linux использует directory descriptors, `O_NOFOLLOW`, inode/device и mount-ID checks; синтетический тест проверяет запрет обхода при подмене каталога. Реальные Linux dirfd/XFS syscall ещё не исполнены на этом Windows-хосте.
+- Обход на Linux использует directory descriptors, `O_NOFOLLOW`, inode/device и mount-ID checks; локальные synthetic tests проверяют отказ при подмене каталога. Пользовательский отчёт фиксирует один успешный реальный purge на Linux/XFS, но не adversarial symlink/mount-race тест.
 - Перед освобождением RuntimeStore disk reservation очищаются runtime settings, gateway token и payload всех операций экземпляра (create/start/stop/restart/remove/purge); остаётся только минимальная replay-запись. WAL checkpoint обязателен, иначе reservation сохраняется и retry восстанавливается по метаданным purge. Draft в пользовательском кабинете намеренно остаётся.
-- Локальные unit/HTTP-smoke проходят с fake quota/xattrs; это не проверка настоящего XFS, физического forensic erase или VM rollout.
+- Локальные unit/HTTP-smoke с fake quota/xattrs сами по себе не доказывают работу реального XFS; пользовательский отчёт отдельно подтверждает один успешный purge на ВМ. Физическое forensic erase не гарантируется, а новые незакоммиченные изменения на ВМ не принимались.
 
 ### Не выполнено / не подтверждено
 
-- EDQUOT при достижении hard limit настоящим экземпляром; report confirms quota assignment/readback, not rejection of writes.
-- Пользовательский ВМ-отчёт проверял второго владельца только в UI; локальный fake HTTP/SQLite smoke проверил отказ чужому purge до storage. Другие direct cross-owner операции на настоящей ВМ не проверялись.
-- Конкурентный lifecycle/create и supervisor restart/recovery while managed instance exists; service autostart after reboot.
-- Owner-scoped purge retained tree, SQLite write-mode regression, partial-tree retry, WAL-scrub checkpoint/replay и оставление резерва при сбое прошли локальные synthetic/temp-file checks. Реальный XFS/Docker, cleanup частично подготовленного failed-create storage и ВМ-приёмка не подтверждены; retained storage reattachment не реализовано.
+- Пользователь подтвердил, что серия функциональных проверок Stage 3 завершена; их не повторять как следующий шаг. Результаты зафиксированы в приложенном отчёте только для его commit; более поздние детали не приложены.
+- Конкурентное первоначальное создание, EDQUOT, реальные отказы и supervisor recovery перечислялись как открытые в более раннем отчёте; пользователь затем сообщил, что текущая серия функциональных проверок уже выполнена. Не начинать повторный прогон без конкретного запроса.
+- Restore и workspace-only browser (list/preview/download) реализованы локально и прошли целевые локальные проверки; они не приняты на VM/browser E2E. Stage 5: пользователь выбрал проектировать поддержку и локального, и внешнего model provider, но конкретный backend/model ID отложил. Также выбрано оставить `NetworkMode=none` до отдельного решения. Пока сеть закрыта, не заявлять работающий inference/chat и не включать chat capability. Следующий безопасный development slice — provider-neutral config и owner-scoped server-side chat contract, без outbound path и без передачи Gateway/provider secrets браузеру.
+- Файловый browser/restore не подвергались целевой ВМ-приёмке; локальные synthetic tests не выдавать за Docker/XFS evidence.
 - Реальный browser end-to-end для operation-key generation/recovery; локальные JS syntax/UI-state checks не заменяют его.
 - Gateway/browser integration, application of changed draft, LLM/chat, Telegram.
 - Перенос на другую машину и полный security audit.
@@ -153,9 +155,9 @@
 ## 9. Следующие действия — короткий маршрут
 
 1. Пользователь подтвердил sequence rollout: old container удалён retain, DB показала inactive/removed до остановки старого supervisor и запуска нового. Это не означает поддержку active old-seccomp adoption; сохранять эту границу.
-2. Базовый VM-сценарий для `4494d757` принят пользователем; не менять его действующие данные. Текущие локальные изменения после этой версии на ВМ не проверены.
-3. Локально исправлен owner-scoped `purge`: writable-no-create storage SQLite, descriptor-relative traversal, runtime snapshot/token и все instance operation payloads scrub-ятся до освобождения резерва. Retry после scrub-checkpoint failure сохраняет минимальный purge metadata/key. Targeted HTTP/SQLite smoke и runtime tests прошли; quota/xattrs и Linux FD syscalls остаются имитацией. Не запускать purge на ВМ или действующих данных.
-4. Следующий шаг — короткая приёмка текущего кода на Linux-ВМ по `docs/SUPERVISOR_RUN.md`, только после отдельного согласия на публикацию/доставку и привилегированный запуск. Обычная приёмка ограничивается create/lifecycle/remove-retain; purge/EDQUOT — отдельная изолированная проверка с отдельным согласием.
+2. Локально реализованы restore retained instance и ограниченный workspace file browser (list/preview/download). Целевые тесты используют временную ФС и fake engine; они не доказывают real XFS/Docker/Linux dirfd/browser integration.
+3. Stage 5 decisions: design for both local and external providers; choose the deployment backend/model later. Keep `NetworkMode=none` until a separate network-route decision. Implement the provider-neutral configuration and owner-scoped server-side chat contract without enabling egress; do not represent this as working chat. Installing a model, configuring credentials, opening egress, publishing or VM changes still require their separate approvals.
+4. Once a concrete endpoint and route are selected, implement and test real chat, then prepare one browser/VM acceptance of the new features; do not repeat completed Stage 3 checks.
 
 Это рекомендуемый порядок, не разрешение на кодовую миграцию, публикацию, SSH, privileged setup, квоты, системные изменения или удаление данных. Работать в локальной копии, сохраняя пользовательские изменения.
 
