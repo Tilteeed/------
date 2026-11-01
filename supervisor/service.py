@@ -51,6 +51,7 @@ MESSAGES = {
     'storage_unavailable': 'Instance storage is unavailable.',
     'runtime_unavailable': 'Runtime operation could not be verified.',
     'instance_retired': 'This operation belongs to a retained, removed instance.',
+    'purge_scrub_unverified': 'Purge cleanup is pending; retry using the original operation key.',
     'profile_drift': 'Deployment profile differs from the durable binding.',
     'unsafe_initialization': 'Initial private runtime files could not be verified.',
     'internal_error': 'Service operation failed.',
@@ -342,13 +343,25 @@ class RuntimeService:
                 or re.fullmatch(r'[0-9a-f]{32}', payload['instance_id']) is None):
             raise ServiceError('invalid_request', 400)
         with self.lock:
+            previous = self.store.operation(owner, payload['idempotency_key'])
+            if previous is None:
+                raise ServiceError('operation_not_found', 404)
+            metadata = self.store.request_metadata(owner, payload['idempotency_key'])
+            if metadata is None:
+                raise ServiceError('operation_not_found', 404)
+            if (metadata.get('action') != payload['action']
+                    or metadata.get('settings_revision') != payload['settings_revision']
+                    or metadata.get('instance_id') != payload.get('instance_id')):
+                raise ServiceError('idempotency_conflict')
+            instance = self.store.instance(previous['instance_id'])
+            if instance['state'] == 'purged':
+                current = self.store.current(owner)
+                if current is not None:
+                    return self._view(current, previous, self._inspect(current['id']))
+                return self._view(instance, previous, None)
             saved = self.store.saved_request(owner, payload['idempotency_key'])
             if saved is None:
                 raise ServiceError('operation_not_found', 404)
-            if (saved['action'] != payload['action']
-                    or saved['settings_revision'] != payload['settings_revision']
-                    or saved.get('instance_id') != payload.get('instance_id')):
-                raise ServiceError('idempotency_conflict')
             return self.action(saved)
 
     def action(self, payload):
@@ -443,7 +456,7 @@ class RuntimeService:
                 operation['status'] = 'completed'
                 return self._view(self.store.instance(instance_id), operation, info)
             except StoreError as error:
-                status = 404 if error.code == 'instance_not_found' else (503 if error.code == 'capacity_exhausted' else 409)
+                status = 404 if error.code == 'instance_not_found' else (503 if error.code in {'capacity_exhausted', 'purge_scrub_unverified'} else 409)
                 raise ServiceError(error.code if error.code in MESSAGES else 'internal_error', status) from None
             except Exception as error:
                 safe = error if isinstance(error, ServiceError) else ServiceError('runtime_unavailable', 503)

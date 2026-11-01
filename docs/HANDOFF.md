@@ -9,7 +9,7 @@
 ## 2. Где находится проект
 
 - Локальный корень: `C:/Users/SystemX/Downloads/Диплом/Практика/Вебчик`.
-- Текущая локальная ветка `main`, HEAD **`25d3afafcfc54c1a29a3d0f618569410c15c5300` — `stage 4 1/4`**, с незакоммиченными изменениями. Локальный ref `origin/main` указывал на этот же commit; сеть не опрашивалась. Пользовательский VM-отчёт относится к более раннему `4494d7575b0c7534076684e6d8547477b527a42f`.
+- Текущая локальная ветка `main`, HEAD **`e3533e99b36ac9265426c36f1ee2b3c9f14303cf`**, с незакоммиченными исправлениями purge. Локальный ref `origin/main` не проверялся заново; сеть не опрашивалась. Пользовательский VM-отчёт относится к более раннему `4494d7575b0c7534076684e6d8547477b527a42f`.
 - Пользовательский отчёт заявляет проверку этого commit на ВМ. Сопоставить отчёт и локальный код; не переносить лабораторные параметры на другой стенд.
 - После получения отчёта актуализируются документы приёмки/roadmap. Проверить текущий `git status/diff`; не публиковать без отдельного разрешения.
 - Доставка согласована: локальный проект → GitHub после разрешения → clone/build на ВМ. На основном Windows-хосте Docker отсутствует; развёртывание туда не переносить.
@@ -106,8 +106,8 @@
 ### Подтверждено
 
 - Пользователь сообщил о ВМ-приёмке настоящего OpenClaw на commit `4494d7575b0c7534076684e6d8547477b527a42f`: create из кабинета, running/healthy, stop/start/restart, remove-retain, новая instance после remove; 73 supervisor tests OK. Ограничения отчёта — `docs/verification.md`.
-- Локально после текущих изменений прошёл `scripts/smoke_runtime.py`: настоящий HTTP/SQLite, fake Docker/XFS/metrics; lifecycle, replay после смены draft, отказ новому stale request, pending-create recovery по исходному snapshot, owner split, paused/restarting, remove-retain, новое создание, owner-scoped purge с отказом чужому владельцу, retry после синтетического сбоя и exact replay без повторного эффекта.
-- Локально прошли targeted `supervisor.tests.test_runtime_service` (3 теста), два HTTP API regression tests, `node --check web/agent/app.js`, 4 UI state tests, `compileall` и `git diff --check`. Это не браузерный end-to-end, не настоящий AF_UNIX, Docker, OpenClaw или XFS.
+- Локально после последних исправлений прошёл `scripts/smoke_runtime.py`: настоящий HTTP/SQLite, fake Docker/XFS/metrics; lifecycle, replay после смены draft, отказ новому stale request, pending-create recovery по исходному snapshot, owner split, paused/restarting, remove-retain, новое создание, owner-scoped purge, отказ чужому владельцу, retry после синтетического сбоя и exact replay.
+- Локально прошли `supervisor.tests.test_runtime_service` (6 тестов), `tests.test_api` (8), `node --check web/agent/app.js`, 4 UI state tests, `compileall` и `git diff --check`. Для XFS purge database-mode теста использован реальный временный SQLite-файл; quota/xattrs и Linux dirfd syscalls имитированы. Браузерный end-to-end, настоящий AF_UNIX, Docker/OpenClaw или XFS не проверены.
 - Временный HTTP server и SQLite из smoke удалены; пользовательские VM-данные не затрагивались.
 
 ### Последнее независимое ручное ревью и внесённые после него правки
@@ -121,12 +121,19 @@
 
 Эти исправления исполнены в локальном обновлённом smoke; их backend-путь прошёл fake-adapter HTTP/SQLite сценарий. Реальный браузерный JS-generation и настоящий Docker/XFS/AF_UNIX этим не подтверждены. Пользовательский ВМ-отчёт подтверждает реальный happy path для commit `4494d7575b0c7534076684e6d8547477b527a42f`, но не перечисленные ниже негативные проверки.
 
+### Дополнительные исправления purge в локальном checkout
+
+- `XfsVolumes.purge` теперь открывает существующую SQLite на запись через отдельный `mode=rw` без создания базы; обычный verify остаётся `mode=ro`. Тест использует настоящий временный SQLite-файл и проверяет, что отсутствующая БД не создаётся.
+- Рекурсивное удаление на Linux использует directory descriptors, `O_NOFOLLOW`, inode/device и mount-ID checks; синтетический тест проверяет запрет обхода при подмене каталога. Реальные Linux dirfd/XFS syscall ещё не исполнены на этом Windows-хосте.
+- Перед освобождением RuntimeStore disk reservation очищаются runtime settings, gateway token и create-payload; остаётся минимальная replay-запись. WAL checkpoint обязателен, иначе reservation сохраняется для повтора. Draft в пользовательском кабинете намеренно остаётся.
+- Локальные unit/HTTP-smoke проходят с fake quota/xattrs; это не проверка настоящего XFS, физического forensic erase или VM rollout.
+
 ### Не выполнено / не подтверждено
 
 - EDQUOT при достижении hard limit настоящим экземпляром; report confirms quota assignment/readback, not rejection of writes.
-- Прямой cross-owner запрос к чужому instance/API (report verifies only UI visibility).
+- Пользовательский ВМ-отчёт проверял второго владельца только в UI; локальный fake HTTP/SQLite smoke проверил отказ чужому purge до storage. Другие direct cross-owner операции на настоящей ВМ не проверялись.
 - Конкурентный lifecycle/create и supervisor restart/recovery while managed instance exists; service autostart after reboot.
-- Явный owner-scoped purge retained dataset и его retry/exact replay прошли локальные fake-backend/synthetic checks; cleanup частично созданного failed-create dataset, настоящий XFS/Docker и ВМ-приёмка не подтверждены. Retained storage reattachment не реализовано.
+- Owner-scoped purge retained tree, SQLite write-mode regression, partial-tree retry, WAL-scrub checkpoint/replay и оставление резерва при сбое прошли локальные synthetic/temp-file checks. Реальный XFS/Docker, cleanup частично подготовленного failed-create storage и ВМ-приёмка не подтверждены; retained storage reattachment не реализовано.
 - Реальный browser end-to-end для operation-key generation/recovery; локальные JS syntax/UI-state checks не заменяют его.
 - Gateway/browser integration, application of changed draft, LLM/chat, Telegram.
 - Перенос на другую машину и полный security audit.
@@ -147,7 +154,7 @@
 
 1. Пользователь подтвердил sequence rollout: old container удалён retain, DB показала inactive/removed до остановки старого supervisor и запуска нового. Это не означает поддержку active old-seccomp adoption; сохранять эту границу.
 2. Базовый VM-сценарий для `4494d757` принят пользователем; не менять его действующие данные. Текущие локальные изменения после этой версии на ВМ не проверены.
-3. Локально реализован явный `purge` с сохранением резерва до подтверждённого удаления дерева и сброса quota; fake-backend HTTP/SQLite smoke и synthetic XFS purge test прошли. Не запускать purge на ВМ или действующих данных.
+3. Локально исправлен owner-scoped `purge`: writable-no-create storage SQLite, descriptor-relative traversal, runtime snapshot/token/create-payload scrub и WAL checkpoint до release. Targeted HTTP/SQLite smoke и 6 runtime tests прошли; quota/xattrs и Linux FD syscalls остаются имитацией. Не запускать purge на ВМ или действующих данных.
 4. Следующий шаг — короткая приёмка текущего кода на Linux-ВМ по `docs/SUPERVISOR_RUN.md`, только после отдельного согласия на публикацию/доставку и привилегированный запуск. Обычная приёмка ограничивается create/lifecycle/remove-retain; purge/EDQUOT — отдельная изолированная проверка с отдельным согласием.
 
 Это рекомендуемый порядок, не разрешение на кодовую миграцию, публикацию, SSH, privileged setup, квоты, системные изменения или удаление данных. Работать в локальной копии, сохраняя пользовательские изменения.

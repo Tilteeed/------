@@ -3,7 +3,6 @@
 An intent reserves resources, NOT permission to create/start a container. Failed
 and pending creates keep their reservation. Removed instances retain disk forever.
 """
-import hashlib
 import json
 import secrets
 import sqlite3
@@ -30,6 +29,7 @@ class RuntimeStore:
         try:
             self.db.execute('PRAGMA journal_mode=WAL')
             self.db.execute('PRAGMA synchronous=FULL')
+            self.db.execute('PRAGMA secure_delete=ON')
             self.db.execute('PRAGMA foreign_keys=ON')
             self.db.executescript('''
                 CREATE TABLE IF NOT EXISTS binding (id INTEGER PRIMARY KEY CHECK(id=1), version TEXT NOT NULL, fingerprint TEXT NOT NULL);
@@ -79,12 +79,38 @@ class RuntimeStore:
                 raise StoreError('idempotency_conflict')
             return dict(row) if row else None
 
-    def saved_request(self, actor, key):
-        """Read a detached copy of the immutable, owner-scoped request snapshot."""
+    def operation(self, actor, key):
+        with self.lock:
+            row = self.db.execute('SELECT * FROM operations WHERE actor=? AND key=?',
+                                  (actor, key)).fetchone()
+            return dict(row) if row else None
+
+    def request_metadata(self, actor, key):
+        """Minimal replay fields remain available after a create snapshot is scrubbed."""
         with self.lock:
             row = self.db.execute('SELECT payload FROM operations WHERE actor=? AND key=?',
                                   (actor, key)).fetchone()
-            return json.loads(row['payload'])['request'] if row else None
+            if row is None:
+                return None
+            saved = json.loads(row['payload'])
+            if type(saved) is not dict:
+                return None
+            request = saved.get('request')
+            if type(request) is dict:
+                return {name: request.get(name) for name in ('action', 'settings_revision', 'instance_id')}
+            replay = saved.get('replay')
+            return dict(replay) if type(replay) is dict else None
+
+    def saved_request(self, actor, key):
+        """Read a detached copy of the owner-scoped request if it is still retained."""
+        with self.lock:
+            row = self.db.execute('SELECT payload FROM operations WHERE actor=? AND key=?',
+                                  (actor, key)).fetchone()
+            if row is None:
+                return None
+            saved = json.loads(row['payload'])
+            request = saved.get('request') if type(saved) is dict else None
+            return request if type(request) is dict else None
 
     def create_retry(self, instance_id):
         with self.lock:
@@ -213,17 +239,53 @@ class RuntimeStore:
                             (state, container_id, instance_id))
 
     def complete(self, operation_id, state, container_id=None):
-        with self.transaction():
+        with self.lock:
             operation = self.db.execute('SELECT * FROM operations WHERE id=?', (operation_id,)).fetchone()
             if operation is None:
                 raise StoreError('operation_not_found')
-            if state == 'removed':
-                self.db.execute("UPDATE instances SET active=0,state='removed',ram=0,cpu=0,container_id=NULL WHERE id=?", (operation['instance_id'],))
-            elif state == 'purged':
-                self.db.execute("UPDATE instances SET active=0,state='purged',ram=0,cpu=0,disk=0,storage=NULL,container_id=NULL WHERE id=?", (operation['instance_id'],))
-            else:
-                self.db.execute('UPDATE instances SET state=?,container_id=? WHERE id=? AND active=1', (state, container_id, operation['instance_id']))
-            self.db.execute("UPDATE operations SET status='completed',error=NULL WHERE id=?", (operation_id,))
+            instance_id = operation['instance_id']
+            if state == 'purged':
+                if operation['action'] != 'purge':
+                    raise StoreError('invalid_transition')
+                # First scrub instance secrets/snapshots and retain only minimal
+                # replay metadata. Keep the disk reservation until SQLite confirms
+                # the scrubbed WAL can be checkpointed.
+                with self.transaction():
+                    self.db.execute("UPDATE instances SET settings='{}',gateway_token='',storage=NULL,container_id=NULL WHERE id=?",
+                                    (instance_id,))
+                    rows = self.db.execute(
+                        "SELECT id,payload FROM operations WHERE instance_id=? AND action='create'",
+                        (instance_id,)).fetchall()
+                    for row in rows:
+                        original = json.loads(row['payload'])
+                        if type(original) is dict and original.get('redacted') is True:
+                            redacted = row['payload']
+                        else:
+                            request = original.get('request') if type(original) is dict else None
+                            replay = {name: request.get(name) for name in
+                                     ('action', 'settings_revision', 'instance_id')} if type(request) is dict else {}
+                            redacted = canonical({'redacted': True, 'replay': replay})
+                        self.db.execute('UPDATE operations SET payload=? WHERE id=?',
+                                        (redacted, row['id']))
+                checkpoint = self.db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+                if checkpoint is None or checkpoint[0] != 0:
+                    raise StoreError('purge_scrub_unverified')
+                with self.transaction():
+                    self.db.execute("UPDATE instances SET active=0,state='purged',ram=0,cpu=0,disk=0 WHERE id=?",
+                                    (instance_id,))
+                    self.db.execute("UPDATE operations SET status='completed',error=NULL WHERE id=?",
+                                    (operation_id,))
+                return
+
+            with self.transaction():
+                if state == 'removed':
+                    self.db.execute("UPDATE instances SET active=0,state='removed',ram=0,cpu=0,container_id=NULL WHERE id=?",
+                                    (instance_id,))
+                else:
+                    self.db.execute('UPDATE instances SET state=?,container_id=? WHERE id=? AND active=1',
+                                    (state, container_id, instance_id))
+                self.db.execute("UPDATE operations SET status='completed',error=NULL WHERE id=?",
+                                (operation_id,))
 
     def fail(self, operation_id, code):
         with self.transaction():

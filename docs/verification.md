@@ -2,13 +2,13 @@
 
 ## Локальная проверка текущих изменений
 
-- `python scripts/smoke_runtime.py`: PASS. Реальные HTTP/SQLite; fake Docker/XFS/metrics. Покрыты lifecycle, replay после новой draft revision, отказ новому stale request, pending-create recovery по исходному snapshot, owner separation, paused/restarting, remove-retain, новое создание после remove, owner-scoped purge, отказ чужому владельцу, retry синтетического сбоя и exact replay без повтора эффекта.
-- `python -m unittest supervisor.tests.test_runtime_service -v`: 3 теста, OK; включая синтетическое удаление только записанного дерева и проверку команд сброса проекта/квоты.
-- Два целевых `tests.test_api` случая: purge request schema/replay по старой revision, stale new request rejection и честный 503 при неподключённом runtime — OK.
-- `node --check web/agent/app.js` и `node --test tests/ui-state.test.mjs`: 4 теста, OK. Это не браузерный execution test.
-- `python -m compileall -q supervisor control_plane` и `git diff --check`: OK.
+- `python scripts/smoke_runtime.py`: PASS после текущего кода. Реальные HTTP/SQLite; fake Docker/XFS/metrics. Покрыты lifecycle, replay после новой draft revision, stale rejection, pending-create recovery, owner separation, paused/restarting, remove-retain, новое создание и purge retry/replay.
+- `python -m unittest supervisor.tests.test_runtime_service -v`: 6 тестов, OK. Включают временный SQLite-файл с `mode=ro`/`mode=rw` без создания, сбой после частичного удаления дерева и recovery, очистку runtime snapshot/token/create payload, WAL-checkpoint gating и replay tombstone.
+- `python -m unittest tests.test_api -v`: 8 тестов, OK.
+- `node --check web/agent/app.js` и `node --test tests/ui-state.test.mjs`: 4 теста, OK; не браузерный execution test.
+- `python -m compileall -q supervisor control_plane scripts` и `git diff --check`: OK.
 
-Smoke создаёт и удаляет только собственные временные SQLite/HTTP fixtures. Он **не** подтверждает браузерный JS, реальный AF_UNIX, Docker/OpenClaw, XFS project quota или фактическое удаление данных на ВМ.
+Python/HTTP smoke использует настоящие SQLite/HTTP и удаляет только временные fixtures; Docker, XFS quota/xattrs, Linux directory-descriptor syscalls и AF_UNIX имитируются или не вызываются. Это **не** ВМ-приёмка и не forensic secure-erase proof.
 
 ## Успешные локальные проверки (исторический базис первой части)
 
@@ -51,7 +51,7 @@ HTTP-тесты используют тестовую dependency личност�
 
 ## Этапы 3–4: функциональная приёмка host-runtime на ВМ
 
-**Источник свидетельств:** отчёт пользователя о проверке commit `4494d7575b0c7534076684e6d8547477b527a42f` на Linux-ВМ с Docker/XFS. На момент этого отчёта локальный `main` совпадал с commit; текущий HEAD `25d3afafcfc54c1a29a3d0f618569410c15c5300` содержит последующие локальные изменения и в этом отчёте не проверялся. Это пользовательская приёмка; помощник не подключался к ВМ и не повторял её.
+**Источник свидетельств:** отчёт пользователя о проверке commit `4494d7575b0c7534076684e6d8547477b527a42f` на Linux-ВМ с Docker/XFS. На момент отчёта локальный `main` совпадал с этим commit; текущий HEAD `e3533e99b36ac9265426c36f1ee2b3c9f14303cf` содержит последующие purge-изменения, а текущие локальные исправления после него не проверялись на ВМ. Это пользовательская приёмка; помощник не подключался к ВМ и не повторял её.
 
 В отчёте указано:
 
@@ -72,8 +72,9 @@ HTTP-тесты используют тестовую dependency личност�
 - Пользовательский ВМ-отчёт проверял второго владельца только на отображение в UI; локальный fake HTTP/SQLite smoke дополнительно подтвердил отказ чужому purge до вызова storage. Прямой cross-owner API при настоящем Docker/XFS/ВМ не проверялся.
 - Не проверены одновременное создание несколькими владельцами, конкурентные lifecycle-запросы и восстановление supervisor при уже работающем управляемом экземпляре.
 - Автозапуск supervisor после reboot не настроен.
-- Текущий локальный код содержит owner-scoped explicit purge для retained-набора с journaled retry и проверкой очистки дерева/квоты. Локальные synthetic test и HTTP/SQLite smoke прошли; на настоящем XFS/Docker или ВМ purge не проверялся.
-- Cleanup частично подготовленного failed-create storage и reattachment retained dataset не принимались на ВМ и требуют отдельной проверки; автоматической очистки нет.
+- Текущий локальный purge owner-scoped и journaled. Storage DB открывается на запись только явным `mode=rw` без создания, обход дерева привязан к directory FDs и проверяет inode/device/mount ID, instance snapshot/token/create payload scrub-ятся, а disk reservation остаётся до успешного WAL checkpoint.
+- Это подтверждено локальными temp-SQLite и syscall-mock тестами. Настоящий Linux `/proc/fdinfo`/dirfd, XFS project quota, Docker removal и фактическое VM purge не запускались; secure forensic erase от SSD не гарантируется.
+- Cleanup после failed create с отсутствующим/неполным XFS journal и reattachment retained dataset отдельно не принимались; автоматической очистки нет.
 - Gateway в кабинет, применение обновлённых настроек, LLM/chat и Telegram не подключены.
 
 Не запускать очистку существующего Project ID/каталога или сброс SQLite для проверки. Для реального EDQUOT и purge нужен отдельный изолированный набор данных/проект и согласованный сценарий.

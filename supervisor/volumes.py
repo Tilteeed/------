@@ -147,8 +147,9 @@ class XfsVolumes:
         return fd
 
     @contextmanager
-    def _database(self, create):
+    def _database(self, create, *, writable=False):
         import fcntl  # Linux-only; importing this module on Windows stays inert.
+        _require(type(create) is bool and type(writable) is bool, 'invalid_database_mode')
         _require(self.state_dir.is_absolute(), 'invalid_state_dir')
         _require(not self.state_dir.is_relative_to(self.mountpoint), 'state_inside_volume')
         if create and not os.path.lexists(self.state_dir):
@@ -169,7 +170,8 @@ class XfsVolumes:
             fcntl.flock(lock, fcntl.LOCK_EX)
             fd = self._private_file(self.db_path, create)
             os.close(fd)
-            uri = self.db_path.as_uri() + ('?mode=rw' if create else '?mode=ro')
+            mode = 'rw' if create or writable else 'ro'
+            uri = self.db_path.as_uri() + '?mode=' + mode
             db = sqlite3.connect(uri, uri=True, timeout=10, isolation_level=None)
             db.row_factory = sqlite3.Row
             if create:
@@ -315,21 +317,90 @@ class XfsVolumes:
         return {'host_path': str(root), 'project_id': project_id,
                 'disk_quota_verified': True}
 
+    @staticmethod
+    def _mount_id(fd):
+        """Read the kernel mount ID for an already-open directory descriptor."""
+        try:
+            with open(f'/proc/self/fdinfo/{fd}', 'r', encoding='ascii') as info:
+                for line in info:
+                    if line.startswith('mnt_id:'):
+                        value = line.split(':', 1)[1].strip()
+                        _require(value.isdecimal(), 'mount_identity_unavailable')
+                        return int(value)
+        except (OSError, UnicodeError):
+            raise RuntimeStorageError('mount_identity_unavailable') from None
+        raise RuntimeStorageError('mount_identity_unavailable')
+
     @classmethod
-    def _clear_contents(cls, path, device):
-        """Delete one owned tree without following symlinks or crossing devices."""
+    def _clear_contents_fd(cls, dir_fd, *, device, mount_id):
+        """Clear an owned tree using openat-style operations; never follow paths."""
+        with os.scandir(dir_fd) as entries:
+            names = [entry.name for entry in entries]
+        for name in names:
+            info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            _require(info.st_dev == device, 'nested_mount')
+            if stat.S_ISDIR(info.st_mode):
+                flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+                child_fd = os.open(name, flags, dir_fd=dir_fd)
+                try:
+                    opened = os.fstat(child_fd)
+                    _require(stat.S_ISDIR(opened.st_mode)
+                             and (opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino),
+                             'directory_identity_changed')
+                    _require(opened.st_dev == device and cls._mount_id(child_fd) == mount_id,
+                             'nested_mount')
+                    cls._clear_contents_fd(child_fd, device=device, mount_id=mount_id)
+                    current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                    _require(stat.S_ISDIR(current.st_mode)
+                             and (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino),
+                             'directory_identity_changed')
+                    os.rmdir(name, dir_fd=dir_fd)
+                finally:
+                    os.close(child_fd)
+            else:
+                current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                _require((current.st_dev, current.st_ino) == (info.st_dev, info.st_ino),
+                         'directory_identity_changed')
+                os.unlink(name, dir_fd=dir_fd)
+        os.fsync(dir_fd)
+
+    @classmethod
+    def _clear_contents_path(cls, path, device, expected_inode=None):
+        """Portable synthetic-test fallback; production preflight is Linux-only."""
+        info = path.lstat()
+        _require(info.st_dev == device and (expected_inode is None or info.st_ino == expected_inode),
+                 'directory_identity_changed')
         with os.scandir(path) as entries:
             for entry in entries:
                 info = os.lstat(entry.path)
                 _require(info.st_dev == device and not os.path.ismount(entry.path),
                          'nested_mount')
                 if stat.S_ISDIR(info.st_mode):
-                    cls._clear_contents(Path(entry.path), device)
+                    cls._clear_contents_path(Path(entry.path), device, info.st_ino)
                     os.rmdir(entry.path)
                 else:
-                    # Symlinks and special files are unlinked, never opened/followed.
                     os.unlink(entry.path)
         cls._sync_dir(path)
+
+    @classmethod
+    def _clear_contents(cls, path, device, expected_inode=None):
+        """Clear only the verified directory using descriptor-relative traversal."""
+        if sys.platform != 'linux':
+            # _preflight rejects this path in production; retained only for portable
+            # synthetic tests that patch the privileged host probes.
+            return cls._clear_contents_path(path, device, expected_inode)
+        _require(hasattr(os, 'O_DIRECTORY') and hasattr(os, 'O_NOFOLLOW'),
+                 'dirfd_cleanup_unsupported')
+        flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+        fd = os.open(path, flags)
+        try:
+            info = os.fstat(fd)
+            _require(stat.S_ISDIR(info.st_mode) and info.st_dev == device
+                     and (expected_inode is None or info.st_ino == expected_inode),
+                     'directory_identity_changed')
+            cls._clear_contents_fd(fd, device=device, mount_id=cls._mount_id(fd))
+        finally:
+            os.close(fd)
 
     @staticmethod
     def _quota_clear(rows):
@@ -358,7 +429,7 @@ class XfsVolumes:
             _require(expected_project_id is None, 'storage_state_missing')
             return {'purged': True, 'project_id': None}
         try:
-            with self._database(create=False) as db:
+            with self._database(create=False, writable=True) as db:
                 row = db.execute('SELECT * FROM volume_projects WHERE instance_id=?',
                                  (instance_id,)).fetchone()
                 root = self.instances / instance_id
@@ -407,7 +478,7 @@ class XfsVolumes:
                                  if original_stage == 'reserved'
                                  else self._quota_matches(limits, disk_bytes),
                                  'quota_limit_mismatch')
-                        self._clear_contents(root, root.stat().st_dev)
+                        self._clear_contents(root, root_record['device'], root_record['inode'])
                         self._quota(f'project -C -p {root} {project_id}')
                         identity = self._fsxattr(root)
                     else:

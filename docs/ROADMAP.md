@@ -74,7 +74,7 @@ Read-only конфигурация в лабораторном профиле с
 
 **Статус: базовый жизненный цикл пройден на ВМ по тому же пользовательскому отчёту для `4494d757`. Последующий локальный код не проверен на ВМ.** На одном контейнере выполнены create → stop → start → restart с последующим `running/healthy`; файлы и XFS project inheritance сохранены. Remove удаляет контейнер с сохранением данных и дискового резерва; после него выполнено новое создание с другим Project ID.
 
-Обычный `remove` сохраняет данные. Owner-scoped explicit `purge` с повтором незавершённой операции реализован в текущем локальном коде и прошёл fake/synthetic checks, но на ВМ не проверялся. Переподключение retained-набора не реализовано; автоматически данные не очищаются. Cleanup частично созданного storage после failed create требует отдельной проверки.
+Обычный `remove` сохраняет данные. Owner-scoped explicit `purge` в текущей локальной версии открывает существующую storage SQLite для записи без создания базы, очищает только descriptor-anchored tree, сбрасывает квоту и scrub-ит runtime snapshot/token/create payload до освобождения резерва. Тесты на временной SQLite и синтетических failure points прошли; настоящие Linux dirfd/XFS/Docker и ВМ не проверялись. Retained storage не переподключается, automatic purge отсутствует; cleanup storage при failed create отдельно не принимался.
 
 **Оставшиеся проверки этапа 4 на текущем коде:** реальный browser end-to-end, проверка lifecycle и owner isolation на актуальной ВМ, конкурентные действия, восстановление supervisor при существующем runtime. Локальный fake HTTP/SQLite smoke проверяет точный replay, stale отказ и чужой purge, но не является VM/browser проверкой.
 

@@ -299,7 +299,7 @@ $('settings-form').addEventListener('submit', async (event) => {
 async function submitAction(button, action, targetInstanceId = null, savedPurgeKey = null, savedPurgeRevision = null) {
   if (button.disabled || busy || !authenticated) return;
   if (action === 'remove' && !window.confirm('Удалить контейнер? Данные будут сохранены. Для следующего экземпляра потребуется дополнительный дисковый бюджет.')) return;
-  if (action === 'purge' && !window.confirm('Безвозвратно удалить контейнер и все его сохранённые данные, затем освободить дисковую квоту? Это действие нельзя отменить.')) return;
+  if (action === 'purge' && !window.confirm('Удалить контейнер, файлы экземпляра, runtime-снимок и его секреты, затем освободить дисковую квоту? Черновик настроек кабинета сохранится. Действие нельзя отменить.')) return;
   const epoch = identityEpoch;
   if (action === 'purge' && !targetInstanceId) targetInstanceId = runtimeData.instance_id;
   const currentPurge = action === 'purge' && targetInstanceId === runtimeData.instance_id;
