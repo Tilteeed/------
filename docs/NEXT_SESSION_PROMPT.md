@@ -7,7 +7,7 @@
 Продолжаем практический проект диплома в папке:
 `C:/Users/SystemX/Downloads/Диплом/Практика/Вебчик`.
 
-**Сначала прочитай `docs/HANDOFF.md`, `docs/ROADMAP.md`, `docs/verification.md` и `docs/SUPERVISOR_RUN.md`, затем сверь Git и исходники.** Последняя локальная сверка: `main`, HEAD `2afe2b5b4da9d5ea1dde1acdac8da015fe591eb7`, с незакоммиченными restore/UI изменениями; сеть не проверялась. Пользовательский Linux-VM отчёт относится к base commit `2afe2b5`, не к текущим незакоммиченным изменениям.
+**Сначала прочитай `docs/HANDOFF.md`, `docs/ROADMAP.md`, `docs/verification.md` и `docs/SUPERVISOR_RUN.md`, затем сверь Git и исходники.** HEAD `0940fc1784b2f52a25a69b2e2e4401e4a561df8c` (`0940fc1`) содержит restore/workspace-browser функции, но не прошёл приёмку на ВМ. Локальный bounded-preview response fix и тесты добавлены поверх него; Python, UI, compileall и diff-check прошли. Пользовательский Linux-VM отчёт относится к `2afe2b5`, не к `0940fc1`.
 
 Базовый lifecycle и purge report относятся к `2afe2b5`. Пользователь позже сообщил, что текущая серия функциональных проверок Stage 3 уже завершена и переходят к разработке; не повторять её как следующий шаг. Подробные результаты более поздней проверки не приложены, поэтому точные дополнительные VM-утверждения не добавляю. Новая локальная workspace-browser реализация покрывает только workspace view/download и требует целевой browser/VM acceptance после согласованной доставки.
 

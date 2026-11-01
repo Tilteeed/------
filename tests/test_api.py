@@ -55,7 +55,7 @@ class PlatformApiTests(unittest.TestCase):
     def test_restore_does_not_forward_current_draft_to_supervisor(self):
         client = SupervisorClient('unused.sock', 'unused.token')
         sent = {}
-        client._request = lambda path, payload: sent.update(path=path, payload=payload) or {}
+        client._request = lambda path, payload, *, response_kind='runtime', response_limit=65536: sent.update(path=path, payload=payload) or {}
         request = {'action': 'restore', 'idempotency_key': 'restore-key',
                    'settings_revision': 2, 'instance_id': 'b' * 32}
         client.action('alice', request, {'name': 'Draft', 'instructions': 'PRIVATE_DRAFT_TEXT'})
@@ -202,6 +202,7 @@ class PlatformApiTests(unittest.TestCase):
         preview = client.get(base + "/preview", params={"path": "notes/note.md"}, headers=self.alice)
         self.assertEqual(preview.status_code, 200, preview.text)
         self.assertEqual(preview.json(), {"text": "hello"})
+        self.assertEqual(preview.headers["cache-control"], "no-store")
         download = client.get(base + "/download", params={"path": "notes/note.md"}, headers=self.alice)
         self.assertEqual(download.status_code, 200)
         self.assertEqual(download.content, b"\\x00file")

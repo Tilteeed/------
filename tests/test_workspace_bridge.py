@@ -13,7 +13,7 @@ class WorkspaceBridgeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             client = SupervisorClient("unused.sock", Path(tmp) / "token")
             calls = []
-            def request(path, payload, *, response_kind='runtime'):
+            def request(path, payload, *, response_kind='runtime', response_limit=65536):
                 calls.append((path, payload, response_kind))
                 if payload['action'] == 'list':
                     return {'directory': 'notes', 'entries': [{'name': 'note.md', 'kind': 'file', 'size': 5}],
@@ -35,6 +35,44 @@ class WorkspaceBridgeTests(unittest.TestCase):
             client._request = oversized_or_secret_response
             with self.assertRaises(RuntimeUnavailable):
                 client.workspace_list('alice', 'a' * 32, 'notes', 0)
+
+    def test_preview_accepts_text_larger_than_default_json_response_limit(self):
+        class Response:
+            status = 200
+            def __init__(self, content):
+                self.content = content
+            def read(self, limit):
+                return self.content[:limit]
+        class Connection:
+            def __init__(self, response):
+                self.response = response
+            def request(self, *_args, **_kwargs):
+                pass
+            def getresponse(self):
+                return self.response
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            token_file = Path(tmp) / "service.token"
+            token_file.write_text('A' * 32, encoding='ascii')
+            client = SupervisorClient('unused.sock', token_file)
+            text = 'Привет мир! ' * 7000
+            encoded = json.dumps({'text': text}, ensure_ascii=True, separators=(',', ':')).encode('ascii')
+            self.assertGreater(len(text.encode('utf-8')), 65536)
+            self.assertGreater(len(encoded), 65536)
+            with patch('control_plane.runtime.UnixConnection', return_value=Connection(Response(encoded))):
+                self.assertEqual(client.workspace_preview('alice', 'a' * 32, 'large.txt'), {'text': text})
+            too_large_text = 'Привет мир! ' * 14000
+            oversized_preview = json.dumps({'text': too_large_text}, ensure_ascii=True,
+                                           separators=(',', ':')).encode('ascii')
+            self.assertLess(len(oversized_preview), 6 * 256 * 1024 + 64)
+            with patch('control_plane.runtime.UnixConnection', return_value=Connection(Response(oversized_preview))):
+                with self.assertRaises(RuntimeUnavailable):
+                    client.workspace_preview('alice', 'a' * 32, 'too-large.txt')
+            with patch('control_plane.runtime.UnixConnection', return_value=Connection(Response(encoded))):
+                with self.assertRaises(RuntimeUnavailable):
+                    client._request('/v1/me', {}, response_kind='json')
 
     def test_download_uses_service_bearer_and_requires_safe_binary_headers(self):
         class Response:

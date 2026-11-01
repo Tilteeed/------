@@ -62,7 +62,7 @@ Read-only конфигурация в лабораторном профиле с
 
 ## Этап 3. Граница управления, ресурсный допуск и host-runtime
 
-- `2afe2b5b4da9d5ea1dde1acdac8da015fe591eb7` — последний пользовательский VM-report для Stage 3/4 функционального среза; содержит настоящий Docker/XFS, purge на временном dataset и другие перечисленные проверки. Он принят как пользовательское свидетельство, не как полный security/operations audit. Текущие незакоммиченные restore/UI изменения после него на ВМ не развёрнуты.
+- `2afe2b5b4da9d5ea1dde1acdac8da015fe591eb7` — последний пользовательский VM-report для Stage 3/4 функционального среза; содержит настоящий Docker/XFS, purge на временном dataset и другие перечисленные проверки. Он принят как пользовательское свидетельство, не как полный security/operations audit. Restore/UI функции вошли позднее в commit `0940fc1` и на ВМ не развёрнуты.
 
 Реализованы приватная web → supervisor связка, durable intents/replay, метрики, общий admission/reservation, XFS project provisioning, Docker lifecycle и чтение фактического состояния. Web и агенты не получают Docker socket. Контейнер реально создаётся из кабинета; его `running/healthy`, lifecycle и основные Docker security settings проверены на ВМ. Подробный перечень свидетельств и границ — `docs/verification.md`.
 

@@ -11,6 +11,13 @@ import re
 import socket
 
 
+MAX_JSON_RESPONSE_BYTES = 65536
+MAX_PREVIEW_TEXT_BYTES = 256 * 1024
+# Supervisor JSON is emitted with ensure_ascii=True. In the worst case each
+# input byte becomes a six-byte \\uXXXX escape, plus a small object envelope.
+MAX_PREVIEW_JSON_RESPONSE_BYTES = MAX_PREVIEW_TEXT_BYTES * 6 + 64
+
+
 class RuntimeUnavailable(Exception):
     pass
 
@@ -55,7 +62,11 @@ class SupervisorClient:
             raise ValueError('Both supervisor socket and credential file are required')
         self.socket_path, self.token_file = str(socket_path), Path(token_file)
 
-    def _request(self, path, payload, *, response_kind='runtime'):
+    def _request(self, path, payload, *, response_kind='runtime',
+                 response_limit=MAX_JSON_RESPONSE_BYTES):
+        if (type(response_limit) is not int
+                or not MAX_JSON_RESPONSE_BYTES <= response_limit <= MAX_PREVIEW_JSON_RESPONSE_BYTES):
+            raise RuntimeUnavailable('Invalid supervisor response limit')
         connection = UnixConnection(self.socket_path)
         try:
             with self.token_file.open('rb') as source:
@@ -71,8 +82,12 @@ class SupervisorClient:
                 'Accept': 'application/json', 'Connection': 'close',
             })
             response = connection.getresponse()
-            raw = response.read(65537)
-            if len(raw) > 65536:
+            # Error envelopes remain on the normal small-response budget even
+            # when the request is allowed to return a large text preview.
+            limit = (response_limit if response.status in (200, 201, 202)
+                     else MAX_JSON_RESPONSE_BYTES)
+            raw = response.read(limit + 1)
+            if len(raw) > limit:
                 raise ValueError('Oversized supervisor response')
             data = json.loads(raw, object_pairs_hook=_unique)
             if type(data) is not dict:
@@ -193,7 +208,7 @@ class SupervisorClient:
         data = self._request('/v1/retained/workspace', {
             'actor_id': actor_id, 'instance_id': instance_id,
             'action': 'preview', 'path': path,
-        }, response_kind='json')
+        }, response_kind='json', response_limit=MAX_PREVIEW_JSON_RESPONSE_BYTES)
         text = data.get('text')
         if type(text) is str and chr(0) in text:
             raise RuntimeUnavailable('Invalid workspace preview')
