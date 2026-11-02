@@ -1,11 +1,9 @@
-"""Small, fail-closed Linux Docker Engine v1.45 client (stdlib only).
+"""Fail-closed Linux Docker Engine v1.45 client (stdlib only).
 
-No subprocesses, Docker SDK, image pulls, filesystem writes or published ports.
-Legacy spec v1 remains the default and keeps NetworkMode=none. Spec v2 is an
-explicit candidate using one Internal bridge per instance; do not activate it
-until host-firewall rules and the trusted proxy/model path are implemented.
-Neither the internal bridge nor these tests prove host isolation. The Docker
-socket is never exposed to agent workloads.
+No Docker SDK, image pulls, agent-visible Docker socket or published agent ports.
+Proxy IPAM uses bounded, read-only iproute2 probes. The dedicated nft adapter is
+injected but remains code-gated until Linux/Docker semantics are validated.
+Legacy spec v1 remains the default and keeps NetworkMode=none.
 """
 from dataclasses import asdict
 import hashlib
@@ -19,10 +17,15 @@ import secrets
 import socket
 import stat
 import time
+from typing import Callable
 from urllib.parse import quote, urlencode, urlsplit
 
 from .config import AgentLimits
-from .firewall import EndpointPair, NetworkPolicy, validate_networks
+from .firewall import (
+    EndpointPair, FirewallManager, NftablesAdapter, NetworkPolicy,
+    NFTABLES_SEMANTICS_VALIDATED, validate_networks,
+)
+from .network_routes import HostRouteInventoryError, read_host_ipv4_networks
 
 
 class DockerEngineError(RuntimeError):
@@ -112,7 +115,7 @@ class DockerEngine:
 
     def __init__(self, image, engine_socket='/var/run/docker.sock', *,
                  agent_network_pool=None, frontend_network_pool=None,
-                 firewall=None):
+                 firewall=None, host_route_provider: Callable[[], tuple[str, ...]] | None = None):
         if not isinstance(image, str) or not self._IMAGE.fullmatch(image):
             raise ValueError('An explicit immutable Docker image digest is required')
         if (not isinstance(engine_socket, str) or not engine_socket.startswith('/')
@@ -132,7 +135,11 @@ class DockerEngine:
         else:
             self.agent_network_pool = None
             self.frontend_network_pool = None
-        self.firewall = firewall
+        self.firewall = (firewall if firewall is not None else FirewallManager(
+            NftablesAdapter(), semantics_validated=NFTABLES_SEMANTICS_VALIDATED))
+        if host_route_provider is not None and not callable(host_route_provider):
+            raise ValueError('Host route provider must be callable')
+        self.host_route_provider = host_route_provider or read_host_ipv4_networks
         # Preserve Moby's default-deny sandbox and close quota-inheritance setters.
         # Dropped capabilities alone do not prevent an owner clearing PROJINHERIT.
         with Path(__file__).with_name('seccomp.json').open('rb') as source:
@@ -253,13 +260,11 @@ class DockerEngine:
             raise ValueError('Invalid host route inventory') from None
         if len(routes) > 4096:
             raise ValueError('Host route inventory exceeds the safety limit')
-        if any(route.prefixlen and (route.overlaps(agent_pool) or route.overlaps(frontend_pool))
-               for route in routes):
-            raise ValueError('Configured network pool overlaps a non-default host route')
         occupied = tuple(ipaddress.IPv4Network(value, strict=True)
                          for value in occupied_subnets)
         if len(occupied) > 4096:
             raise ValueError('Docker network inventory exceeds the safety limit')
+        occupied = (*occupied, *(route for route in routes if route.prefixlen > 0))
 
         def allocate(pool):
             for candidate in pool.subnets(new_prefix=29):
@@ -745,6 +750,14 @@ class DockerEngine:
         instance_id = self._instance(instance_id)
         agent_pool = self._proxy_pool(agent_network_pool)
         frontend_pool = self._proxy_pool(frontend_network_pool)
+        try:
+            host_routes = tuple(self.host_route_provider())
+            if len(host_routes) > 4096:
+                raise ValueError
+            route_networks = tuple(ipaddress.IPv4Network(value, strict=True)
+                                   for value in host_routes)
+        except Exception:
+            raise DockerEngineError('Host IPv4 route inventory is unavailable') from None
         rows = self._request('GET', '/networks')
         if type(rows) is not list or len(rows) > 4096:
             raise DockerEngineError('Docker network inventory is invalid')
@@ -754,6 +767,8 @@ class DockerEngine:
             if type(row) is not dict:
                 raise DockerEngineError('Docker network inventory is invalid')
             if type(row.get('Name')) is str:
+                if row['Name'] in by_name:
+                    raise DockerEngineError('Docker network names are ambiguous')
                 by_name[row['Name']] = row
             ipam = row.get('IPAM') or {}
             config = ipam.get('Config') or [] if type(ipam) is dict else []
@@ -775,11 +790,16 @@ class DockerEngine:
             role_pool = agent_pool if role == 'agent' else frontend_pool
             plan[role] = self._proxy_network_from_observation(
                 instance_id, role, observed, role_pool)
+            retained_subnet = ipaddress.IPv4Network(plan[role]['subnet'])
+            if any(route.prefixlen > 0 and retained_subnet.overlaps(route)
+                   for route in route_networks):
+                raise DockerEngineError('Retained proxy subnet overlaps a host route')
             existing_ids[role] = network_id
         if len(plan) != 2:
             allocated = self._proxy_network_plan(
                 instance_id, agent_network_pool=str(agent_pool),
-                frontend_network_pool=str(frontend_pool), occupied_subnets=occupied)
+                frontend_network_pool=str(frontend_pool), occupied_subnets=occupied,
+                host_routes=host_routes)
             for role in ('agent', 'frontend'):
                 if role not in plan:
                     plan[role] = allocated[role]
@@ -835,12 +855,22 @@ class DockerEngine:
                     or observed.get('Containers') not in ({}, None)):
                 raise DockerEngineError('Proxy network removal verification failed')
             verified.append((role, name, network_id, plan))
+        firewall = self.firewall
+        apply_policy = getattr(firewall, 'apply', None)
+        if getattr(firewall, 'can_apply', False) is not True or not callable(apply_policy):
+            raise DockerEngineError('Firewall policy manager is unavailable for network purge')
         for role, name, network_id, _plan in verified:
             self._request('DELETE', '/networks/' + network_id, ok=(204,))
             remaining = self._request('GET', '/networks?' + urlencode(
                 {'filters': self._json({'name': [name]})}))
             if type(remaining) is not list or remaining:
                 raise DockerEngineError('Proxy network removal could not be verified')
+        try:
+            current_policies = tuple(self.proxy_network_policies())
+            remaining_policies = validate_networks(current_policies) if current_policies else ()
+            apply_policy(remaining_policies)
+        except Exception:
+            raise DockerEngineError('Firewall policy cleanup could not be verified') from None
 
     def _verify_proxy_network_membership(self, instance_id, role, network_id,
                                          expected_plan, expected_container_ids):
@@ -918,12 +948,15 @@ class DockerEngine:
             raise DockerEngineError('Control UI instance configuration is invalid')
         origin = f'https://{instance_id}.{control_ui_domain}'
         firewall_ready = getattr(self.firewall, 'ready', None)
-        if not callable(firewall_ready):
+        firewall_apply = getattr(self.firewall, 'apply', None)
+        if (not callable(firewall_ready) or not callable(firewall_apply)
+                or getattr(self.firewall, 'can_apply', False) is not True):
             raise DockerEngineError('Per-agent firewall readiness is unavailable')
         plan = self.ensure_proxy_networks(
             instance_id, agent_network_pool=self.agent_network_pool,
             frontend_network_pool=self.frontend_network_pool)
         policies = self.proxy_network_policies()
+        firewall_apply(policies)
         if firewall_ready(policies) is not True:
             raise DockerEngineError('Per-agent firewall policy is not ready')
         self._ensure_proxy_token_file(host_path)

@@ -1,9 +1,10 @@
 """Synthetic adapter tests; never execute nft or privileged operations."""
 import copy
+import json
 import unittest
 
 from supervisor.firewall import (
-    EndpointPair, FirewallError, FirewallManager, NetworkPolicy,
+    EndpointPair, FirewallError, FirewallManager, NetworkPolicy, NftablesAdapter,
     expected_ruleset, validate_networks,
 )
 
@@ -21,7 +22,9 @@ class FakeAdapter:
         self.writes.append(copy.deepcopy(ruleset))
         self.state = copy.deepcopy(ruleset)
         if self.corrupt_readback:
-            self.state['tables']['inet']['chains']['output']['rules'][0]['verdict'] = 'accept'
+            drop_rule = next(rule for rule in self.state['tables']['inet']['rules']
+                             if rule['expr'][-1] == {'drop': None})
+            drop_rule['expr'][-1] = {'accept': None}
 
     def remove(self):
         self.writes.append(None)
@@ -39,26 +42,125 @@ def network(hex_digit='a', subnet='192.0.2.0/29'):
         EndpointPair(str(front_net.network_address + 2), str(front_net.network_address + 3)))
 
 
+class NftablesAdapterTests(unittest.TestCase):
+    def test_nft_json_readback_matches_and_detects_rule_drift(self):
+        expected = expected_ruleset((network(),))
+        drift = {'enabled': False}
+        def runner(argv):
+            family = argv[-1] if argv[-2] == 'tables' else argv[-2]
+            table = expected['tables'][family]
+            if argv[-2] == 'tables':
+                return json.dumps({'nftables': [{'table': {
+                    **table['table'], 'handle': 20 if family == 'inet' else 21}}]})
+            objects = [{'table': {**table['table'], 'handle': 20 if family == 'inet' else 21}}]
+            objects.extend({'chain': {**chain, 'handle': i + 30}}
+                           for i, chain in enumerate(table['chains']))
+            rules = sorted(copy.deepcopy(table['rules']),
+                           key=lambda item: item['chain'], reverse=True)
+            if drift['enabled'] and family == 'inet' and rules:
+                rules[0]['expr'][-1] = {'accept': None}
+            objects.extend({'rule': {**rule, 'handle': i + 100}}
+                           for i, rule in enumerate(rules))
+            return json.dumps({'nftables': objects})
+        adapter = NftablesAdapter(nft_binary='nft-test', runner=runner,
+                                  batch_runner=lambda *_args: None)
+        self.assertEqual(adapter.read(), expected)
+        drift['enabled'] = True
+        self.assertNotEqual(adapter.read(), expected)
+
+    def test_batch_is_atomic_scoped_to_bezr_tables_and_never_flushes_host_rules(self):
+        invocations = []
+        batches = []
+        def runner(argv):
+            invocations.append(tuple(argv))
+            return '{"nftables":[]}'
+        def batch_runner(argv, batch):
+            batches.append((tuple(argv), batch))
+        adapter = NftablesAdapter(nft_binary='nft-test', runner=runner,
+                                  batch_runner=batch_runner)
+        adapter.replace(expected_ruleset((network(),)))
+        self.assertEqual(len(batches), 1)
+        command, batch = batches[0]
+        self.assertEqual(command, ('nft-test', '-f', '-'))
+        self.assertIn('inet agent_proxy_v1', batch)
+        self.assertIn('bridge agent_proxy_v1', batch)
+        self.assertNotIn('flush ruleset', batch.lower())
+        self.assertNotIn('flush table', batch.lower())
+        self.assertGreaterEqual(len(invocations), 2)
+
+    def test_unowned_table_name_is_never_replaced(self):
+        batches = []
+        def runner(argv):
+            if argv[-2:] == ['tables', 'inet']:
+                return ('{"nftables":[{"table":{"family":"inet","name":"agent_proxy_v1",'
+                        '"handle":17,"comment":"not-bezr"}}]}')
+            if argv[-3:] == ['table', 'inet', 'agent_proxy_v1']:
+                return ('{"nftables":[{"table":{"family":"inet","name":"agent_proxy_v1",'
+                        '"handle":17,"comment":"not-bezr"}}]}')
+            return '{"nftables":[]}'
+        adapter = NftablesAdapter(
+            nft_binary='nft-test', runner=runner,
+            batch_runner=lambda argv, batch: batches.append((argv, batch)))
+        with self.assertRaises(FirewallError):
+            adapter.replace(expected_ruleset((network(),)))
+        self.assertEqual(batches, [])
+
+    def test_partial_tables_are_not_a_ready_ruleset(self):
+        def runner(argv):
+            if argv[-2:] == ('tables', 'inet') or argv[-2:] == ['tables', 'inet']:
+                return ('{"nftables":[{"table":{"family":"inet","name":"agent_proxy_v1",'
+                        '"handle":17,"comment":"BEZR managed firewall agent_proxy_v1 v1"}}]}')
+            if argv[-2:] == ('tables', 'bridge') or argv[-2:] == ['tables', 'bridge']:
+                return '{"nftables":[]}'
+            return '{"nftables":[]}'
+        adapter = NftablesAdapter(nft_binary='nft-test', runner=runner,
+                                  batch_runner=lambda *_args: None)
+        self.assertFalse(FirewallManager(adapter, semantics_validated=True).ready((network(),)))
+
+    def test_unvalidated_firewall_cannot_apply_policy(self):
+        adapter = FakeAdapter()
+        manager = FirewallManager(adapter, semantics_validated=False)
+        with self.assertRaises(FirewallError):
+            manager.apply((network(),))
+        self.assertEqual(adapter.writes, [])
+
+
 class FirewallPolicyTests(unittest.TestCase):
-    def test_expected_policy_separates_host_and_routed_filters_from_bridge_forwarding(self):
+    def test_expected_policy_separates_host_routed_and_bridge_hooks(self):
         policy = network()
         expected = expected_ruleset((policy,))
         self.assertEqual(set(expected['tables']), {'inet', 'bridge'})
         inet = expected['tables']['inet']
-        self.assertEqual(inet['chains']['input']['policy'], 'accept')
-        self.assertEqual(inet['chains']['output']['policy'], 'accept')
-        self.assertEqual(inet['chains']['forward']['policy'], 'accept')
-        self.assertEqual(inet['chains']['forward']['rules'][0]['match'], 'exact-allowed-endpoint-pair')
-        self.assertEqual(inet['chains']['forward']['rules'][-1]['verdict'], 'drop')
+        self.assertEqual(inet['table']['name'], 'agent_proxy_v1')
+        inet_chains = {chain['name']: chain for chain in inet['chains']}
+        self.assertEqual(set(inet_chains), {'input', 'output', 'forward'})
+        self.assertTrue(all(chain['policy'] == 'accept' and chain['prio'] == -10
+                            for chain in inet_chains.values()))
+        self.assertTrue(any('input agent source' in rule['comment']
+                            and rule['expr'][-1] == {'drop': None}
+                            for rule in inet['rules']))
+        inet_forward_accepts = [rule for rule in inet['rules']
+                                if rule['chain'] == 'forward'
+                                and rule['expr'][-1] == {'accept': None}]
+        self.assertTrue(inet_forward_accepts)
+        for rule in inet_forward_accepts:
+            meta_keys = {match['match']['left']['meta']['key']
+                         for match in rule['expr'][:-1]
+                         if 'meta' in match.get('match', {}).get('left', {})}
+            self.assertEqual(meta_keys, {'iifname', 'oifname'})
         bridge = expected['tables']['bridge']
-        self.assertEqual(bridge['chains']['forward']['policy'], 'accept')
-        self.assertEqual(bridge['chains']['forward']['rules'][0]['match'],
-                         'exact-endpoint-pair-on-same-managed-bridge')
-        self.assertNotIn('allowed_bridge_pairs', bridge['sets'])
-        self.assertTrue(all(chain['policy'] == 'accept'
-                            for chain in bridge['chains'].values()))
+        bridge_chains = {chain['name']: chain for chain in bridge['chains']}
+        self.assertTrue(all(chain['policy'] == 'accept' and chain['prio'] == -210
+                            for chain in bridge_chains.values()))
+        self.assertTrue(any('same-bridge arp' in rule['comment'] for rule in bridge['rules']))
+        self.assertTrue(any('bridge agent' in rule['comment']
+                            and rule['expr'][-1] == {'accept': None}
+                            for rule in bridge['rules']))
+        self.assertTrue(any(rule['expr'][-1] == {'drop': None}
+                            and 'bridge ingress' in rule['comment']
+                            for rule in bridge['rules']))
 
-    def test_policy_models_separate_agent_and_frontend_networks_and_pairs(self):
+    def test_policy_lists_distinct_static_pairs_for_frontend_and_agent(self):
         ident = 'c' * 32
         policy = NetworkPolicy(
             instance_id=ident, agent_subnet='10.240.0.0/29',
@@ -67,16 +169,15 @@ class FirewallPolicyTests(unittest.TestCase):
             agent_pair=EndpointPair('10.240.0.2', '10.240.0.3'),
             frontend_pair=EndpointPair('10.248.0.2', '10.248.0.3'))
         rules = expected_ruleset((policy,))
-        self.assertEqual(rules['tables']['inet']['sets']['managed_subnets4'],
-                         ['10.240.0.0/29', '10.248.0.0/29'])
-        self.assertEqual(rules['tables']['inet']['sets']['allowed_endpoint_pairs4'], [
-            ['10.240.0.2', '10.240.0.3'], ['10.240.0.3', '10.240.0.2'],
-            ['10.248.0.2', '10.248.0.3'], ['10.248.0.3', '10.248.0.2']])
-        self.assertEqual(rules['tables']['bridge']['sets']['allowed_bridge_endpoint_pairs'], [
-            ['bza' + ident[:12], '10.240.0.2', '10.240.0.3'],
-            ['bza' + ident[:12], '10.240.0.3', '10.240.0.2'],
-            ['bzf' + ident[:12], '10.248.0.2', '10.248.0.3'],
-            ['bzf' + ident[:12], '10.248.0.3', '10.248.0.2']])
+        agent_rules = [rule for rule in rules['tables']['bridge']['rules']
+                       if 'bridge agent' in rule['comment']]
+        front_rules = [rule for rule in rules['tables']['bridge']['rules']
+                       if 'bridge frontend' in rule['comment']]
+        self.assertEqual(len(agent_rules), 2)
+        self.assertEqual(len(front_rules), 2)
+        self.assertTrue(all('10.240.0.' in str(rule['expr']) for rule in agent_rules))
+        self.assertTrue(all('10.248.0.' in str(rule['expr']) for rule in front_rules))
+
 
     def test_network_policy_rejects_non_contract_static_endpoint_pair(self):
         ident = 'd' * 32
@@ -95,7 +196,11 @@ class FirewallPolicyTests(unittest.TestCase):
         self.assertFalse(FirewallManager(adapter).ready((n,)))
         manager = FirewallManager(adapter, semantics_validated=True)
         self.assertTrue(manager.ready((n,)))
-        adapter.state['tables']['inet']['chains']['input']['rules'][0]['verdict'] = 'accept'
+        if adapter.state is None:
+            self.fail('Fake adapter state unexpectedly absent')
+        drop_rule = next(rule for rule in adapter.state['tables']['inet']['rules']
+                         if rule['expr'][-1] == {'drop': None})
+        drop_rule['expr'][-1] = {'accept': None}
         self.assertFalse(manager.ready((n,)))
         self.assertFalse(manager.ready(()))
 
@@ -104,9 +209,9 @@ class FirewallPolicyTests(unittest.TestCase):
         expected = expected_ruleset((n,))
         manager = FirewallManager(FakeAdapter(expected), semantics_validated=True)
         for mutate in (
-            lambda s: s['tables']['inet'].update(name='other'),
-            lambda s: s['tables']['inet']['chains'].pop('forward'),
-            lambda s: s['tables']['inet']['sets']['allowed_endpoint_pairs4'].clear(),
+            lambda state: state['tables']['inet']['table'].update(name='other'),
+            lambda state: state['tables']['inet']['chains'].pop(),
+            lambda state: state['tables']['inet']['rules'].clear(),
         ):
             adapter = FakeAdapter(expected)
             manager = FirewallManager(adapter, semantics_validated=True)
@@ -138,12 +243,12 @@ class FirewallPolicyTests(unittest.TestCase):
         self.assertEqual(len(adapter.writes), 1)
         broken = FakeAdapter(corrupt_readback=True)
         with self.assertRaises(FirewallError):
-            FirewallManager(broken).register(a)
+            FirewallManager(broken, semantics_validated=True).register(a)
 
     def test_cleanup_removes_one_network_or_removes_empty_table_with_readback(self):
         a, b = network('a'), network('b', '198.51.100.0/29')
         adapter = FakeAdapter(expected_ruleset((a, b)))
-        manager = FirewallManager(adapter)
+        manager = FirewallManager(adapter, semantics_validated=True)
         result = manager.unregister(a.instance_id, (a, b))
         self.assertEqual(result, expected_ruleset((b,)))
         self.assertEqual(adapter.state, result)
@@ -157,7 +262,7 @@ class FirewallPolicyTests(unittest.TestCase):
                 self.writes.append(None)
                 self.state = {'unexpected': True}
         with self.assertRaises(FirewallError):
-            FirewallManager(Stubborn()).unregister('a' * 32, (network(),))
+            FirewallManager(Stubborn(), semantics_validated=True).unregister('a' * 32, (network(),))
 
 
 if __name__ == '__main__':

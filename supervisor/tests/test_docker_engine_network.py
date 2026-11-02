@@ -12,6 +12,7 @@ from urllib.parse import parse_qs
 
 from supervisor.config import AgentLimits
 from supervisor.docker_engine import DockerEngine, DockerEngineError
+from supervisor.firewall import FirewallManager, NftablesAdapter
 
 
 class DockerEngineNetworkTests(unittest.TestCase):
@@ -89,7 +90,7 @@ class DockerEngineNetworkTests(unittest.TestCase):
 
     def test_proxy_network_plan_rejects_nondefault_host_route_overlap(self):
         engine = DockerEngine('sha256:' + 'a' * 64)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(DockerEngineError):
             engine._proxy_network_plan(
                 '3' * 32, agent_network_pool='10.240.0.0/24',
                 frontend_network_pool='10.241.0.0/24',
@@ -99,6 +100,15 @@ class DockerEngineNetworkTests(unittest.TestCase):
             frontend_network_pool='10.241.0.0/24',
             host_routes=('0.0.0.0/0',))
         self.assertEqual(plan['agent']['subnet'], '10.240.0.0/29')
+
+    def test_proxy_network_plan_skips_conflicting_host_route_and_uses_next_free_subnet(self):
+        engine = DockerEngine('sha256:' + 'a' * 64)
+        plan = engine._proxy_network_plan(
+            '5' * 32, agent_network_pool='10.240.0.0/24',
+            frontend_network_pool='10.241.0.0/24',
+            host_routes=('10.240.0.0/29', '10.241.0.0/29'))
+        self.assertEqual(plan['agent']['subnet'], '10.240.0.8/29')
+        self.assertEqual(plan['frontend']['subnet'], '10.241.0.8/29')
 
     def test_proxy_network_payload_pins_bridge_ipam_and_internal_policy(self):
         engine = DockerEngine('sha256:' + 'a' * 64)
@@ -382,7 +392,11 @@ class DockerEngineNetworkTests(unittest.TestCase):
             frontend_network_pool=engine.frontend_network_pool)
         web_id = 'e' * 64
         image_id = 'sha256:' + 'b' * 64
+        events = []
         class ReadyFirewall:
+            can_apply = True
+            def apply(self, policies):
+                events.append(('apply', policies))
             def ready(self, policies):
                 return True
         engine.firewall = ReadyFirewall()
@@ -394,8 +408,9 @@ class DockerEngineNetworkTests(unittest.TestCase):
         engine._proxy_network_id = lambda _instance, role, _expected: (
             'c' * 64 if role == 'agent' else 'd' * 64)
         endpoints = []
-        engine._ensure_container_network = lambda container_id, network_id, name, ip: \
-            endpoints.append((container_id, network_id, name, ip))
+        engine.__dict__['_ensure_container_network'] = lambda container_id, network_id, network_name, ipv4: \
+            (events.append(('web-attach', container_id, network_id)) or
+             endpoints.append((container_id, network_id, network_name, ipv4)))
         payloads = []
         engine._proxy_sidecar_payload = lambda *args, **kwargs: {'fake': True}
         engine._find = lambda instance_id: None
@@ -415,6 +430,9 @@ class DockerEngineNetworkTests(unittest.TestCase):
         })
         self.assertEqual(endpoints, [(web_id, 'd' * 64, plan['frontend']['name'],
                                       plan['frontend']['web_ip'])])
+        self.assertEqual(events[0][0], 'apply')
+        self.assertLess(next(i for i, event in enumerate(events) if event[0] == 'apply'),
+                        next(i for i, event in enumerate(events) if event[0] == 'web-attach'))
         self.assertEqual(payloads, ['created'])
         self.assertEqual([(item[1], item[4]) for item in memberships], [
             ('agent', {sidecar_id}), ('frontend', {web_id, sidecar_id})])
@@ -630,6 +648,21 @@ class DockerEngineNetworkTests(unittest.TestCase):
         engine.firewall = ReadyFirewall()
         self.assertFalse(engine._proxy_firewall_ready(instance_id, gateway_spec))
 
+    def test_default_engine_wires_disabled_real_firewall_adapter_before_network_changes(self):
+        engine = DockerEngine('sha256:' + 'a' * 64,
+                              agent_network_pool='10.244.0.0/24',
+                              frontend_network_pool='10.245.0.0/24',
+                              host_route_provider=lambda: ())
+        self.assertIsInstance(engine.firewall, FirewallManager)
+        self.assertIsInstance(engine.firewall.adapter, NftablesAdapter)
+        self.assertFalse(engine.firewall.can_apply)
+        calls = []
+        engine.ensure_proxy_networks = lambda *_args, **_kwargs: calls.append('networks')
+        with self.assertRaises(DockerEngineError):
+            engine.prepare_control_ui('8' * 32, 'owner-8', 'agents.example.test',
+                                      '/srv/agent-data/' + '8' * 32)
+        self.assertEqual(calls, [])
+
     def test_proxy_start_fails_closed_without_verified_firewall(self):
         engine = DockerEngine('sha256:' + 'a' * 64,
                               agent_network_pool='10.244.0.0/24',
@@ -733,7 +766,8 @@ class DockerEngineNetworkTests(unittest.TestCase):
         self.assertNotIn('S' * 43, json.dumps(payload))
 
     def test_proxy_network_lifecycle_creates_and_verifies_both_networks(self):
-        engine = DockerEngine('sha256:' + 'a' * 64)
+        engine = DockerEngine('sha256:' + 'a' * 64,
+                              host_route_provider=lambda: ())
         instance_id = '3' * 32
         state = {}
         calls = []
@@ -781,6 +815,84 @@ class DockerEngineNetworkTests(unittest.TestCase):
         self.assertEqual(engine._existing_proxy_network(instance_id, 'frontend'),
                          ('b' * 64, plan['frontend'], observed))
 
+    def test_proxy_network_purge_syncs_remaining_firewall_policies(self):
+        engine = DockerEngine('sha256:' + 'a' * 64,
+                              agent_network_pool='10.240.0.0/24',
+                              frontend_network_pool='10.241.0.0/24',
+                              host_route_provider=lambda: ())
+        instance_id, other_id = '2' * 32, '3' * 32
+        plan = engine._proxy_network_plan(
+            instance_id, agent_network_pool=engine.agent_network_pool,
+            frontend_network_pool=engine.frontend_network_pool)
+        other_plan = engine._proxy_network_plan(
+            other_id, agent_network_pool=engine.agent_network_pool,
+            frontend_network_pool=engine.frontend_network_pool,
+            occupied_subnets=(plan['agent']['subnet'], plan['frontend']['subnet']))
+        policies = (engine._proxy_firewall_policy(instance_id, plan),
+                    engine._proxy_firewall_policy(other_id, other_plan))
+        state = {}
+        for role, network_id in (('agent', 'a' * 64), ('frontend', 'b' * 64)):
+            payload = engine._proxy_network_payload(instance_id, plan[role], role=role)
+            state[network_id] = {**payload, 'Id': network_id, 'Ingress': False,
+                                 'Containers': {}}
+        deleted, applied = [], []
+        fail_once = {'enabled': True}
+        def request(method, path, payload=None, *, ok=(200,)):
+            if method == 'GET' and path.startswith('/networks?'):
+                query = parse_qs(path.split('?', 1)[1])
+                name = json.loads(query['filters'][0])['name'][0]
+                return [{'Id': network_id, 'Name': value['Name'], 'IPAM': value['IPAM'],
+                         'Labels': value['Labels']}
+                        for network_id, value in state.items() if value['Name'] == name]
+            if method == 'GET' and path.startswith('/networks/'):
+                return state[path.rsplit('/', 1)[1]]
+            if method == 'DELETE' and path.startswith('/networks/'):
+                network_id = path.rsplit('/', 1)[1]
+                deleted.append(network_id)
+                state.pop(network_id)
+                return None
+            raise AssertionError((method, path))
+        class Firewall:
+            can_apply = True
+            def apply(self, remaining):
+                applied.append(tuple(remaining))
+                if fail_once['enabled']:
+                    fail_once['enabled'] = False
+                    raise RuntimeError('synthetic adapter failure')
+        engine.firewall = Firewall()
+        engine.__dict__['_request'] = request
+        engine.__dict__['proxy_network_policies'] = lambda: (policies[1],)
+        with self.assertRaises(DockerEngineError):
+            engine.remove_proxy_networks(instance_id)
+        self.assertEqual(set(deleted), {'a' * 64, 'b' * 64})
+        self.assertEqual(state, {})
+        self.assertEqual(applied, [(policies[1],)])
+        engine.remove_proxy_networks(instance_id)
+        self.assertEqual(applied, [(policies[1],), (policies[1],)])
+
+    def test_proxy_network_purge_reconciles_firewall_when_networks_are_already_absent(self):
+        engine = DockerEngine('sha256:' + 'a' * 64,
+                              agent_network_pool='10.240.0.0/24',
+                              frontend_network_pool='10.241.0.0/24',
+                              host_route_provider=lambda: ())
+        instance_id, other_id = '2' * 32, '3' * 32
+        other_plan = engine._proxy_network_plan(
+            other_id, agent_network_pool=engine.agent_network_pool,
+            frontend_network_pool=engine.frontend_network_pool)
+        other_policy = engine._proxy_firewall_policy(other_id, other_plan)
+        applied = []
+        class Firewall:
+            can_apply = True
+            def apply(self, remaining):
+                applied.append(tuple(remaining))
+        engine.firewall = Firewall()
+        engine.__dict__['_request'] = lambda method, path, *args, **kwargs: (
+            [] if method == 'GET' and path.startswith('/networks?') else
+            (_ for _ in ()).throw(AssertionError((method, path))))
+        engine.__dict__['proxy_network_policies'] = lambda: (other_policy,)
+        engine.remove_proxy_networks(instance_id)
+        self.assertEqual(applied, [(other_policy,)])
+
     def test_proxy_network_purge_rejects_drift_before_deleting_any_network(self):
         engine = DockerEngine('sha256:' + 'a' * 64,
                               agent_network_pool='10.240.0.0/24',
@@ -815,8 +927,10 @@ class DockerEngineNetworkTests(unittest.TestCase):
         self.assertEqual(deleted, [])
 
     def test_proxy_network_lifecycle_reuses_retained_subnets_without_reallocation(self):
-        engine = DockerEngine('sha256:' + 'a' * 64, agent_network_pool='10.246.0.0/24',
-                              frontend_network_pool='10.247.0.0/24')
+        engine = DockerEngine('sha256:' + 'a' * 64,
+                              agent_network_pool='10.246.0.0/24',
+                              frontend_network_pool='10.247.0.0/24',
+                              host_route_provider=lambda: ())
         instance_id = '5' * 32
         plan = engine._proxy_network_plan(
             instance_id, agent_network_pool=engine.agent_network_pool,

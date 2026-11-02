@@ -22,7 +22,7 @@
 
 ## Реальное и неподключённое
 
-Реально реализованы хранение подготовленных настроек, ограничение полей, optimistic revisions, разделение данных в запросах, ограниченный журнал и отдельная страница. Отдельно подключён opt-in host-runtime для provisioning и Docker lifecycle; его функциональная приёмка на ВМ по пользовательскому отчёту описана в `docs/verification.md`. В локальной незакоммиченной разработке обычный create пока сохраняет `NetworkMode=none`; per-instance internal bridge — только opt-in candidate до реализации host-firewall и доверенных proxy/model paths. Добавлены owner-scoped launch ticket, hashed session и cookie handoff endpoints, но не reverse proxy. Сохранение draft после создания по-прежнему не применяет изменения к уже работающему OpenClaw; Gateway HTTP/WS proxy, pairing flow, чат, модель и Telegram не подключены.
+Реальные и неподключённые части первой веб-части и её точечная приёмка описаны ниже как исторический срез. Текущее состояние Control UI, схема сетей, границы доверия и ограничения firewall зафиксированы в [`control-ui-architecture-threat-model.md`](control-ui-architecture-threat-model.md): локальная реализация есть, но profile `agent_proxy_v1` остаётся fail-closed и не принят на целевой Linux/Docker/nftables/browser окружении. `legacy_none` остаётся default. Локальные synthetic-тесты не подтверждают реальную сетевую изоляцию.
 
 ## Безопасность нового API
 
