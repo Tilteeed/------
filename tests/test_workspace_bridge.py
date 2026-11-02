@@ -69,6 +69,29 @@ class WorkspaceBridgeTests(unittest.TestCase):
         self.assertEqual(result['runtime']['network_profile'], 'agent_internal_v1')
         self.assertNotIn('proxy_ip', result['runtime'])
 
+    def test_control_ui_target_uses_owner_instance_and_validates_private_sidecar_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = SupervisorClient('unused.sock', Path(tmp) / 'token')
+            calls = []
+            target = {'ip': '172.30.1.2', 'port': 18790, 'proxy_token': 'X' * 43}
+            client._request = lambda path, payload, **kwargs: (
+                calls.append((path, payload, kwargs.get('response_kind'))) or {'ready': True, 'target': target})
+            self.assertEqual(client.control_ui_target('alice', 'a' * 32), target)
+            self.assertEqual(calls, [('/v1/control-ui/target',
+                {'actor_id': 'alice', 'instance_id': 'a' * 32}, 'json')])
+
+            client._request = lambda *_args, **_kwargs: {'ready': False, 'target': None}
+            self.assertIsNone(client.control_ui_target('alice', 'a' * 32))
+            for invalid in (
+                {'ip': '127.0.0.1', 'port': 18790, 'proxy_token': 'X' * 43},
+                {'ip': '172.30.1.2', 'port': 80, 'proxy_token': 'X' * 43},
+                {'ip': '172.30.1.2', 'port': 18790, 'proxy_token': 'short'},
+            ):
+                client._request = lambda *_args, invalid=invalid, **_kwargs: {
+                    'ready': True, 'target': invalid}
+                with self.assertRaises(RuntimeUnavailable):
+                    client.control_ui_target('alice', 'a' * 32)
+
     def test_preview_accepts_text_larger_than_default_json_response_limit(self):
         class Response:
             status = 200

@@ -7,5 +7,9 @@
   "capacity_ram_bytes": null,
   "capacity_cpu_millicores": null,
   "capacity_disk_bytes": null,
-  "disk_floor_bytes": null
+  "disk_floor_bytes": null,
+  "network_profile_default": "legacy_none",
+  "control_ui_domain": null,
+  "agent_network_pool": null,
+  "frontend_network_pool": null
 }

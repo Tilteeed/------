@@ -4,6 +4,7 @@ Only the configured Unix socket is used. No URLs, Docker API, redirects or
 client-selected targets are accepted. The service credential stays server-side.
 """
 import http.client
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -175,6 +176,35 @@ class SupervisorClient:
 
     def replay(self, actor_id, payload):
         return self._request('/v1/replay', dict(payload, actor_id=actor_id))
+
+    def control_ui_target(self, actor_id, instance_id):
+        """Owner-bound private target lookup; never include it in the normal runtime view."""
+        if (type(actor_id) is not str or not 1 <= len(actor_id) <= 256
+                or any(ord(char) < 33 or ord(char) == 127 for char in actor_id)
+                or type(instance_id) is not str or re.fullmatch(r'[0-9a-f]{32}', instance_id) is None):
+            raise RuntimeUnavailable('Invalid Control UI target request')
+        data = self._request('/v1/control-ui/target', {
+            'actor_id': actor_id, 'instance_id': instance_id,
+        }, response_kind='json')
+        if type(data) is not dict or set(data) != {'ready', 'target'} or type(data['ready']) is not bool:
+            raise RuntimeUnavailable('Invalid Control UI target response')
+        if data['ready'] is False and data['target'] is None:
+            return None
+        target = data['target']
+        if (data['ready'] is not True or type(target) is not dict
+                or set(target) != {'ip', 'port', 'proxy_token'}):
+            raise RuntimeUnavailable('Invalid Control UI target response')
+        ip, port, token = target['ip'], target['port'], target['proxy_token']
+        try:
+            address = ipaddress.ip_address(ip)
+        except (TypeError, ValueError):
+            raise RuntimeUnavailable('Invalid Control UI target response') from None
+        if (address.version != 4 or not address.is_private or address.is_loopback
+                or address.is_link_local or address.is_multicast or address.is_unspecified
+                or str(address) != ip or type(port) is not int or port != 18790
+                or type(token) is not str or not re.fullmatch(r'[A-Za-z0-9_-]{40,64}', token)):
+            raise RuntimeUnavailable('Invalid Control UI target response')
+        return {'ip': ip, 'port': port, 'proxy_token': token}
 
     def workspace_list(self, actor_id, instance_id, directory, offset):
         if type(offset) is not int or not 0 <= offset <= 10000:

@@ -34,12 +34,20 @@ def main(argv=None):
     parser.add_argument('--capacity-cpu-millicores', type=amount, required=True)
     parser.add_argument('--capacity-disk-bytes', type=amount, required=True)
     parser.add_argument('--disk-floor-bytes', type=amount, required=True)
+    parser.add_argument('--control-ui-domain', default=None,
+                        help='Trusted wildcard subdomain suffix for isolated Control UI origins')
     parser.add_argument('--state-dir', default='/var/lib/personal-agent-supervisor')
     parser.add_argument('--socket-path', default='/run/personal-agent-supervisor/control.sock')
     parser.add_argument('--prepare-host-config', action='store_true')
     args = parser.parse_args(argv)
     if sys.platform != 'linux' or not args.prepare_host_config or os.geteuid() != 0:
         parser.error('Explicit --prepare-host-config, Linux and root required')
+    if args.control_ui_domain is not None:
+        labels = args.control_ui_domain.split('.')
+        label_re = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z')
+        if (len(args.control_ui_domain) > 253 or len(labels) < 2
+                or any(label_re.fullmatch(label) is None for label in labels)):
+            parser.error('Control UI domain must be an exact lowercase DNS suffix without wildcards')
     if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,255}', args.image) is None:
         parser.error('Explicit local image name or immutable ID required')
     try:
@@ -109,6 +117,10 @@ def main(argv=None):
             'image': image, 'capacity_ram_bytes': args.capacity_ram_bytes,
             'capacity_cpu_millicores': args.capacity_cpu_millicores,
             'capacity_disk_bytes': args.capacity_disk_bytes, 'disk_floor_bytes': args.disk_floor_bytes,
+            'network_profile_default': 'legacy_none',
+            'control_ui_domain': args.control_ui_domain,
+            'agent_network_pool': None,
+            'frontend_network_pool': None,
         }
         descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(descriptor, 'w', encoding='utf-8') as target:

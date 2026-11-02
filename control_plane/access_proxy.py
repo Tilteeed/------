@@ -166,15 +166,23 @@ def _session_cookie(scope):
 
 def _request_client_ip(scope):
     client = scope.get('client')
+    forwarded_for = _scope_header_values(scope, 'x-forwarded-for')
+    forwarded_proto = _scope_header_values(scope, 'x-forwarded-proto')
     if (type(client) not in (tuple, list) or len(client) < 1
-            or type(client[0]) is not str):
+            or type(client[0]) is not str or len(forwarded_for) != 1
+            or len(forwarded_proto) != 1 or forwarded_proto[0] != 'https'):
+        raise HTTPException(403, 'Forbidden', headers={'Cache-Control': 'no-store'})
+    value = forwarded_for[0]
+    if not value or value != value.strip() or ',' in value:
         raise HTTPException(403, 'Forbidden', headers={'Cache-Control': 'no-store'})
     try:
-        address = ipaddress.ip_address(client[0])
+        address = ipaddress.ip_address(value)
+        peer = ipaddress.ip_address(client[0])
     except ValueError:
         raise HTTPException(403, 'Forbidden', headers={'Cache-Control': 'no-store'}) from None
-    if (address.is_loopback or address.is_link_local or address.is_multicast
-            or address.is_unspecified):
+    if (address != peer or str(address) != value
+            or address.is_loopback or address.is_link_local
+            or address.is_multicast or address.is_unspecified):
         raise HTTPException(403, 'Forbidden', headers={'Cache-Control': 'no-store'})
     return str(address)
 

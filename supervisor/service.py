@@ -8,6 +8,7 @@ import argparse
 from dataclasses import asdict, dataclass
 import hashlib
 import hmac
+import ipaddress
 from http.server import BaseHTTPRequestHandler
 import json
 import os
@@ -42,6 +43,12 @@ class ServiceError(Exception):
 class WorkspaceDownload:
     name: str
     content: bytes
+
+
+_CONTROL_UI_INSTANCE_RE = re.compile(r'[0-9a-f]{32}\Z')
+_CONTROL_UI_PROXY_TOKEN_RE = re.compile(r'[A-Za-z0-9_-]{40,64}\Z')
+_CONTROL_UI_DOCKER_ID_RE = re.compile(r'[0-9a-f]{64}\Z')
+_CONTROL_UI_SIDECAR_PORT = 18790
 
 
 MESSAGES = {
@@ -207,13 +214,40 @@ def initialize_files(instance, evidence):
 class RuntimeService:
     """Portable injectable controller; production dependencies are built only by CLI."""
     def __init__(self, profile, store, volumes, engine, metrics, *, capacities,
-                 disk_floor_bytes, clock=time.monotonic, initialize=initialize_files):
+                 disk_floor_bytes, clock=time.monotonic, initialize=initialize_files,
+                 network_profile_default=RuntimeStore.NETWORK_PROFILE_LEGACY,
+                 control_ui_domain=None, agent_network_pool=None,
+                 frontend_network_pool=None):
         fingerprint = hashlib.sha256(canonical(asdict(profile)).encode('ascii')).hexdigest()
         if (store.profile_version, store.profile_hash) != (profile.profile_version, fingerprint):
             raise StoreError('profile_drift')
+        if type(network_profile_default) is not str or network_profile_default not in RuntimeStore.NETWORK_PROFILES:
+            raise ValueError('Unsupported default network profile')
+        if control_ui_domain is not None and (type(control_ui_domain) is not str
+                or len(control_ui_domain) > 253 or len(control_ui_domain.split('.')) < 2
+                or any(_CONTROL_UI_DOMAIN_LABEL.fullmatch(label) is None
+                       for label in control_ui_domain.split('.'))):
+            raise ValueError('Invalid Control UI domain')
+        if (agent_network_pool is None) != (frontend_network_pool is None):
+            raise ValueError('Both Control UI network pools must be provided together')
+        if agent_network_pool is not None:
+            agent_pool = _network_pool(agent_network_pool)
+            frontend_pool = _network_pool(frontend_network_pool)
+            if agent_pool.overlaps(frontend_pool):
+                raise ValueError('Control UI network pools must not overlap')
+            agent_network_pool, frontend_network_pool = str(agent_pool), str(frontend_pool)
+        if network_profile_default == RuntimeStore.NETWORK_PROFILE_PROXY:
+            if control_ui_domain is None:
+                raise ValueError('Control UI domain required for proxy profile')
+            if agent_network_pool is None:
+                raise ValueError('Control UI network pools required for proxy profile')
         self.profile, self.store, self.volumes = profile, store, volumes
         self.engine, self.metrics, self.capacities = engine, metrics, tuple(capacities)
         self.disk_floor_bytes, self.clock, self.initialize = disk_floor_bytes, clock, initialize
+        self.network_profile_default = network_profile_default
+        self.control_ui_domain = control_ui_domain
+        self.agent_network_pool = agent_network_pool
+        self.frontend_network_pool = frontend_network_pool
         self.lock = threading.RLock()
 
     def _sample(self):
@@ -227,13 +261,18 @@ class RuntimeService:
         except (MetricsUnavailable, OSError, ValueError, KeyError):
             raise ServiceError('metrics_unavailable', 503) from None
 
-    def _admit(self, *, quota, preparing=False, requested_disk_bytes=None):
+    def _admit(self, *, quota, preparing=False, requested_disk_bytes=None, network_profile=None):
         sample, limits = self._sample(), self.profile.agent_limits
+        network_profile = self.network_profile_default if network_profile is None else network_profile
+        if type(network_profile) is not str or network_profile not in RuntimeStore.NETWORK_PROFILES:
+            raise ServiceError('invalid_network_profile', 503)
+        proxy_ram = (RuntimeStore.SIDECAR_RAM_BYTES
+                     if network_profile == RuntimeStore.NETWORK_PROFILE_PROXY else 0)
         disk_request = limits.disk_bytes if requested_disk_bytes is None else requested_disk_bytes
         decision = evaluate_admission(mode=self.profile.mode, now=self.clock(),
             sampled_at=sample['sampled_at'], cpu_window_seconds=sample['cpu_window_seconds'],
             total_ram_bytes=sample['total_ram_bytes'], available_ram_bytes=sample['available_ram_bytes'],
-            cpu_percent=sample['cpu_percent'], requested_ram_bytes=limits.ram_bytes,
+            cpu_percent=sample['cpu_percent'], requested_ram_bytes=limits.ram_bytes + proxy_ram,
             free_disk_bytes=sample['free_disk_bytes'], requested_disk_bytes=disk_request,
             disk_floor_bytes=self.disk_floor_bytes, disk_quota_verified=quota)
         reasons = set(decision.reasons)
@@ -255,7 +294,7 @@ class RuntimeService:
             expected_profile = instance['network_profile'] if instance else None
             actual_profile = info.get('network_profile')
             if not self._absent(info):
-                if actual_profile not in {'legacy_none', 'agent_internal_v1'}:
+                if actual_profile not in RuntimeStore.NETWORK_PROFILES:
                     raise ValueError()
                 if expected_profile is not None and actual_profile != expected_profile:
                     raise ValueError()
@@ -300,7 +339,7 @@ class RuntimeService:
             # Never return arbitrary engine fields, endpoints, tokens or Docker IDs.
             network_profile = info.get('network_profile')
             gateway = info.get('gateway')
-            if network_profile in {'legacy_none', 'agent_internal_v1'}:
+            if network_profile in RuntimeStore.NETWORK_PROFILES:
                 runtime['network_profile'] = network_profile
             if gateway in ('connected', 'ready', 'starting', 'not_connected', 'unavailable', 'unknown', 'not_ready'):
                 runtime['gateway'] = gateway
@@ -313,9 +352,12 @@ class RuntimeService:
                 and 0 <= self.clock() - sample['sampled_at'] <= 10)
             self._admit(quota=False, preparing=True)
             limits = self.profile.agent_limits
+            requested = RuntimeStore._with_proxy_reservation(
+                (limits.ram_bytes, limits.cpu_millicores, limits.disk_bytes),
+                self.network_profile_default)
             result['capabilities']['provisioning'] = all(
-                used + (0 if instance and instance['active'] else requested) <= capacity for used, requested, capacity in zip(
-                    self.store.totals(), (limits.ram_bytes, limits.cpu_millicores, limits.disk_bytes), self.capacities))
+                used + (0 if instance and instance['active'] else needed) <= capacity
+                for used, needed, capacity in zip(self.store.totals(), requested, self.capacities))
         except (ServiceError, ValueError):
             pass
         if instance and instance['active']:
@@ -474,63 +516,76 @@ class RuntimeService:
                             not instance['active'] or current is None or current['id'] != instance['id']):
                         raise ServiceError('instance_retired')
                 if payload['action'] in {'create', 'restore'}:
+                    admission_profile = self.network_profile_default
+                    if payload['action'] == 'restore':
+                        admission_profile = self.store.instance(payload['instance_id'])['network_profile']
                     self._admit(quota=False, preparing=True,
-                                requested_disk_bytes=0 if payload['action'] == 'restore' else None)
+                                requested_disk_bytes=0 if payload['action'] == 'restore' else None,
+                                network_profile=admission_profile)
                 limits = self.profile.agent_limits
-                operation = self.store.intent(payload, (limits.ram_bytes, limits.cpu_millicores, limits.disk_bytes), self.capacities)
+                operation = self.store.intent(
+                    payload, (limits.ram_bytes, limits.cpu_millicores, limits.disk_bytes),
+                    self.capacities, network_profile=self.network_profile_default)
                 self.store.pending(operation['id'])
                 instance = self.store.instance(operation['instance_id'])
                 instance_id, action = instance['id'], payload['action']
                 evidence = None
+                prepared_instance = instance
                 if action in {'create', 'start', 'restart', 'restore'}:
                     evidence = self._storage(instance, prepare=action == 'create')
+                    prepared_instance = self._prepare_control_ui_instance(
+                        instance, action=action,
+                        host_path=evidence.get('host_path') if evidence else None)
                     if not instance['initialized']:
-                        self.initialize(instance, evidence)
+                        self.initialize(prepared_instance, evidence)
                         self.store.initialized(instance_id)
                     # Re-observe AFTER real quota verification. Intent is not a permit.
                     self._admit(quota=evidence['disk_quota_verified'],
-                                requested_disk_bytes=0 if action == 'restore' else None)
+                                requested_disk_bytes=0 if action == 'restore' else None,
+                                network_profile=instance['network_profile'])
                 info = self._inspect(instance_id)
                 if action in {'create', 'restore'}:
                     assert evidence is not None
                     # create/restore are idempotent and verify the EXACT expected
                     # spec/token; restore reuses the existing instance and its data.
                     self._admit(quota=evidence['disk_quota_verified'],
-                                requested_disk_bytes=0 if action == 'restore' else None)
-                    self.engine.create(instance_id, evidence['host_path'], limits,
-                                       instance['gateway_token'],
-                                       network_profile=instance['network_profile'])
+                                requested_disk_bytes=0 if action == 'restore' else None,
+                                network_profile=instance['network_profile'])
+                    self._create_engine_instance(instance, evidence, limits, prepared_instance)
                     info = self._inspect(instance_id)
                     if self._absent(info):
                         raise ServiceError('runtime_unavailable', 503)
                     # Also on crash recovery/adoption, verify and re-evaluate right before start.
                     evidence = self._storage(self.store.instance(instance_id))
                     self._admit(quota=evidence['disk_quota_verified'],
-                                requested_disk_bytes=0 if action == 'restore' else None)
+                                requested_disk_bytes=0 if action == 'restore' else None,
+                                network_profile=instance['network_profile'])
                     if info['state'] != 'running':
                         self.engine.start(instance_id)
                 elif action == 'start':
                     assert evidence is not None
                     if self._absent(info):
                         raise ServiceError('runtime_unavailable', 503)
-                    self._admit(quota=evidence['disk_quota_verified'])
+                    self._admit(quota=evidence['disk_quota_verified'],
+                                network_profile=instance['network_profile'])
                     if info['state'] != 'running':
                         self.engine.start(instance_id)
                 elif action == 'restart':
                     assert evidence is not None
                     if self._absent(info):
                         raise ServiceError('runtime_unavailable', 503)
-                    self._admit(quota=evidence['disk_quota_verified'])
+                    self._admit(quota=evidence['disk_quota_verified'],
+                                network_profile=instance['network_profile'])
                     self.engine.restart(instance_id)
                 elif action == 'stop':
                     if not self._absent(info) and info['state'] not in {'stopped', 'exited', 'created'}:
                         self.engine.stop(instance_id)
                 elif action == 'remove':
                     if not self._absent(info):
-                        self.engine.remove(instance_id)
+                        self._remove_engine_instance(instance, action=action)
                 elif action == 'purge':
                     if not self._absent(info):
-                        self.engine.remove(instance_id)
+                        self._remove_engine_instance(instance, action=action)
                     info = self._inspect(instance_id)
                     if not self._absent(info):
                         raise ServiceError('runtime_unavailable', 503)
@@ -560,6 +615,12 @@ class RuntimeService:
             except Exception as error:
                 safe = error if isinstance(error, ServiceError) else ServiceError('runtime_unavailable', 503)
                 if operation:
+                    if payload['action'] in {'create', 'restore'}:
+                        try:
+                            failed_instance = self.store.instance(operation['instance_id'])
+                            self._abort_control_ui_prepare(operation['instance_id'], failed_instance)
+                        except Exception:
+                            safe = ServiceError('runtime_unavailable', 503)
                     if safe.code in {'quota_unverified', 'storage_unavailable'} and payload['action'] in {'create', 'start', 'restart', 'restore'}:
                         # A crash-recovered container may already be running. Do
                         # not leave it running after failed storage verification.
@@ -575,6 +636,155 @@ class RuntimeService:
                             safe = ServiceError('runtime_unavailable', 503)
                     self.store.fail(operation['id'], safe.code)
                 raise safe from None
+
+    def _abort_control_ui_prepare(self, instance_id, instance):
+        if (type(instance) is not dict
+                or instance.get('network_profile') != RuntimeStore.NETWORK_PROFILE_PROXY):
+            return
+        abort = getattr(self.engine, 'abort_control_ui_prepare', None)
+        if not callable(abort):
+            raise ServiceError('runtime_unavailable', 503)
+        try:
+            abort(instance_id)
+        except Exception:
+            raise ServiceError('runtime_unavailable', 503) from None
+
+    def _proxy_agent_identity_matches(self, sidecar_ip, agent_subnet):
+        if type(self.agent_network_pool) is not str:
+            return False
+        if type(sidecar_ip) is not str or type(agent_subnet) is not str:
+            return False
+        try:
+            pool = ipaddress.IPv4Network(self.agent_network_pool, strict=True)
+            subnet = ipaddress.IPv4Network(agent_subnet, strict=True)
+            address = ipaddress.IPv4Address(sidecar_ip)
+        except (ValueError, TypeError):
+            return False
+        return (subnet.prefixlen == 29 and subnet.subnet_of(pool)
+                and str(subnet) == agent_subnet
+                and str(address) == sidecar_ip
+                and address == subnet.network_address + 2)
+
+    def _create_engine_instance(self, instance, evidence, limits, prepared_instance):
+        """Keep legacy token auth isolated from proxy-profile container creation."""
+        if instance.get('network_profile') == RuntimeStore.NETWORK_PROFILE_PROXY:
+            if (type(prepared_instance) is not dict
+                    or not self._proxy_agent_identity_matches(
+                        prepared_instance.get('sidecar_ip'), prepared_instance.get('agent_subnet'))
+                    or type(prepared_instance.get('control_ui_origin')) is not str):
+                raise ServiceError('runtime_unavailable', 503)
+            return self.engine.create(
+                instance['id'], evidence['host_path'], limits, None,
+                network_profile=RuntimeStore.NETWORK_PROFILE_PROXY,
+                owner_id=instance['actor'], sidecar_ip=prepared_instance['sidecar_ip'],
+                control_ui_origin=prepared_instance['control_ui_origin'])
+        return self.engine.create(instance['id'], evidence['host_path'], limits,
+                                  instance['gateway_token'],
+                                  network_profile=instance['network_profile'])
+
+    def _remove_engine_instance(self, instance, *, action):
+        if action not in {'remove', 'purge'}:
+            raise ValueError('Unsupported runtime removal action')
+        if instance.get('network_profile') == RuntimeStore.NETWORK_PROFILE_PROXY:
+            return self.engine.remove(instance['id'], retain_networks=action == 'remove')
+        return self.engine.remove(instance['id'])
+
+    def _prepare_control_ui_instance(self, instance, *, action='create', host_path=None):
+        """Resolve trusted network identity before generating the Gateway policy."""
+        if type(instance) is not dict:
+            raise ServiceError('runtime_unavailable', 503)
+        if action not in {'create', 'restore'}:
+            return instance
+        if instance.get('network_profile') != RuntimeStore.NETWORK_PROFILE_PROXY:
+            return instance
+        prepare = getattr(self.engine, 'prepare_control_ui', None)
+        if (not callable(prepare) or type(self.control_ui_domain) is not str
+                or type(host_path) is not str
+                or not _CONTROL_UI_INSTANCE_RE.fullmatch(str(instance.get('id', '')))
+                or type(instance.get('actor')) is not str):
+            raise ServiceError('runtime_unavailable', 503)
+        try:
+            resolved = prepare(instance['id'], instance['actor'], self.control_ui_domain, host_path)
+        except Exception:
+            raise ServiceError('runtime_unavailable', 503) from None
+        if (type(resolved) is not dict
+                or set(resolved) != {'sidecar_ip', 'agent_subnet', 'control_ui_origin'}
+                or not self._proxy_agent_identity_matches(
+                    resolved.get('sidecar_ip'), resolved.get('agent_subnet'))
+                or type(resolved['control_ui_origin']) is not str
+                or resolved['control_ui_origin'] !=
+                    f"https://{instance['id']}.{self.control_ui_domain}"):
+            raise ServiceError('runtime_unavailable', 503)
+        enriched = dict(instance)
+        enriched.update(resolved)
+        try:
+            build_gateway_config(enriched)
+        except Exception:
+            raise ServiceError('runtime_unavailable', 503) from None
+        return enriched
+
+    def control_ui_target(self, payload):
+        """Return an owner-bound sidecar target only after live Docker verification."""
+        if type(payload) is not dict or set(payload) != {'actor_id', 'instance_id'}:
+            raise ServiceError('invalid_request', 400)
+        owner_id = actor(payload['actor_id'])
+        instance_id = payload['instance_id']
+        if type(instance_id) is not str or _CONTROL_UI_INSTANCE_RE.fullmatch(instance_id) is None:
+            raise ServiceError('invalid_request', 400)
+        unavailable = {'ready': False, 'target': None}
+        with self.lock:
+            instance = self.store.current(owner_id)
+            if type(instance) is not dict or instance.get('id') != instance_id:
+                return unavailable
+            for _ in range(2):
+                info = self._inspect(instance_id)
+                if (info.get('state') != 'running' or info.get('gateway') != 'ready'
+                        or info.get('network_profile') != RuntimeStore.NETWORK_PROFILE_PROXY
+                        or info.get('proxy_state') != 'ready'):
+                    return unavailable
+                resolver = getattr(self.engine, 'control_ui_target', None)
+                if not callable(resolver):
+                    return unavailable
+                try:
+                    target = resolver(instance_id, owner_id)
+                except Exception:
+                    return unavailable
+                if (type(target) is not dict
+                        or set(target) != {'ip', 'port', 'proxy_token', 'identity'}
+                        or type(target['ip']) is not str or type(target['port']) is not int
+                        or type(target['proxy_token']) is not str
+                        or type(target['identity']) is not dict
+                        or set(target['identity']) != {
+                            'gateway_id', 'sidecar_id', 'agent_network_id', 'frontend_network_id'}
+                        or any(type(value) is not str or _CONTROL_UI_DOCKER_ID_RE.fullmatch(value) is None
+                               for value in target['identity'].values())):
+                    return unavailable
+                if (target['identity']['gateway_id'] != info.get('container_id')
+                        or target['identity'] != info.get('proxy_identity')):
+                    return unavailable
+                try:
+                    address = ipaddress.ip_address(target['ip'])
+                except ValueError:
+                    return unavailable
+                if (address.version != 4 or not address.is_private or address.is_loopback
+                        or address.is_link_local or address.is_multicast or address.is_unspecified
+                        or str(address) != target['ip'] or target['port'] != _CONTROL_UI_SIDECAR_PORT
+                        or _CONTROL_UI_PROXY_TOKEN_RE.fullmatch(target['proxy_token']) is None):
+                    return unavailable
+                verified = self._inspect(instance_id)
+                if (verified.get('state') != 'running' or verified.get('gateway') != 'ready'
+                        or verified.get('network_profile') != RuntimeStore.NETWORK_PROFILE_PROXY
+                        or verified.get('proxy_state') != 'ready'
+                        or verified.get('container_id') != target['identity']['gateway_id']
+                        or verified.get('proxy_identity') != target['identity']):
+                    return unavailable
+                current = self.store.current(owner_id)
+                if type(current) is not dict or current.get('id') != instance_id:
+                    return unavailable
+                return {'ready': True, 'target': {
+                    'ip': target['ip'], 'port': target['port'],
+                    'proxy_token': target['proxy_token']}}
+        return unavailable
 
     def reconcile(self):
         """Inspect known IDs only; never create/start queued or failed intents."""
@@ -613,12 +823,19 @@ class RuntimeApplication(RuntimeService):
             volumes = XfsVolumes(profile, config['state_dir'])
         if engine is None:
             from .docker_engine import DockerEngine
-            engine = DockerEngine(config['image'])
+            engine = DockerEngine(
+                config['image'], agent_network_pool=config.get('agent_network_pool'),
+                frontend_network_pool=config.get('frontend_network_pool'))
         if metrics is None:
             metrics = HostMetrics(profile.storage.mountpoint, clock=clock)
         super().__init__(profile, store, volumes, engine, metrics,
                          capacities=tuple(config[k] for k in ('capacity_ram_bytes', 'capacity_cpu_millicores', 'capacity_disk_bytes')),
-                         disk_floor_bytes=config['disk_floor_bytes'], initialize=initialize, clock=clock)
+                         disk_floor_bytes=config['disk_floor_bytes'], initialize=initialize, clock=clock,
+                         network_profile_default=config.get(
+                             'network_profile_default', RuntimeStore.NETWORK_PROFILE_LEGACY),
+                         control_ui_domain=config.get('control_ui_domain'),
+                         agent_network_pool=config.get('agent_network_pool'),
+                         frontend_network_pool=config.get('frontend_network_pool'))
 
     def close(self):
         if hasattr(self.metrics, 'close'):
@@ -626,8 +843,28 @@ class RuntimeApplication(RuntimeService):
         self.store.close()
 
 
-CONFIG_KEYS = {'profile_path', 'state_dir', 'socket_path', 'token_file', 'image',
-               'capacity_ram_bytes', 'capacity_cpu_millicores', 'capacity_disk_bytes', 'disk_floor_bytes'}
+BASE_CONFIG_KEYS = {'profile_path', 'state_dir', 'socket_path', 'token_file', 'image',
+                    'capacity_ram_bytes', 'capacity_cpu_millicores', 'capacity_disk_bytes', 'disk_floor_bytes'}
+CONFIG_KEYS = BASE_CONFIG_KEYS | {'network_profile_default'}
+CONFIG_KEYS_WITH_DOMAIN = CONFIG_KEYS | {'control_ui_domain'}
+CONFIG_KEYS_WITH_NETWORKS = CONFIG_KEYS | {
+    'control_ui_domain', 'agent_network_pool', 'frontend_network_pool'}
+_CONTROL_UI_DOMAIN_LABEL = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z')
+
+
+def _network_pool(value):
+    if type(value) is not str:
+        raise ValueError('Invalid Control UI network pool')
+    try:
+        network = ipaddress.IPv4Network(value, strict=True)
+    except (ValueError, ipaddress.NetmaskValueError):
+        raise ValueError('Invalid Control UI network pool') from None
+    private_pools = tuple(ipaddress.IPv4Network(item) for item in (
+        '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))
+    if (network.prefixlen > 24
+            or not any(network.subnet_of(private) for private in private_pools)):
+        raise ValueError('Control UI network pool must be an explicit RFC1918 IPv4 supernet')
+    return network
 
 
 def load_service_config(path):
@@ -636,8 +873,37 @@ def load_service_config(path):
     if len(blob) > 65536:
         raise ValueError('Invalid service config')
     config = decode_json(blob)
-    if type(config) is not dict or set(config) != CONFIG_KEYS:
+    allowed_keys = (BASE_CONFIG_KEYS, CONFIG_KEYS, CONFIG_KEYS_WITH_DOMAIN,
+                    CONFIG_KEYS_WITH_NETWORKS)
+    if type(config) is not dict or set(config) not in allowed_keys:
         raise ValueError('Invalid service config')
+    config.setdefault('network_profile_default', RuntimeStore.NETWORK_PROFILE_LEGACY)
+    config.setdefault('control_ui_domain', None)
+    config.setdefault('agent_network_pool', None)
+    config.setdefault('frontend_network_pool', None)
+    if (type(config['network_profile_default']) is not str
+            or config['network_profile_default'] not in RuntimeStore.NETWORK_PROFILES):
+        raise ValueError('Invalid default network profile')
+    domain = config['control_ui_domain']
+    if domain is not None and (type(domain) is not str or len(domain) > 253
+            or len(domain.split('.')) < 2
+            or any(_CONTROL_UI_DOMAIN_LABEL.fullmatch(label) is None for label in domain.split('.'))):
+        raise ValueError('Invalid Control UI domain')
+    raw_agent_pool = config['agent_network_pool']
+    raw_frontend_pool = config['frontend_network_pool']
+    if (raw_agent_pool is None) != (raw_frontend_pool is None):
+        raise ValueError('Both Control UI network pools must be provided together')
+    if raw_agent_pool is not None:
+        agent_pool, frontend_pool = _network_pool(raw_agent_pool), _network_pool(raw_frontend_pool)
+        if agent_pool.overlaps(frontend_pool):
+            raise ValueError('Control UI network pools must not overlap')
+        config['agent_network_pool'] = str(agent_pool)
+        config['frontend_network_pool'] = str(frontend_pool)
+    if config['network_profile_default'] == RuntimeStore.NETWORK_PROFILE_PROXY:
+        if domain is None:
+            raise ValueError('Control UI domain required for proxy profile')
+        if raw_agent_pool is None:
+            raise ValueError('Control UI network pools required for proxy profile')
     for key in ('profile_path', 'state_dir', 'socket_path', 'token_file'):
         value = config[key]
         if (type(value) is not str or len(value) > 4096 or not value.startswith('/')
@@ -769,7 +1035,8 @@ class APIHandler(BaseHTTPRequestHandler):
             supplied = headers[0].encode('utf-8') if len(headers) == 1 else b''
             if not hmac.compare_digest(supplied, expected):
                 raise ServiceError('unauthorized', 401)
-            if self.path not in ('/v1/me', '/v1/actions', '/v1/replay', '/v1/retained/workspace'):
+            if self.path not in ('/v1/me', '/v1/actions', '/v1/replay',
+                                 '/v1/retained/workspace', '/v1/control-ui/target'):
                 raise ServiceError('not_found', 404)
             lengths = self.headers.get_all('Content-Length', [])
             if (len(lengths) != 1 or re.fullmatch(r'[0-9]{1,10}', lengths[0]) is None
@@ -792,6 +1059,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     self._binary(200, result)
                 else:
                     self._json(200, result)
+            elif self.path == '/v1/control-ui/target':
+                resolver = getattr(controller, 'control_ui_target', None)
+                if not callable(resolver):
+                    raise ServiceError('runtime_unavailable', 503)
+                self._json(200, resolver(payload))
             else:
                 self._json(200, dispatch[self.path](payload))
         except ServiceError as error:
@@ -853,7 +1125,9 @@ def serve(config):
     for target in (Path(config['token_file']), socket_path):
         if target.is_symlink():
             raise ValueError('Unsafe service target')
-    engine = DockerEngine(config['image'])
+    engine = DockerEngine(
+        config['image'], agent_network_pool=config['agent_network_pool'],
+        frontend_network_pool=config['frontend_network_pool'])
     engine.check_host()
     metrics = HostMetrics(profile.storage.mountpoint)
     metrics.collect()
@@ -879,7 +1153,11 @@ def serve(config):
         store = RuntimeStore(db_path, profile.profile_version, fingerprint)
         metrics.start()
         controller = RuntimeService(profile, store, XfsVolumes(profile, state), engine,
-                                    metrics, capacities=capacities, disk_floor_bytes=config['disk_floor_bytes'])
+                                    metrics, capacities=capacities, disk_floor_bytes=config['disk_floor_bytes'],
+                                    network_profile_default=config['network_profile_default'],
+                                    control_ui_domain=config['control_ui_domain'],
+                                    agent_network_pool=config['agent_network_pool'],
+                                    frontend_network_pool=config['frontend_network_pool'])
         controller._sample()  # Reject explicit ceilings above physical totals.
         if any(used > maximum for used, maximum in zip(store.totals(), capacities)):
             raise ValueError('Existing reservations exceed configured ceilings')

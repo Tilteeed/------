@@ -6,9 +6,12 @@ agent-network IPv4 address. A private bearer authenticates the BEZR web process.
 """
 from dataclasses import dataclass
 import hmac
+import http.client
 import ipaddress
 import os
 import re
+import stat
+import sys
 from urllib.parse import urlsplit, unquote
 
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
@@ -16,6 +19,8 @@ MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_WS_MESSAGE_BYTES = 16 * 1024 * 1024
 SIDECAR_PORT = 18790
 GATEWAY_PORT = 18789
+SIDECAR_TOKEN_FILE = '/run/secrets/bezr-proxy-token'
+_TOKEN_FILE_ENV = 'BEZR_SIDECAR_PROXY_TOKEN_FILE'
 _OWNER_RE = re.compile(r"[^\x00-\x20\x7f]{1,256}\Z")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{40,64}\Z")
 _ORIGIN_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
@@ -217,7 +222,7 @@ def _create_app(config):
         origin_values = request.headers.getall('Origin', [])
         if origin_values != [config.public_origin]:
             raise web.HTTPForbidden(headers={'Cache-Control': 'no-store'})
-        return normalize_target_path(request.rel_url.raw_path), _client_ip(
+        return normalize_target_path(request.rel_url.raw_path_qs), _client_ip(
             request.headers.get('X-Bezr-Client-IP'))
 
     async def health(request):
@@ -312,20 +317,96 @@ def _create_app(config):
     return app
 
 
-def main():
+def _read_proxy_token_file(path):
+    if type(path) is not str or path != SIDECAR_TOKEN_FILE:
+        raise SidecarConfigError('Invalid sidecar credential file')
+    nofollow = getattr(os, 'O_NOFOLLOW', None)
+    if type(nofollow) is not int:
+        raise SidecarConfigError('Secure sidecar credential file access is unavailable')
+    flags = os.O_RDONLY | nofollow | getattr(os, 'O_CLOEXEC', 0)
+    descriptor = None
+    try:
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+        get_euid = getattr(os, 'geteuid', None)
+        if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_nlink != 1 or not callable(get_euid)
+                or info.st_uid != get_euid() or not 40 <= info.st_size <= 64):
+            raise SidecarConfigError('Invalid sidecar credential file')
+        raw = os.read(descriptor, 65)
+        if len(raw) != info.st_size:
+            raise SidecarConfigError('Invalid sidecar credential file')
+    except SidecarConfigError:
+        raise
+    except OSError:
+        raise SidecarConfigError('Invalid sidecar credential file') from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    try:
+        token = raw.decode('ascii')
+    except UnicodeError:
+        raise SidecarConfigError('Invalid sidecar credential file') from None
+    if _TOKEN_RE.fullmatch(token) is None:
+        raise SidecarConfigError('Invalid sidecar credential file')
+    return token
+
+
+def _environment_config():
+    if 'BEZR_SIDECAR_PROXY_TOKEN' in os.environ:
+        raise SidecarConfigError('Proxy credential must not be an environment value')
+    token_path = os.environ.get(_TOKEN_FILE_ENV)
     values = {
         'owner_id': os.environ.get('BEZR_SIDECAR_OWNER_ID'),
         'public_origin': os.environ.get('BEZR_SIDECAR_PUBLIC_ORIGIN'),
         'gateway_ip': os.environ.get('BEZR_SIDECAR_GATEWAY_IP'),
         'listen_ip': os.environ.get('BEZR_SIDECAR_LISTEN_IP'),
-        'proxy_token': os.environ.get('BEZR_SIDECAR_PROXY_TOKEN'),
+        'proxy_token': _read_proxy_token_file(token_path),
     }
-    config = validate_sidecar_config(values)
+    return validate_sidecar_config(values)
+
+
+def _healthcheck(config):
+    connection = None
+    headers = {
+        'Authorization': 'Bearer ' + config.proxy_token,
+        'Host': config.public_host,
+        'X-Bezr-Host': config.public_host,
+        'X-Bezr-Origin': config.public_origin,
+    }
+    try:
+        connection = http.client.HTTPConnection(config.listen_ip, SIDECAR_PORT, timeout=3)
+        connection.request('GET', '/_bezr/health', headers=headers)
+        response = connection.getresponse()
+        return response.status == 204
+    except Exception:
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def main():
+    if sys.argv[1:] == ['--healthcheck']:
+        try:
+            config = _environment_config()
+            healthy = _healthcheck(config)
+        except Exception:
+            healthy = False
+        if not healthy:
+            print('Sidecar healthcheck failed', file=sys.stderr)
+            return 1
+        return 0
+    config = _environment_config()
     from aiohttp import web
     app = _create_app(config)
     web.run_app(app, host=config.listen_ip, port=SIDECAR_PORT,
                 print=None, access_log=None, handle_signals=True)
 
 
+def _entrypoint():
+    raise SystemExit(main())
+
+
 if __name__ == '__main__':
-    main()
+    _entrypoint()

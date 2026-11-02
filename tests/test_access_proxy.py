@@ -101,6 +101,10 @@ class AccessProxyRequestTests(unittest.TestCase):
         self.origin = f'https://{self.instance_id}.agents.example.test'
         ticket = self.store.issue_control_ui_ticket('alice', self.instance_id, self.origin)['ticket']
         self.session_id = self.store.redeem_control_ui_ticket(ticket, audience=self.origin)['session_id']
+        self.forwarded_headers = {
+            'X-Forwarded-For': '198.51.100.7',
+            'X-Forwarded-Proto': 'https',
+        }
 
     def make_app(self, *, state='running', profile='agent_proxy_v1', ws_recheck_seconds: float = 15.0):
         import asyncio
@@ -164,6 +168,7 @@ class AccessProxyRequestTests(unittest.TestCase):
         client = TestClient(app, base_url=self.origin, client=('198.51.100.7', 12345))
         self.addCleanup(client.close)
         response = client.get('/assets/app.js', headers={
+            **self.forwarded_headers,
             'Cookie': '__Host-bezr-control-ui=' + self.session_id,
             'Origin': self.origin,
         })
@@ -183,6 +188,39 @@ class AccessProxyRequestTests(unittest.TestCase):
         self.assertEqual(denied.status_code, 404)
         self.assertEqual(len(transport.calls), 1)
 
+    def test_access_proxy_rejects_plain_http_origin_before_relay(self):
+        app, transport = self.make_app()
+        client = TestClient(app, base_url='http://' + self.instance_id + '.agents.example.test',
+                            client=('198.51.100.7', 12345))
+        self.addCleanup(client.close)
+        response = client.get('/', headers={
+            **self.forwarded_headers,
+            'Cookie': '__Host-bezr-control-ui=' + self.session_id,
+            'Origin': self.origin,
+        })
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(transport.calls, [])
+
+    def test_proxy_rejects_missing_or_untrusted_frontend_forwarded_identity(self):
+        app, transport = self.make_app()
+        client = TestClient(app, base_url=self.origin, client=('198.51.100.7', 12345))
+        self.addCleanup(client.close)
+        invalid_forwarded = (
+            {},
+            {'X-Forwarded-For': '198.51.100.8', 'X-Forwarded-Proto': 'https'},
+            {'X-Forwarded-For': '198.51.100.7, 198.51.100.8', 'X-Forwarded-Proto': 'https'},
+            {'X-Forwarded-For': '198.51.100.7', 'X-Forwarded-Proto': 'http'},
+        )
+        for forwarded in invalid_forwarded:
+            with self.subTest(forwarded=forwarded):
+                response = client.get('/', headers={
+                    'Cookie': '__Host-bezr-control-ui=' + self.session_id,
+                    'Origin': self.origin,
+                    **forwarded,
+                })
+                self.assertEqual(response.status_code, 403)
+        self.assertEqual(transport.calls, [])
+
     def test_host_dispatch_sends_agent_origin_to_proxy_and_keeps_main_origin_in_webui(self):
         from control_plane.access_proxy import ControlUiHostMiddleware
         app, transport = self.make_app()
@@ -195,6 +233,7 @@ class AccessProxyRequestTests(unittest.TestCase):
         client = TestClient(root, base_url='https://bezr.example.test', client=('198.51.100.7', 12345))
         self.addCleanup(client.close)
         agent = client.get('/', headers={
+            **self.forwarded_headers,
             'Host': self.instance_id + '.agents.example.test',
             'Cookie': '__Host-bezr-control-ui=' + self.session_id,
             'Origin': self.origin,
@@ -212,6 +251,7 @@ class AccessProxyRequestTests(unittest.TestCase):
         self.addCleanup(client.close)
         try:
             with client.websocket_connect(self.origin.replace('https://', 'wss://') + '/ws', headers={
+                **self.forwarded_headers,
                 'Cookie': '__Host-bezr-control-ui=' + self.session_id,
                 'Origin': self.origin,
             }, subprotocols=['openclaw']) as websocket:
@@ -235,6 +275,7 @@ class AccessProxyRequestTests(unittest.TestCase):
         client = TestClient(app, base_url=self.origin, client=('198.51.100.7', 12345))
         self.addCleanup(client.close)
         with client.websocket_connect(self.origin.replace('https://', 'wss://') + '/ws', headers={
+            **self.forwarded_headers,
             'Cookie': '__Host-bezr-control-ui=' + self.session_id,
             'Origin': self.origin,
         }) as websocket:
@@ -250,6 +291,7 @@ class AccessProxyRequestTests(unittest.TestCase):
                 client = TestClient(app, base_url=self.origin, client=('198.51.100.7', 12345))
                 self.addCleanup(client.close)
                 response = client.get('/', headers={
+                    **self.forwarded_headers,
                     'Cookie': '__Host-bezr-control-ui=' + self.session_id,
                     'Origin': self.origin,
                 })

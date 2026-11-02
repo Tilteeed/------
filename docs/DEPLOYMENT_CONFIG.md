@@ -22,7 +22,8 @@
 | --- | --- | --- |
 | Порт веба | `WEB_PORT` в локальной `.env`; описание в `.env.example` | Выбрать доступный порт; проверить фактическую публикацию Compose. |
 | Публичный origin кабинета | `AGENT_PLATFORM_PUBLIC_ORIGIN` в `.env` | Указать фактические схему, hostname и порт доступа, не копировать лабораторный localhost без проверки. Для Control UI launch нужен HTTPS origin. |
-| Суффикс отдельного Control UI origin | `AGENT_CONTROL_UI_DOMAIN` в `.env` | Пустой по умолчанию. Заполнять только после wildcard DNS/TLS и owner-scoped HTTP/WS proxy; API дополнительно требует per-instance `agent_internal_v1` и отключённый по умолчанию server-side proxy-ready gate. Переменная сама по себе не создаёт DNS/TLS/reverse proxy. |
+| Суффикс отдельного Control UI origin | `AGENT_CONTROL_UI_DOMAIN` в `.env` и `control_ui_domain` в `supervisor/runtime.json` | Пусто по умолчанию. Заполнять одинаково только после wildcard DNS/TLS и owner-scoped HTTP/WS proxy; API требует `agent_proxy_v1`, готовый server-resolved sidecar target и смонтированный proxy. Поля сами по себе не создают DNS/TLS/reverse proxy. |
+| Пулы per-agent IPAM | `agent_network_pool` и `frontend_network_pool` в `supervisor/runtime.json` | Оба обязательны только для `agent_proxy_v1`; defaults отсутствуют. Указать два непересекающихся RFC1918 IPv4 supernet, выбранных для целевой машины, после проверки всех host routes и Docker networks. Не копировать диапазоны из лабораторной конфигурации. |
 | Память/CPU веба | `WEB_MEMORY_LIMIT`, `WEB_CPU_LIMIT` в `.env` | Подобрать по ресурсам и замерам новой машины. |
 | Ключ веб-сессий | `WEBUI_SECRET_KEY` в `.env` | Для независимого нового стенда сгенерировать локально через `scripts/init_env.py`; не копировать лабораторный секрет. Генератор не перезаписывает существующую `.env`. |
 | Начальная установка веба | `docs/deployment.md`, `compose.yaml` | Инструкция относится к веб-части, не к готовому персональному provisioning. |

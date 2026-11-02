@@ -28,6 +28,69 @@ def valid_profile():
     }
 
 
+class ServiceConfigTests(unittest.TestCase):
+    @staticmethod
+    def config():
+        return {
+            'profile_path': '/var/lib/personal-agent-supervisor/deployment.json',
+            'state_dir': '/var/lib/personal-agent-supervisor',
+            'socket_path': '/run/personal-agent-supervisor/control.sock',
+            'token_file': '/var/lib/personal-agent-supervisor/service.token',
+            'image': 'sha256:' + 'a' * 64,
+            'capacity_ram_bytes': 1024 * 1024 * 1024,
+            'capacity_cpu_millicores': 2000,
+            'capacity_disk_bytes': 8 * 1024**3,
+            'disk_floor_bytes': 1024**3,
+        }
+
+    def test_network_profile_default_is_legacy_and_proxy_profile_is_explicit(self):
+        from supervisor.service import load_service_config
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'runtime.json'
+            data = self.config()
+            path.write_text(json.dumps(data), encoding='utf-8')
+            defaults = load_service_config(path)
+            self.assertEqual(defaults['network_profile_default'], 'legacy_none')
+            self.assertIsNone(defaults['control_ui_domain'])
+            self.assertIsNone(defaults['agent_network_pool'])
+            self.assertIsNone(defaults['frontend_network_pool'])
+            data['network_profile_default'] = 'agent_proxy_v1'
+            data['control_ui_domain'] = 'agents.example.test'
+            data['agent_network_pool'] = '10.240.0.0/13'
+            data['frontend_network_pool'] = '10.248.0.0/13'
+            path.write_text(json.dumps(data), encoding='utf-8')
+            proxy_config = load_service_config(path)
+            self.assertEqual(proxy_config['network_profile_default'], 'agent_proxy_v1')
+            self.assertEqual(proxy_config['control_ui_domain'], 'agents.example.test')
+            self.assertEqual(proxy_config['agent_network_pool'], '10.240.0.0/13')
+            self.assertEqual(proxy_config['frontend_network_pool'], '10.248.0.0/13')
+            data['frontend_network_pool'] = '10.240.0.0/12'
+            path.write_text(json.dumps(data), encoding='utf-8')
+            with self.assertRaises(ValueError):
+                load_service_config(path)
+            data['frontend_network_pool'] = '10.248.0.0/13'
+            del data['agent_network_pool']
+            path.write_text(json.dumps(data), encoding='utf-8')
+            with self.assertRaises(ValueError):
+                load_service_config(path)
+            data['frontend_network_pool'] = '10.248.0.0/13'
+            for invalid_pool in ('192.0.2.0/24', '10.240.1.1/24', '10.240.0.0/25', 'fd00::/64'):
+                with self.subTest(invalid_pool=invalid_pool):
+                    data['agent_network_pool'] = invalid_pool
+                    path.write_text(json.dumps(data), encoding='utf-8')
+                    with self.assertRaises(ValueError):
+                        load_service_config(path)
+            data['agent_network_pool'] = '10.240.0.0/13'
+            data['control_ui_domain'] = '*.agents.example.test'
+            path.write_text(json.dumps(data), encoding='utf-8')
+            with self.assertRaises(ValueError):
+                load_service_config(path)
+            data['network_profile_default'] = 'network_mode=host'
+            path.write_text(json.dumps(data), encoding='utf-8')
+            with self.assertRaises(ValueError):
+                load_service_config(path)
+
+
 class ProfileTests(unittest.TestCase):
     def test_explicit_site_profile_becomes_immutable_snapshot(self):
         from supervisor.config import validate_profile

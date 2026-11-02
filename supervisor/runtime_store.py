@@ -26,6 +26,11 @@ def canonical(value):
 class RuntimeStore:
     NETWORK_PROFILE_LEGACY = 'legacy_none'
     NETWORK_PROFILE_PRIVATE = 'agent_internal_v1'
+    NETWORK_PROFILE_PROXY = 'agent_proxy_v1'
+    SIDECAR_RAM_BYTES = 128 * 1024 * 1024
+    SIDECAR_CPU_MILLICORES = 100
+    SIDECAR_PIDS_LIMIT = 32
+    NETWORK_PROFILES = {NETWORK_PROFILE_LEGACY, NETWORK_PROFILE_PRIVATE, NETWORK_PROFILE_PROXY}
 
     def __init__(self, path, profile_version, profile_hash):
         self.lock = threading.RLock()
@@ -314,11 +319,27 @@ class RuntimeStore:
         with self.lock:
             return [dict(row) for row in self.db.execute('SELECT * FROM instances')]
 
+    @classmethod
+    def _with_proxy_reservation(cls, limits, network_profile):
+        if type(network_profile) is not str or network_profile not in cls.NETWORK_PROFILES:
+            raise StoreError('invalid_network_profile')
+        ram, cpu, disk = limits
+        if network_profile == cls.NETWORK_PROFILE_PROXY:
+            ram += cls.SIDECAR_RAM_BYTES
+            cpu += cls.SIDECAR_CPU_MILLICORES
+        return ram, cpu, disk
+
     def totals(self):
         with self.lock:
-            return tuple(self.db.execute('SELECT COALESCE(SUM(ram),0),COALESCE(SUM(cpu),0),COALESCE(SUM(disk),0) FROM instances').fetchone())
+            row = self.db.execute(
+                'SELECT COALESCE(SUM(ram),0) + COALESCE(SUM(CASE WHEN active=1 AND network_profile=? THEN ? ELSE 0 END),0), '
+                'COALESCE(SUM(cpu),0) + COALESCE(SUM(CASE WHEN active=1 AND network_profile=? THEN ? ELSE 0 END),0), '
+                'COALESCE(SUM(disk),0) FROM instances',
+                (self.NETWORK_PROFILE_PROXY, self.SIDECAR_RAM_BYTES,
+                 self.NETWORK_PROFILE_PROXY, self.SIDECAR_CPU_MILLICORES)).fetchone()
+            return tuple(row)
 
-    def intent(self, payload, limits, capacities):
+    def intent(self, payload, limits, capacities, *, network_profile=NETWORK_PROFILE_LEGACY):
         """Atomic replay, owner slot, reservation and operation intent."""
         with self.transaction():
             replay = self.lookup(payload)
@@ -328,6 +349,8 @@ class RuntimeStore:
                     raise StoreError('operation_pending')
                 return replay
             actor, action = payload['actor_id'], payload['action']
+            if type(network_profile) is not str or network_profile not in self.NETWORK_PROFILES:
+                raise StoreError('invalid_network_profile')
             if action not in {'create', 'start', 'stop', 'restart', 'remove', 'purge', 'restore'}:
                 raise StoreError('invalid_action')
             instance_id = None
@@ -352,8 +375,9 @@ class RuntimeStore:
                 if self.current(actor) is not None:
                     raise StoreError('owner_has_instance')
                 used = self.totals()
-                if (used[0] + limits[0] > capacities[0]
-                        or used[1] + limits[1] > capacities[1]):
+                requested = self._with_proxy_reservation(limits, instance['network_profile'])
+                if (used[0] + requested[0] > capacities[0]
+                        or used[1] + requested[1] > capacities[1]):
                     raise StoreError('capacity_exhausted')
                 instance_id = instance['id']
             else:
@@ -361,14 +385,15 @@ class RuntimeStore:
             if action == 'create':
                 if instance:
                     raise StoreError('owner_has_instance')
-                if any(used + requested > capacity for used, requested, capacity
-                       in zip(self.totals(), limits, capacities)):
+                requested = self._with_proxy_reservation(limits, network_profile)
+                if any(used + needed > capacity for used, needed, capacity
+                       in zip(self.totals(), requested, capacities)):
                     raise StoreError('capacity_exhausted')
                 instance_id = uuid.uuid4().hex
                 self.db.execute('INSERT INTO instances (id,actor,active,state,settings,revision,ram,cpu,disk,gateway_token,storage,container_id,network_profile) VALUES (?,?,1,?,?,?,?,?,?,?,NULL,NULL,?)',
                                 (instance_id, actor, 'preparing', canonical(payload['settings']),
                                  payload['settings_revision'], *limits, secrets.token_urlsafe(32),
-                                 self.NETWORK_PROFILE_LEGACY))
+                                 network_profile))
             elif action not in {'purge', 'restore'}:
                 if instance is None:
                     raise StoreError('instance_not_found')

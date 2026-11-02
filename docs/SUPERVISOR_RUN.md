@@ -4,7 +4,7 @@
 
 Кабинет передаёт проверенную Open WebUI identity через приватный Unix socket. Только host-supervisor обращается к Docker и XFS. Веб и агенты не получают Docker socket. Пользовательский отчёт для `2afe2b5` подтверждает отдельный реальный purge/XFS сценарий на disposable dataset. Restore и workspace browser реализованы локально, но не прошли VM/browser приёмку.
 
-Текущий незакоммиченный локальный slice версионирует сеть: обычный create пока остаётся на legacy `NetworkMode=none`; отдельные bridge-сети и lifecycle sidecar ещё не подключены. BEZR-кнопка, одноразовый ticket/session handoff, HTTP/WS Access Proxy и per-agent relay реализованы на уровне кода и имеют только локальные синтетические проверки; Open WebUI middleware для отдельного host устанавливается интеграционным скриптом. Production proxy-ready остаётся выключенным, потому что Supervisor ещё не выдаёт проверенный sidecar target. Есть builder для `trusted-proxy` конфига с точным IP/owner и `deviceAutoApprove=false`, но профиль пока не включён в Docker lifecycle и ручное pairing через Supervisor не реализовано. Internal bridge сам по себе не блокирует host services: host-firewall policy, per-agent networks, реальный sidecar container, manual pairing и LLM/egress остаются обязательными до доступности. Не считать это готовой LLM/чат-функцией и не переносить на ВМ без отдельного согласия.
+Текущий локальный slice: обычный create остаётся на legacy `NetworkMode=none`; per-agent bridge-сети и sidecar lifecycle ещё не подключены. BEZR-кнопка, one-time ticket/session handoff, HTTP/WS Access Proxy, relay и Open WebUI host middleware существуют только в локальном коде. Sidecar query передаётся через `raw_path_qs`. Access Proxy требует HTTPS/WSS ASGI scope и проверяет однозначные `X-Forwarded-For`/`X-Forwarded-Proto` против ASGI client; Compose задаёт Uvicorn `FORWARDED_ALLOW_IPS=127.0.0.1` для ожидаемого host-local edge, но реальный ASGI peer/scope в Docker ещё не проверен. Production proxy-ready закрыт: Supervisor не выдаёт sidecar target. `trusted-proxy` builder не подключён к Docker profile, ручное pairing отсутствует. Выбранные 128 MiB / 100m / 32 PIDs sidecar не применяются и не резервируются. Host-firewall, per-agent networks/container, ручное pairing и VM/browser acceptance остаются обязательными; не считать это готовым Control UI и не переносить на ВМ без отдельного согласия.
 
 ## Подготовка на Linux-ВМ
 
@@ -72,7 +72,7 @@ docker compose -f compose.yaml -f compose.supervisor.yaml up -d --build
 
 1. Ранее пользователь сообщал о lifecycle-проверках create/start/stop/restart/remove-retain на своей ВМ; см. `docs/verification.md`.
 2. Контроль владельца, retained restore и workspace browser для более новых функций требуют отдельной приёмки; локальные fake-тесты не подтверждают их на ВМ.
-3. Новый `agent_internal_v1` не имеет Access Proxy/model relay; создать агент этим профилем пока не означает, что его Control UI доступен пользователю.
+3. `agent_internal_v1` не делает Control UI доступным. Launch/status требуют `agent_proxy_v1`, готового server-resolved sidecar target и смонтированного Access Proxy; Supervisor пока не обеспечивает sidecar target, поэтому production status остаётся unavailable.
 
 **Не нажимайте «Удалить данные и квоту» в этой обычной приёмке.** Пользовательский отчёт для `2afe2b5` уже подтверждает один purge на отдельном disposable XFS dataset. Любой повторный purge/release test — отдельное необратимое действие: он требует отдельного согласия и нового disposable набора данных, не действующих пользовательских данных.
 

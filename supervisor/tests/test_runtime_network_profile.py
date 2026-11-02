@@ -143,6 +143,91 @@ class RuntimeNetworkProfileTests(unittest.TestCase):
             self.assertEqual(Path(report['backup_path']), backup)
             self.assertTrue(backup.is_file())
 
+    def test_agent_proxy_profile_reserves_sidecar_ram_and_cpu_atomically(self):
+        from supervisor.runtime_store import StoreError
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RuntimeStore(Path(tmp) / 'runtime.sqlite3', 'site-v1', 'c' * 64)
+            try:
+                limits = (1024, 100, 10)
+                proxy_ram = 128 * 1024 * 1024
+                proxy_cpu = 100
+                operation = store.intent({
+                    'actor_id': 'alice', 'action': 'create', 'idempotency_key': 'proxy-create-1',
+                    'settings_revision': 1, 'settings': {'name': 'Agent', 'instructions': ''},
+                }, limits, (proxy_ram + limits[0], proxy_cpu + limits[1], limits[2]),
+                    network_profile='agent_proxy_v1')
+                instance = store.instance(operation['instance_id'])
+                self.assertEqual(instance['network_profile'], 'agent_proxy_v1')
+                self.assertEqual(store.totals(), (proxy_ram + limits[0], proxy_cpu + limits[1], limits[2]))
+                store.storage_ready(instance['id'], {'quota_verified': True})
+                with self.assertRaises(StoreError) as caught:
+                    store.intent({
+                        'actor_id': 'bob', 'action': 'create', 'idempotency_key': 'proxy-create-2',
+                        'settings_revision': 1, 'settings': {'name': 'Agent 2', 'instructions': ''},
+                    }, limits, (proxy_ram + 2 * limits[0] + proxy_ram - 1,
+                               proxy_cpu + 2 * limits[1], 2 * limits[2]),
+                        network_profile='agent_proxy_v1')
+                self.assertEqual(caught.exception.code, 'capacity_exhausted')
+                remove = store.intent({
+                    'actor_id': 'alice', 'action': 'remove', 'idempotency_key': 'proxy-remove-1',
+                    'settings_revision': 1, 'instance_id': instance['id'],
+                }, limits, (proxy_ram + limits[0], proxy_cpu + limits[1], limits[2]),
+                    network_profile='agent_proxy_v1')
+                store.complete(remove['id'], 'removed')
+                self.assertEqual(store.totals(), (0, 0, limits[2]))
+                with self.assertRaises(StoreError) as restore_error:
+                    store.intent({
+                        'actor_id': 'alice', 'action': 'restore',
+                        'idempotency_key': 'proxy-restore-1', 'settings_revision': 1,
+                        'instance_id': instance['id'],
+                    }, limits,
+                       (proxy_ram + limits[0] - 1, proxy_cpu + limits[1] - 1, limits[2]),
+                       network_profile='agent_proxy_v1')
+                self.assertEqual(restore_error.exception.code, 'capacity_exhausted')
+            finally:
+                store.close()
+
+    def test_agent_proxy_admission_includes_sidecar_memory_reserve(self):
+        from dataclasses import asdict
+        import hashlib
+        import json
+        from supervisor.config import validate_profile
+        from supervisor.service import RuntimeService, ServiceError
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = validate_profile({
+                'schema_version': 1, 'profile_version': 'proxy-admission', 'mode': 'lab',
+                'storage': {'backend': 'xfs_project_quota', 'mountpoint': '/mnt/proxy',
+                            'expected_uuid': '22222222-3333-4444-8555-666666666666'},
+                'agent_limits': {'ram_bytes': 1024, 'cpu_millicores': 100,
+                                 'pids_limit': 32, 'disk_bytes': 1024},
+            })
+            fingerprint = hashlib.sha256(json.dumps(asdict(profile), sort_keys=True,
+                separators=(',', ':'), ensure_ascii=True).encode('ascii')).hexdigest()
+            store = RuntimeStore(Path(tmp) / 'runtime.sqlite3', profile.profile_version, fingerprint)
+            class Metrics:
+                def snapshot(self):
+                    return {'sampled_at': 100, 'cpu_window_seconds': 60,
+                            'total_ram_bytes': 1024**4,
+                            'available_ram_bytes': RuntimeStore.SIDECAR_RAM_BYTES + 1024 - 1,
+                            'cpu_percent': 0, 'free_disk_bytes': 1024**4,
+                            'total_cpu_millicores': 1_000_000,
+                            'total_disk_bytes': 1024**4}
+            service = RuntimeService(
+                profile, store, None, None, Metrics(),
+                capacities=(1024**4, 1_000_000, 1024**4), disk_floor_bytes=0,
+                clock=lambda: 100, network_profile_default='agent_proxy_v1',
+                control_ui_domain='agents.example.test',
+                agent_network_pool='10.240.0.0/13',
+                frontend_network_pool='10.248.0.0/13')
+            try:
+                with self.assertRaises(ServiceError) as caught:
+                    service._admit(quota=True)
+                self.assertEqual(caught.exception.code, 'admission_denied')
+                service.network_profile_default = 'legacy_none'
+                service._admit(quota=True)
+            finally:
+                store.close()
+
     def test_new_create_stays_network_none_until_policy_is_ready(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = RuntimeStore(Path(tmp) / 'runtime.sqlite3', 'site-v1', 'b' * 64)
