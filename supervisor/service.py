@@ -249,6 +249,14 @@ class RuntimeService:
                     'absent', 'not_created', 'missing', 'created', 'running', 'stopped',
                     'exited', 'paused', 'restarting', 'dead', 'failed'}:
                 raise ValueError()
+            instance = self.store.instance(instance_id)
+            expected_profile = instance['network_profile'] if instance else None
+            actual_profile = info.get('network_profile')
+            if not self._absent(info):
+                if actual_profile not in {'legacy_none', 'agent_internal_v1'}:
+                    raise ValueError()
+                if expected_profile is not None and actual_profile != expected_profile:
+                    raise ValueError()
             return info
         except Exception:
             raise ServiceError('runtime_unavailable', 503) from None
@@ -484,7 +492,9 @@ class RuntimeService:
                     # spec/token; restore reuses the existing instance and its data.
                     self._admit(quota=evidence['disk_quota_verified'],
                                 requested_disk_bytes=0 if action == 'restore' else None)
-                    self.engine.create(instance_id, evidence['host_path'], limits, instance['gateway_token'])
+                    self.engine.create(instance_id, evidence['host_path'], limits,
+                                       instance['gateway_token'],
+                                       network_profile=instance['network_profile'])
                     info = self._inspect(instance_id)
                     if self._absent(info):
                         raise ServiceError('runtime_unavailable', 503)

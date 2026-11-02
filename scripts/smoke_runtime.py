@@ -59,10 +59,12 @@ class FakeEngine:
         self.containers, self.creates = {}, 0
     def inspect(self, instance_id):
         return dict(self.containers.get(instance_id, dict(state='absent', gateway='unknown', container_id=None)))
-    def create(self, instance_id, host_path, limits, token):
+    def create(self, instance_id, host_path, limits, token, *, network_profile='legacy_none'):
         if instance_id not in self.containers:
             self.creates += 1
-            self.containers[instance_id] = dict(state='created', gateway='unknown', container_id=instance_id * 2)
+            self.containers[instance_id] = dict(state='created', gateway='unknown',
+                                                container_id=instance_id * 2,
+                                                network_profile=network_profile)
         return self.containers[instance_id]['container_id']
     def start(self, instance_id):
         self.containers[instance_id].update(state='running', gateway='ready')

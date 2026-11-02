@@ -33,6 +33,7 @@ services:
       ANONYMIZED_TELEMETRY: "false"
       FORWARDED_ALLOW_IPS: "127.0.0.1"
       AGENT_PLATFORM_PUBLIC_ORIGIN: "${AGENT_PLATFORM_PUBLIC_ORIGIN:-http://localhost:3000}"
+      AGENT_CONTROL_UI_DOMAIN: "${AGENT_CONTROL_UI_DOMAIN:-}"
     volumes:
       - webui_data:/app/backend/data
     security_opt:

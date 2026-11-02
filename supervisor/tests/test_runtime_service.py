@@ -78,12 +78,17 @@ class ServiceWorkflowSmoke(unittest.TestCase):
         class Engine:
             calls = []
             host_paths = []
+            network_profiles = []
             state = 'absent'
             def inspect(self, instance_id):
-                return dict(state=self.state, gateway='unknown', container_id='c' if self.state != 'absent' else None)
-            def create(self, instance_id, host_path, limits, token):
+                return dict(state=self.state, gateway='unknown',
+                            container_id='c' if self.state != 'absent' else None,
+                            **({'network_profile': self.network_profiles[-1] if self.network_profiles else 'legacy_none'}
+                               if self.state != 'absent' else {}))
+            def create(self, instance_id, host_path, limits, token, *, network_profile='legacy_none'):
                 self.calls.append(('create', instance_id))
                 self.host_paths.append(host_path)
+                self.network_profiles.append(network_profile)
                 self.state = 'stopped'
                 return 'c'
             def start(self, instance_id):
@@ -110,6 +115,11 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             result = service.action(payload)
             self.assertEqual(result['runtime']['state'], 'running')
             self.assertEqual(result['runtime']['instance_id'], instance_id)
+            self.assertEqual(engine.network_profiles[-1], 'legacy_none')
+            engine.network_profiles[-1] = 'agent_internal_v1'
+            with self.assertRaises(ServiceError):
+                service.me({'actor_id': 'alice'})
+            engine.network_profiles[-1] = 'legacy_none'
             calls_before_replay = len(engine.calls)
             replayed = service.replay({'actor_id': 'alice', 'action': 'create',
                                        'idempotency_key': 'key', 'settings_revision': 0})
@@ -130,6 +140,8 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             self.assertEqual(store.totals(), (0, 0, profile.agent_limits.disk_bytes))
             self.assertEqual([item['instance_id'] for item in store.retained('alice')], [instance_id])
             self.assertEqual(store.retained('bob'), [])
+            store.db.execute('UPDATE instances SET network_profile=? WHERE id=?',
+                             ('legacy_none', instance_id))
             replay = service.action(payload)
             self.assertEqual(replay['runtime']['state'], 'removed')
             self.assertEqual(len(engine.calls), 2)
@@ -153,6 +165,7 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             restored = service.replay({key: value for key, value in restore_request.items() if key != 'settings'})
             self.assertEqual(restored['runtime']['state'], 'running')
             self.assertEqual(restored['runtime']['instance_id'], instance_id)
+            self.assertEqual(engine.network_profiles[-1], 'legacy_none')
             restore_operation = store.operation('alice', 'restore-1')
             assert restore_operation is not None
             self.assertNotIn('RESTORE_PRIVATE_INSTRUCTIONS', restore_operation['payload'])
@@ -289,13 +302,17 @@ class SupervisorRestartRecoveryTests(unittest.TestCase):
         class Engine:
             def __init__(self, host_state):
                 self.host_state = host_state
+                self.network_profiles = {}
                 self.calls = []
             def inspect(self, instance_id):
                 state = self.host_state.get(instance_id, 'absent')
                 return dict(state=state, gateway='unknown',
-                            container_id=('container-' + instance_id[:8]) if state != 'absent' else None)
-            def create(self, instance_id, _host_path, _limits, _token):
+                            container_id=('container-' + instance_id[:8]) if state != 'absent' else None,
+                            **({'network_profile': self.network_profiles.get(instance_id, 'legacy_none')}
+                               if state != 'absent' else {}))
+            def create(self, instance_id, _host_path, _limits, _token, *, network_profile='legacy_none'):
                 self.calls.append(('create', instance_id))
+                self.network_profiles[instance_id] = network_profile
                 self.host_state[instance_id] = 'stopped'
                 return 'container-' + instance_id[:8]
             def start(self, instance_id):

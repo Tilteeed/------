@@ -12,6 +12,7 @@ def create_env(path: str | Path) -> Path:
         f"WEBUI_SECRET_KEY={secrets.token_hex(32)}\n"
         "WEB_PORT=3000\n"
         "AGENT_PLATFORM_PUBLIC_ORIGIN=http://localhost:3000\n"
+        "AGENT_CONTROL_UI_DOMAIN=\n"
         "WEB_MEMORY_LIMIT=2g\n"
         "WEB_CPU_LIMIT=2.0\n"
     )

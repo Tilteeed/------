@@ -9,7 +9,7 @@
 ## 2. Где находится проект
 
 - Локальный корень: `C:/Users/SystemX/Downloads/Диплом/Практика/Вебчик`.
-- Текущая локальная ветка `main`, HEAD **`0940fc1784b2f52a25a69b2e2e4401e4a561df8c`** (`0940fc1`); commit содержит restore и workspace-browser функции, но они не приняты на ВМ. В рабочем дереве — review-исправление bounded JSON response для preview и тесты; локально прошли 110 Python tests, 4 UI tests, compileall и diff-check. Пользовательский VM-отчёт для `2afe2b5` относится к более раннему commit; сеть не опрашивалась.
+- Текущая локальная ветка `main`, базовый HEAD **`a4c86aaafabec9604398ced895001aefeef37a7c`**; restore/workspace-browser и review-исправление preview входят в этот baseline. Текущие network-profile изменения ещё не закоммичены и не приняты на ВМ.
 - Пользовательский отчёт заявляет проверку этого commit на ВМ. Сопоставить отчёт и локальный код; не переносить лабораторные параметры на другой стенд.
 - После получения отчёта актуализируются документы приёмки/roadmap. Проверить текущий `git status/diff`; не публиковать без отдельного разрешения.
 - Доставка согласована: локальный проект → GitHub после разрешения → clone/build на ВМ. На основном Windows-хосте Docker отсутствует; развёртывание туда не переносить.
@@ -96,10 +96,10 @@
 - После реального назначения и readback персональной квоты выполняется полный свежий admission. Общие Accounting/Enforcement ON или валидный JSON не равны персональной квоте.
 - RuntimeStore фиксирует полный профиль для своего журнала. Не удалять DB ради смены binding; автоматическая миграция профиля не реализована.
 - Retained disk остаётся в бюджете после удаления. RAM/CPU освобождаются после подтверждённого remove.
-- Контейнер: UID/GID 1000, readonly rootfs, cap_drop ALL, no-new-privileges, RAM/CPU/PIDs, bounded tmpfs, logging none, **network none**. Две bind-привязки state/secrets внутри одного XFS проекта.
+- Контейнер: UID/GID 1000, readonly rootfs, cap_drop ALL, no-new-privileges, RAM/CPU/PIDs, bounded tmpfs, logging none, no published ports, две bind-привязки state/secrets внутри одного XFS проекта. RuntimeStore и DockerEngine по умолчанию остаются на legacy spec v1 (`NetworkMode=none`). Spec v2 с отдельным `Internal=true` bridge реализован как явный кандидат, но не активирован обычным create: internal bridge сам по себе не блокирует host access и не заменяет host firewall.
 - Disk limit должен делиться на 1024; inode hard limit — технический `max(1024, disk_bytes//4096)`, не пользовательская настройка.
 - Одного cap_drop недостаточно для project inheritance: seccomp ограничивает filesystem ioctl/setattr и альтернативные пути. Точечный tini ioctl regression на ВМ пройден по пользовательскому отчёту; полный security audit не выполнен.
-- `initialize_files` использует принятый lab bootstrap: gateway local/lan, token auth, loopback controlUi.allowedOrigins. Subsequent draft saves пока не применяются к уже созданному агенту.
+- `initialize_files` пока использует принятый lab bootstrap: gateway local/lan, token auth, loopback controlUi.allowedOrigins. Subsequent draft saves пока не применяются к уже созданному агенту. Новый Control UI proxy/auth/bootstrap ещё не реализован.
 - Root-owned административный snapshot нужен вне user-writable checkout. Служба проверяет владельца/предков; напрямую подставлять старый user-owned deployment.local.json в runtime config нельзя.
 
 ## 7. Что действительно проверено, а что нет
@@ -134,7 +134,7 @@
 
 - Пользователь подтвердил, что серия функциональных проверок Stage 3 завершена; их не повторять как следующий шаг. Результаты зафиксированы в приложенном отчёте только для его commit; более поздние детали не приложены.
 - Конкурентное первоначальное создание, EDQUOT, реальные отказы и supervisor recovery перечислялись как открытые в более раннем отчёте; пользователь затем сообщил, что текущая серия функциональных проверок уже выполнена. Не начинать повторный прогон без конкретного запроса.
-- Restore и workspace-only browser (list/preview/download) реализованы локально и прошли целевые локальные проверки; они не приняты на VM/browser E2E. Stage 5: пользователь выбрал проектировать поддержку и локального, и внешнего model provider, но конкретный backend/model ID отложил. Также выбрано оставить `NetworkMode=none` до отдельного решения. Пока сеть закрыта, не заявлять работающий inference/chat и не включать chat capability. Следующий безопасный development slice — provider-neutral config и owner-scoped server-side chat contract, без outbound path и без передачи Gateway/provider secrets браузеру.
+- Restore/workspace-only browser (list/preview/download) реализованы локально и не приняты на VM/browser E2E. По ТЗ `BEZR_TZ_ControlUI_LLM_2026-11-02.md` цель — встроенный OpenClaw Control UI и поддержка локального и внешнего model provider. Versioned network slice добавляет opt-in Docker spec v2 (`agent_internal_v1`), но normal create остаётся `legacy_none` до host-firewall/proxy/model policy. Old SQLite не изменяется при старте и требует отдельной backup-first миграции `scripts/migrate_runtime_network_profile.py`; миграция на ВМ не запускалась. Добавлены owner-scoped status/launch/revoke API, hashed one-use launch tickets и hashed host-bound session cookies, плюс `/_bezr/enter` POST handoff. Stop/remove и любые lifecycle-результаты вне `running + gateway ready` аннулируют активные сессии и неиспользованные launch tickets владельца. Это не reverse proxy: Gateway HTTP/WS routing, Control UI-кнопка, trusted-proxy Gateway config и ручное pairing ещё отсутствуют. Никаких credentials/VM/Docker state не использовано.
 - Файловый browser/restore не подвергались целевой ВМ-приёмке; локальные synthetic tests не выдавать за Docker/XFS evidence.
 - Реальный browser end-to-end для operation-key generation/recovery; локальные JS syntax/UI-state checks не заменяют его.
 - Gateway/browser integration, application of changed draft, LLM/chat, Telegram.
@@ -156,8 +156,9 @@
 
 1. Пользователь подтвердил sequence rollout: old container удалён retain, DB показала inactive/removed до остановки старого supervisor и запуска нового. Это не означает поддержку active old-seccomp adoption; сохранять эту границу.
 2. Локально реализованы restore retained instance и ограниченный workspace file browser (list/preview/download). Целевые тесты используют временную ФС и fake engine; они не доказывают real XFS/Docker/Linux dirfd/browser integration.
-3. Stage 5 decisions: design for both local and external providers; choose the deployment backend/model later. Keep `NetworkMode=none` until a separate network-route decision. Implement the provider-neutral configuration and owner-scoped server-side chat contract without enabling egress; do not represent this as working chat. Installing a model, configuring credentials, opening egress, publishing or VM changes still require their separate approvals.
-4. Once a concrete endpoint and route are selected, implement and test real chat, then prepare one browser/VM acceptance of the new features; do not repeat completed Stage 3 checks.
+3. Follow the user-provided Control UI/LLM specification. Per-instance internal bridge is only an opt-in candidate; normal create remains `NetworkMode=none`. Launch ticket/session handoff exists, but no Gateway HTTP/WS proxy is connected. Do not claim usable Control UI, model, or chat.
+4. Implement owner-scoped HTTP/WS proxying, trusted-proxy Gateway config and explicit manual device-pairing; then provider-neutral model configuration/model relay. Concrete backend/model/credentials remain for the user's selection. Installing a model, enabling inference/egress, publishing or changing a VM requires separate approval.
+5. After those slices are implemented, prepare one approved browser/VM acceptance of the new features; do not repeat completed Stage 3 checks.
 
 Это рекомендуемый порядок, не разрешение на кодовую миграцию, публикацию, SSH, privileged setup, квоты, системные изменения или удаление данных. Работать в локальной копии, сохраняя пользовательские изменения.
 

@@ -1,11 +1,11 @@
 """Small, fail-closed Linux Docker Engine v1.45 client (stdlib only).
 
 No subprocesses, Docker SDK, image pulls, filesystem writes or published ports.
-The caller owns storage/quota verification and writes config/secrets before create.
-Stage 3 uses NetworkMode=none: local healthchecks work, but models, chat and proxy
-access are unavailable until a separately reviewed Stage 5 networking policy.
-Labels are an ownership/configuration receipt, not protection from a hostile daemon
-administrator. Never expose this object or the Docker socket to agent workloads.
+Legacy spec v1 remains the default and keeps NetworkMode=none. Spec v2 is an
+explicit candidate using one Internal bridge per instance; do not activate it
+until host-firewall rules and the trusted proxy/model path are implemented.
+Neither the internal bridge nor these tests prove host isolation. The Docker
+socket is never exposed to agent workloads.
 """
 from dataclasses import asdict
 import hashlib
@@ -67,6 +67,10 @@ class DockerEngine:
     INSTANCE_LABEL = 'io.personal-agent.supervisor.instance'
     CONFIG_LABEL = 'io.personal-agent.supervisor.config-sha256'
     SPEC_LABEL = 'io.personal-agent.supervisor.spec'
+    NETWORK_SCHEMA_LABEL = 'io.personal-agent.supervisor.network-spec'
+    NETWORK_SCHEMA = 'internal-bridge-v1'
+    NETWORK_PROFILE_LEGACY = 'legacy_none'
+    NETWORK_PROFILE_PRIVATE = 'agent_internal_v1'
 
     _INSTANCE = re.compile(r'[0-9a-f]{32}\Z')
     _OBJECT = re.compile(r'[0-9a-f]{64}\Z')
@@ -163,8 +167,90 @@ class DockerEngine:
             if stream is not None:
                 stream.close()
 
-    def _labels(self, instance_id):
-        return {self.MANAGED_LABEL: 'true', self.INSTANCE_LABEL: instance_id}
+    @classmethod
+    def _labels(cls, instance_id):
+        return {cls.MANAGED_LABEL: 'true', cls.INSTANCE_LABEL: instance_id}
+
+    @classmethod
+    def _network_name(cls, instance_id):
+        return 'pa-net-' + cls._instance(instance_id)
+
+    @classmethod
+    def _network_labels(cls, instance_id):
+        return {**cls._labels(instance_id), cls.NETWORK_SCHEMA_LABEL: cls.NETWORK_SCHEMA}
+
+    @classmethod
+    def _network_payload(cls, instance_id):
+        instance_id = cls._instance(instance_id)
+        return {
+            'Name': cls._network_name(instance_id),
+            'Driver': 'bridge',
+            'Internal': True,
+            'Attachable': False,
+            'EnableIPv6': False,
+            'Labels': cls._network_labels(instance_id),
+        }
+
+    def _network_rows(self, instance_id):
+        filters = {'name': [self._network_name(instance_id)]}
+        rows = self._request('GET', '/networks?' + urlencode({'filters': self._json(filters)}))
+        if type(rows) is not list or len(rows) > 1:
+            raise DockerEngineError('Managed network identity is ambiguous')
+        return rows
+
+    def _verify_network(self, instance_id, network_id, *, expected_container_id=None):
+        instance_id = self._instance(instance_id)
+        network_id = self._object(network_id)
+        network = self._request('GET', '/networks/' + network_id)
+        if (type(network) is not dict
+                or network.get('Id') != network_id
+                or network.get('Name') != self._network_name(instance_id)
+                or network.get('Driver') != 'bridge'
+                or network.get('Internal') is not True
+                or network.get('Attachable') is not False
+                or network.get('EnableIPv6') is not False
+                or network.get('Ingress') is not False
+                or network.get('Labels') != self._network_payload(instance_id)['Labels']):
+            raise DockerEngineError('Managed network configuration verification failed')
+        containers = network.get('Containers') or {}
+        if type(containers) is not dict:
+            raise DockerEngineError('Managed network membership verification failed')
+        expected = set() if expected_container_id is None else {self._object(expected_container_id)}
+        if set(containers) != expected:
+            raise DockerEngineError('Managed network membership verification failed')
+        return network
+
+    def ensure_instance_network(self, instance_id):
+        """Create or verify the isolated internal network assigned to one instance."""
+        instance_id = self._instance(instance_id)
+        rows = self._network_rows(instance_id)
+        if rows:
+            row = rows[0]
+            if type(row) is not dict:
+                raise DockerEngineError('Invalid managed network observation')
+            network_id = self._object(row.get('Id'))
+        else:
+            created = self._request('POST', '/networks/create', self._network_payload(instance_id), ok=(201,))
+            if type(created) is not dict:
+                raise DockerEngineError('Invalid managed network creation response')
+            network_id = self._object(created.get('Id'))
+        self._verify_network(instance_id, network_id)
+        return self._network_name(instance_id)
+
+    def remove_instance_network(self, instance_id):
+        """Delete only the exact empty managed network for a removed instance."""
+        instance_id = self._instance(instance_id)
+        rows = self._network_rows(instance_id)
+        if not rows:
+            return
+        row = rows[0]
+        if type(row) is not dict:
+            raise DockerEngineError('Invalid managed network observation')
+        network_id = self._object(row.get('Id'))
+        self._verify_network(instance_id, network_id)
+        self._request('DELETE', '/networks/' + network_id, ok=(204,))
+        if self._network_rows(instance_id):
+            raise DockerEngineError('Managed network removal could not be verified')
 
     def _find(self, instance_id):
         filters = {'label': [f'{k}={v}' for k, v in self._labels(instance_id).items()]}
@@ -232,8 +318,10 @@ class DockerEngine:
             raise ValueError('CPU limit exceeds Docker NanoCpus range')
         return asdict(limits)
 
-    def _spec(self, host_path, limits):
-        return {'version': 1, 'image': self.image, 'host_path': self._host_path(host_path),
+    def _spec(self, host_path, limits, *, version=2):
+        if type(version) is not int or version not in (1, 2):
+            raise ValueError('Unsupported managed container spec version')
+        return {'version': version, 'image': self.image, 'host_path': self._host_path(host_path),
                 'limits': self._limits(limits)}
 
     def _payload(self, instance_id, spec, token, image_info):
@@ -256,6 +344,7 @@ class DockerEngine:
             {'Type': 'bind', 'Source': path + '/secrets', 'Target': '/home/node/.config/openclaw',
              'ReadOnly': False, 'BindOptions': {'Propagation': 'rprivate', 'CreateMountpoint': False}},
         ]
+        network_mode = 'none' if spec['version'] == 1 else self._network_name(instance_id)
         return {
             'Image': self.image, 'User': '1000:1000', 'Cmd': list(self._CMD),
             'Env': [k + '=' + v for k, v in sorted(environment.items())],
@@ -273,7 +362,7 @@ class DockerEngine:
                 'PidsLimit': limits['pids_limit'], 'Init': True,
                 'Tmpfs': {'/tmp': 'rw,nosuid,nodev,noexec,size=64m'},
                 'LogConfig': {'Type': 'none', 'Config': {}},
-                'NetworkMode': 'none', 'PortBindings': {}, 'PublishAllPorts': False,
+                'NetworkMode': network_mode, 'PortBindings': {}, 'PublishAllPorts': False,
                 'CgroupnsMode': 'private', 'IpcMode': 'private', 'Runtime': 'runc',
                 'RestartPolicy': {'Name': 'no', 'MaximumRetryCount': 0},
             },
@@ -316,9 +405,10 @@ class DockerEngine:
             if any(labels.get(k) != v for k, v in self._labels(instance_id).items()):
                 raise ValueError
             spec = json.loads(labels[self.SPEC_LABEL])
-            if set(spec) != {'version', 'image', 'host_path', 'limits'} or spec['version'] != 1:
+            if (set(spec) != {'version', 'image', 'host_path', 'limits'}
+                    or type(spec['version']) is not int or spec['version'] not in (1, 2)):
                 raise ValueError
-            if spec != self._spec(spec['host_path'], AgentLimits(**spec['limits'])):
+            if spec != self._spec(spec['host_path'], AgentLimits(**spec['limits']), version=spec['version']):
                 raise ValueError
             if spec['image'] != self.image or (expected_spec is not None and spec != expected_spec):
                 raise ValueError
@@ -367,20 +457,35 @@ class DockerEngine:
                 raise ValueError
             settings = observed.get('NetworkSettings') or {}
             networks = settings.get('Networks') or {}
-            if set(networks) - {'none'} or any((settings.get('Ports') or {}).values()):
+            if type(networks) is not dict or any((settings.get('Ports') or {}).values()):
                 raise ValueError
+            if spec['version'] == 1:
+                if set(networks) - {'none'}:
+                    raise ValueError
+            else:
+                network_name = self._network_name(instance_id)
+                if set(networks) != {network_name}:
+                    raise ValueError
+                attached = networks[network_name]
+                if type(attached) is not dict:
+                    raise ValueError
+                self._verify_network(instance_id, attached.get('NetworkID'),
+                                     expected_container_id=container_id)
             return container_id
         except (ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError):
             raise DockerEngineError('Managed container configuration verification failed') from None
 
-    def create(self, instance_id, host_path, limits, token):
-        """Idempotently create (not start); return the actual 64-hex container ID.
+    def create(self, instance_id, host_path, limits, token, *, network_profile=NETWORK_PROFILE_LEGACY):
+        """Idempotently create (not start); default to the legacy no-network profile.
 
-        Bind paths must already exist; Engine Mounts deliberately never mkdir them.
-        disk_bytes is part of the receipt; XFS enforcement belongs to the caller.
+        The internal bridge is explicit and must only be selected after its
+        host-firewall and trusted-proxy/model policy is active.
         """
         self._instance(instance_id)
-        spec = self._spec(host_path, limits)
+        versions = {self.NETWORK_PROFILE_LEGACY: 1, self.NETWORK_PROFILE_PRIVATE: 2}
+        if type(network_profile) is not str or network_profile not in versions:
+            raise ValueError('Unsupported managed network profile')
+        spec = self._spec(host_path, limits, version=versions[network_profile])
         # Validate token before any Engine operation, including network creation.
         if (not isinstance(token, str) or not 1 <= len(token) <= 4096
                 or any(ord(c) < 33 or ord(c) > 126 for c in token)):
@@ -389,6 +494,8 @@ class DockerEngine:
         if existing is not None:
             return self._verify(instance_id, existing, spec, token)
         image_info = self._image_info()  # Missing local image fails; never pull.
+        if spec['version'] == 2:
+            self.ensure_instance_network(instance_id)
         payload = self._payload(instance_id, spec, token, image_info)
         digest = self._hash(self._projection(payload, payload['HostConfig'],
                                              self._expected_mounts(payload), image_info['Id']))
@@ -433,7 +540,11 @@ class DockerEngine:
         gateway = 'unknown'
         if health in ('healthy', 'unhealthy', 'starting'):
             gateway = 'ready' if state == 'running' and health == 'healthy' else 'not_ready'
-        return {'state': state, 'gateway': gateway, 'container_id': container_id}
+        spec_version = json.loads(observed['Config']['Labels'][self.SPEC_LABEL])['version']
+        network_profile = {1: self.NETWORK_PROFILE_LEGACY,
+                           2: self.NETWORK_PROFILE_PRIVATE}[spec_version]
+        return {'state': state, 'gateway': gateway, 'container_id': container_id,
+                'network_profile': network_profile}
 
     def _action(self, instance_id, action):
         self._instance(instance_id)
@@ -464,7 +575,7 @@ class DockerEngine:
         return self._action(instance_id, 'restart')
 
     def remove(self, instance_id):
-        """Remove only the verified container; never remove bind data or networks."""
+        """Remove the verified container and its exact empty network, never bind data."""
         self._instance(instance_id)
         observed = self._find(instance_id)
         if observed is not None:
@@ -472,4 +583,5 @@ class DockerEngine:
             self._request('DELETE', f'/containers/{container_id}?force=true&v=false', ok=(204,))
             if self._find(instance_id) is not None:
                 raise DockerEngineError('Managed container removal could not be verified')
+        self.remove_instance_network(instance_id)
         return {'state': 'absent', 'gateway': 'unknown', 'container_id': None}

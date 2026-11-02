@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from control_plane import api
 from control_plane.policy import validate_agent_input
 from control_plane.runtime import RuntimeRejected, SupervisorClient
-from control_plane.store import DraftStore
+from control_plane.store import DraftStore, InvalidControlUiTicket
 
 
 async def verified_test_user(request: Request):
@@ -111,6 +111,182 @@ class PlatformApiTests(unittest.TestCase):
         result = self.client.put(path, headers={**self.alice, "Content-Type": "application/json"}, content=duplicate)
         self.assertEqual(result.status_code, 400)
         self.assertIsNone(self.store.get("alice"))
+
+    def test_control_ui_launch_is_owner_bound_ready_and_one_time(self):
+        instance_id = "a" * 32
+        origin = f"https://{instance_id}.agents.example.test"
+
+        class Runtime:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, owner_id):
+                self.calls.append(owner_id)
+                if owner_id == "alice":
+                    return {"runtime": {"state": "running", "gateway": "ready",
+                                        "instance_id": instance_id}}
+                return {"runtime": {"state": "not_created", "gateway": "not_connected",
+                                    "instance_id": None}}
+
+        runtime = Runtime()
+        app = FastAPI()
+        app.include_router(api.create_router(
+            verified_test_user, self.store, runtime=runtime,
+            public_origin="https://bezr.example.test",
+            control_ui_domain="agents.example.test"))
+        client = TestClient(app)
+        self.addCleanup(client.close)
+        status = client.get(self.base + "/control-ui/status", headers=self.alice)
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(status.json(), {"available": True, "origin": origin})
+        self.assertEqual(status.headers["cache-control"], "no-store")
+
+        not_ready = client.get(self.base + "/control-ui/status", headers=self.bob)
+        self.assertEqual(not_ready.status_code, 200, not_ready.text)
+        self.assertEqual(not_ready.json(), {"available": False, "origin": None})
+        denied = client.post(self.base + "/control-ui/launch", headers=self.bob, json={})
+        self.assertEqual(denied.status_code, 503)
+        self.assertEqual(denied.json()["detail"]["code"], "gateway_not_ready")
+        cross_origin = client.post(self.base + "/control-ui/launch",
+                                   headers={**self.alice, "Origin": "https://attacker.invalid"}, json={})
+        self.assertEqual(cross_origin.status_code, 403)
+
+        launched = client.post(self.base + "/control-ui/launch", headers=self.alice, json={})
+        self.assertEqual(launched.status_code, 200, launched.text)
+        self.assertEqual(launched.headers["cache-control"], "no-store")
+        self.assertEqual(launched.headers["referrer-policy"], "no-referrer")
+        result = launched.json()
+        self.assertEqual(result["origin"], origin)
+        self.assertEqual(result["expires_in"], 60)
+        self.assertRegex(result["launch_ticket"], r"^[A-Za-z0-9_-]{40,64}$")
+        self.assertNotIn("token", launched.text.lower())
+        redeemed = self.store.consume_control_ui_ticket(result["launch_ticket"], audience=origin)
+        self.assertEqual(redeemed, {"owner_id": "alice", "instance_id": instance_id,
+                                    "audience": origin})
+        with self.assertRaises(InvalidControlUiTicket):
+            self.store.consume_control_ui_ticket(result["launch_ticket"], audience=origin)
+        self.assertEqual(runtime.calls, ["alice", "bob", "bob", "alice"])
+
+    def test_control_ui_launch_rejects_client_targets_and_unconfigured_domain(self):
+        class Runtime:
+            def __init__(self):
+                self.calls = []
+            def get(self, owner_id):
+                self.calls.append(owner_id)
+                return {"runtime": {"state": "running", "gateway": "ready",
+                                    "instance_id": "a" * 32}}
+
+        runtime = Runtime()
+        app = FastAPI()
+        app.include_router(api.create_router(verified_test_user, self.store, runtime=runtime))
+        client = TestClient(app)
+        self.addCleanup(client.close)
+        status = client.get(self.base + "/control-ui/status", headers=self.alice)
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json(), {"available": False, "origin": None})
+        no_domain = client.post(self.base + "/control-ui/launch", headers=self.alice, json={})
+        self.assertEqual(no_domain.status_code, 503)
+        self.assertEqual(no_domain.json()["detail"]["code"], "control_ui_not_configured")
+        for payload in ({"instance_id": "b" * 32}, {"origin": "https://attacker.invalid"},
+                        {"user_id": "bob"}):
+            with self.subTest(payload=payload):
+                result = client.post(self.base + "/control-ui/launch", headers=self.alice, json=payload)
+                self.assertEqual(result.status_code, 400)
+        self.assertEqual(runtime.calls, [])
+
+        insecure_app = FastAPI()
+        insecure_app.include_router(api.create_router(
+            verified_test_user, self.store, runtime=runtime,
+            public_origin="http://localhost:3000",
+            control_ui_domain="agents.example.test"))
+        insecure_client = TestClient(insecure_app)
+        self.addCleanup(insecure_client.close)
+        insecure_status = insecure_client.get(self.base + "/control-ui/status", headers=self.alice)
+        self.assertEqual(insecure_status.json(), {"available": False, "origin": None})
+        insecure_launch = insecure_client.post(self.base + "/control-ui/launch", headers=self.alice, json={})
+        self.assertEqual(insecure_launch.status_code, 503)
+        self.assertEqual(insecure_launch.json()["detail"]["code"], "control_ui_not_configured")
+        self.assertEqual(runtime.calls, [])
+
+    def test_lifecycle_stop_revokes_current_owner_control_ui_access(self):
+        self.store.save('alice', validate_agent_input({'name': 'Agent'}), expected_revision=0)
+        audience = 'https://' + 'f' * 32 + '.agents.example.test'
+        ticket = self.store.issue_control_ui_ticket('alice', 'f' * 32, audience)['ticket']
+        session_id = self.store.redeem_control_ui_ticket(ticket, audience=audience)['session_id']
+
+        class Runtime:
+            def replay(self, _actor, _payload):
+                raise RuntimeRejected(404, 'operation_not_found', 'not found')
+            def action(self, _actor, _payload, _draft):
+                return {'runtime': {'state': 'stopped', 'gateway': 'not_ready',
+                                    'instance_id': 'f' * 32}, 'capabilities': {}, 'retained': []}
+
+        app = FastAPI()
+        app.include_router(api.create_router(verified_test_user, self.store, runtime=Runtime()))
+        client = TestClient(app)
+        self.addCleanup(client.close)
+        result = client.post(self.base + '/actions', headers=self.alice, json={
+            'action': 'stop', 'idempotency_key': 'stop-key', 'settings_revision': 1,
+        })
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertIsNone(self.store.validate_control_ui_session(session_id, audience=audience))
+        with self.assertRaises(InvalidControlUiTicket):
+            self.store.redeem_control_ui_ticket(ticket, audience=audience)
+
+    def test_control_ui_sessions_are_revoked_on_lifecycle_replay(self):
+        self.store.save('alice', validate_agent_input({'name': 'Agent'}), expected_revision=0)
+        audience = 'https://' + '9' * 32 + '.agents.example.test'
+        ticket = self.store.issue_control_ui_ticket('alice', '9' * 32, audience)['ticket']
+        session_id = self.store.redeem_control_ui_ticket(ticket, audience=audience)['session_id']
+
+        class Runtime:
+            def replay(self, _actor, _payload):
+                return {'runtime': {'state': 'stopped', 'gateway': 'not_ready',
+                                    'instance_id': '9' * 32}, 'capabilities': {}, 'retained': []}
+            def action(self, *_args):
+                raise AssertionError('A completed stop must replay, not execute again')
+
+        app = FastAPI()
+        app.include_router(api.create_router(verified_test_user, self.store, runtime=Runtime()))
+        client = TestClient(app)
+        self.addCleanup(client.close)
+        result = client.post(self.base + '/actions', headers=self.alice, json={
+            'action': 'stop', 'idempotency_key': 'replay-stop-key', 'settings_revision': 1,
+        })
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertIsNone(self.store.validate_control_ui_session(session_id, audience=audience))
+
+    def test_control_ui_revoke_ends_only_the_current_owners_sessions(self):
+        alice_origin = "https://" + "a" * 32 + ".agents.example.test"
+        bob_origin = "https://" + "b" * 32 + ".agents.example.test"
+        alice_ticket = self.store.issue_control_ui_ticket("alice", "a" * 32, alice_origin)["ticket"]
+        bob_ticket = self.store.issue_control_ui_ticket("bob", "b" * 32, bob_origin)["ticket"]
+        alice_session = self.store.redeem_control_ui_ticket(
+            alice_ticket, audience=alice_origin)["session_id"]
+        bob_session = self.store.redeem_control_ui_ticket(
+            bob_ticket, audience=bob_origin)["session_id"]
+        app = FastAPI()
+        app.include_router(api.create_router(verified_test_user, self.store))
+        client = TestClient(app)
+        self.addCleanup(client.close)
+        revoked = client.post(self.base + "/control-ui/revoke", headers=self.alice, json={})
+        self.assertEqual(revoked.status_code, 200, revoked.text)
+        self.assertEqual(revoked.json(), {"revoked": 1})
+        self.assertEqual(revoked.headers["cache-control"], "no-store")
+        self.assertIsNone(self.store.validate_control_ui_session(
+            alice_session, audience=alice_origin))
+        self.assertIsNotNone(self.store.validate_control_ui_session(
+            bob_session, audience=bob_origin))
+        cross_origin = client.post(self.base + "/control-ui/revoke",
+                                   headers={**self.alice, "Origin": "https://attacker.invalid"}, json={})
+        self.assertEqual(cross_origin.status_code, 403)
+
+    def test_control_ui_domain_is_trusted_host_only_configuration(self):
+        for value in ('https://agents.example.test', 'agents.example.test/path',
+                      'agents..example.test', 'agents.example.test:443', '.agents.example.test'):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    api.create_router(verified_test_user, self.store, control_ui_domain=value)
 
     def test_events_are_private_and_settings_do_not_mark_runtime_ready(self):
         payload = {"settings": {"name": "Agent", "instructions": "private text"}, "revision": 0}

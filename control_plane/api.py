@@ -5,10 +5,10 @@ import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from starlette.concurrency import run_in_threadpool
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from .policy import require_owner, validate_agent_input
-from .store import RevisionConflict
+from .store import RevisionConflict, LaunchRateLimited
 from .runtime import RuntimeRejected, RuntimeUnavailable
 
 
@@ -32,8 +32,27 @@ def _workspace_path(value, *, allow_empty=False):
     return value
 
 
-def create_router(verified_user, store, *, public_origin: str | None = None, runtime=None):
-    """Use the upstream verified-user dependency; never accept user-id headers."""
+def _https_origin(value):
+    if type(value) is not str or len(value) > 300:
+        return False
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+    except ValueError:
+        return False
+    return bool(parsed.scheme == 'https' and hostname and parsed.netloc == hostname
+                and not parsed.path and not parsed.query and not parsed.fragment)
+
+
+def create_router(verified_user, store, *, public_origin: str | None = None, runtime=None,
+                  control_ui_domain: str | None = None):
+    """Use upstream verified identity; only trusted deployment config sets UI domain."""
+    if control_ui_domain is not None:
+        label = r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
+        if (type(control_ui_domain) is not str or len(control_ui_domain) > 253
+                or re.fullmatch(label + r'(?:\.' + label + r')*', control_ui_domain) is None):
+            raise ValueError('Invalid Control UI domain configuration')
+    control_ui_enabled = control_ui_domain is not None and _https_origin(public_origin)
     router = APIRouter(prefix="/api/v1/agent-platform", tags=["agent-platform"])
 
     def unique_object(pairs):
@@ -123,6 +142,78 @@ def create_router(verified_user, store, *, public_origin: str | None = None, run
         if runtime is None:
             raise HTTPException(503, {"code": "runtime_not_connected", "message": "Supervisor недоступен."})
         return runtime
+
+    def control_ui_instance(owner_id):
+        if runtime is None:
+            return None, 'runtime_not_connected'
+        try:
+            result = runtime.get(owner_id)
+        except (RuntimeUnavailable, RuntimeRejected):
+            return None, 'supervisor_unavailable'
+        info = result.get('runtime') if type(result) is dict else None
+        if type(info) is not dict:
+            return None, 'supervisor_unavailable'
+        instance_id = info.get('instance_id')
+        if (info.get('state') != 'running' or info.get('gateway') != 'ready'
+                or type(instance_id) is not str or re.fullmatch(r'[0-9a-f]{32}', instance_id) is None):
+            return None, 'gateway_not_ready'
+        return instance_id, None
+
+    async def revoke_control_ui_if_not_ready(owner_id, result):
+        info = result.get('runtime') if type(result) is dict else None
+        if (type(info) is not dict or info.get('state') != 'running'
+                or info.get('gateway') != 'ready'):
+            await run_in_threadpool(store.revoke_control_ui_sessions, owner_id)
+
+    @router.get("/me/control-ui/status")
+    def control_ui_status(response: Response, user=Depends(actor)):
+        response.headers['Cache-Control'] = 'no-store'
+        if not control_ui_enabled:
+            return {'available': False, 'origin': None}
+        instance_id, _reason = control_ui_instance(user.id)
+        if instance_id is None:
+            return {'available': False, 'origin': None}
+        return {'available': True, 'origin': f'https://{instance_id}.{control_ui_domain}'}
+
+    @router.post("/me/control-ui/launch")
+    async def launch_control_ui(request: Request, response: Response, user=Depends(actor)):
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['Referrer-Policy'] = 'no-referrer'
+        payload = await mutation_body(request)
+        if type(payload) is not dict or payload:
+            raise HTTPException(400, 'An empty JSON object is required')
+        if not control_ui_enabled:
+            raise HTTPException(503, {'code': 'control_ui_not_configured',
+                                      'message': 'Control UI domain is not configured.'})
+        instance_id, reason = await run_in_threadpool(control_ui_instance, user.id)
+        if instance_id is None:
+            code = reason or 'gateway_not_ready'
+            messages = {
+                'runtime_not_connected': 'Supervisor is not connected.',
+                'supervisor_unavailable': 'Supervisor is unavailable.',
+                'gateway_not_ready': 'Your Gateway is not ready yet.',
+            }
+            raise HTTPException(503, {'code': code, 'message': messages.get(code, 'Gateway unavailable.')})
+        origin = f'https://{instance_id}.{control_ui_domain}'
+        try:
+            launch = await run_in_threadpool(
+                store.issue_control_ui_ticket, user.id, instance_id, origin, ttl_seconds=60)
+        except LaunchRateLimited:
+            raise HTTPException(429, {'code': 'control_ui_launch_rate_limited',
+                                      'message': 'Too many launch attempts. Wait and retry.'}) from None
+        except (ValueError, TypeError):
+            raise HTTPException(503, {'code': 'control_ui_unavailable',
+                                      'message': 'Control UI launch could not be prepared.'}) from None
+        return {'origin': origin, 'launch_ticket': launch['ticket'], 'expires_in': 60}
+
+    @router.post("/me/control-ui/revoke")
+    async def revoke_control_ui(request: Request, response: Response, user=Depends(actor)):
+        response.headers['Cache-Control'] = 'no-store'
+        payload = await mutation_body(request)
+        if type(payload) is not dict or payload:
+            raise HTTPException(400, 'An empty JSON object is required')
+        revoked = await run_in_threadpool(store.revoke_control_ui_sessions, user.id)
+        return {'revoked': revoked}
 
     def retained_target(instance_id):
         if type(instance_id) is not str or re.fullmatch(r"[0-9a-f]{32}", instance_id) is None:
@@ -216,14 +307,18 @@ def create_router(verified_user, store, *, public_origin: str | None = None, run
                 raise HTTPException(400, "Supported action, idempotency_key and saved settings_revision required")
             try:
                 try:
-                    return await run_in_threadpool(runtime.replay, user.id, payload)
+                    result = await run_in_threadpool(runtime.replay, user.id, payload)
                 except RuntimeRejected as error:
                     if error.status != 404 or error.code != 'operation_not_found':
                         raise
+                else:
+                    await revoke_control_ui_if_not_ready(user.id, result)
+                    return result
                 draft = await run_in_threadpool(store.get, user.id)
                 if draft is None or draft["revision"] != payload["settings_revision"]:
                     raise HTTPException(409, {"code": "revision_conflict", "message": "Перечитайте сохранённые настройки перед операцией."})
                 result = await run_in_threadpool(runtime.action, user.id, payload, draft)
+                await revoke_control_ui_if_not_ready(user.id, result)
             except RuntimeUnavailable:
                 raise HTTPException(503, {"code": "supervisor_unavailable", "message": "Связь с supervisor недоступна. Результат операции неизвестен: обновите состояние перед повтором."}) from None
             except RuntimeRejected as error:

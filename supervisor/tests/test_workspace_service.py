@@ -47,8 +47,9 @@ class RetainedWorkspaceServiceTests(unittest.TestCase):
             def inspect(self, instance_id):
                 state = self.states.get(instance_id, "absent")
                 return dict(state=state, gateway="unknown",
-                            container_id="container-1" if state != "absent" else None)
-            def create(self, instance_id, *_args):
+                            container_id="container-1" if state != "absent" else None,
+                            **({"network_profile": "legacy_none"} if state != "absent" else {}))
+            def create(self, instance_id, *_args, **_kwargs):
                 self.states[instance_id] = "stopped"
                 return "container-1"
             def start(self, instance_id):

@@ -4,11 +4,13 @@ An intent reserves resources, NOT permission to create/start a container. Failed
 and pending creates keep their reservation. Removed instances retain disk forever.
 """
 import json
+import os
 import secrets
 import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
 
 
 class StoreError(Exception):
@@ -22,11 +24,22 @@ def canonical(value):
 
 
 class RuntimeStore:
+    NETWORK_PROFILE_LEGACY = 'legacy_none'
+    NETWORK_PROFILE_PRIVATE = 'agent_internal_v1'
+
     def __init__(self, path, profile_version, profile_hash):
         self.lock = threading.RLock()
+        database_existed = Path(path).exists()
         self.db = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         try:
+            if database_existed:
+                tables = {row['name'] for row in self.db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+                if tables:
+                    columns = {row['name'] for row in self.db.execute('PRAGMA table_info(instances)')}
+                    if 'instances' not in tables or 'network_profile' not in columns:
+                        raise StoreError('runtime_schema_migration_required')
             self.db.execute('PRAGMA journal_mode=WAL')
             self.db.execute('PRAGMA synchronous=FULL')
             self.db.execute('PRAGMA secure_delete=ON')
@@ -38,7 +51,8 @@ class RuntimeStore:
                     state TEXT NOT NULL, settings TEXT NOT NULL, revision INTEGER NOT NULL,
                     ram INTEGER NOT NULL, cpu INTEGER NOT NULL, disk INTEGER NOT NULL,
                     gateway_token TEXT NOT NULL, storage TEXT, container_id TEXT,
-                    initialized INTEGER NOT NULL DEFAULT 0);
+                    initialized INTEGER NOT NULL DEFAULT 0,
+                    network_profile TEXT NOT NULL DEFAULT 'legacy_none');
                 CREATE UNIQUE INDEX IF NOT EXISTS owner_active ON instances(actor) WHERE active=1;
                 CREATE TABLE IF NOT EXISTS operations (
                     id TEXT PRIMARY KEY, actor TEXT NOT NULL, key TEXT NOT NULL,
@@ -55,6 +69,83 @@ class RuntimeStore:
         except BaseException:
             self.db.close()
             raise
+
+    @staticmethod
+    def migrate_network_profile_schema(database_path, backup_path):
+        """Explicitly back up and migrate a legacy DB; never called by service startup."""
+        database_path, backup_path = Path(database_path), Path(backup_path)
+        if (database_path.is_symlink() or not database_path.is_file()
+                or backup_path.is_symlink() or backup_path.exists()
+                or not backup_path.parent.is_dir()
+                or database_path.resolve() == backup_path.resolve()):
+            raise StoreError('invalid_migration_path')
+
+        source = sqlite3.connect(str(database_path), isolation_level=None)
+        source.row_factory = sqlite3.Row
+        destination = None
+        backup_created = False
+        backup_valid = False
+        try:
+            tables = {row['name'] for row in source.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+            if not {'binding', 'instances', 'operations'} <= tables:
+                raise StoreError('runtime_schema_unsupported')
+            columns = {row['name'] for row in source.execute('PRAGMA table_info(instances)')}
+            if 'network_profile' in columns:
+                raise StoreError('runtime_schema_already_migrated')
+            required = {'id', 'actor', 'active', 'state', 'settings', 'revision', 'ram', 'cpu',
+                        'disk', 'gateway_token', 'storage', 'container_id', 'initialized'}
+            if not required <= columns:
+                raise StoreError('runtime_schema_unsupported')
+            data_version = source.execute('PRAGMA data_version').fetchone()[0]
+            counts = {name: source.execute(f'SELECT COUNT(*) FROM {name}').fetchone()[0]
+                      for name in ('binding', 'instances', 'operations')}
+
+            flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, 'O_BINARY', 0)
+            descriptor = os.open(str(backup_path), flags, 0o600)
+            os.close(descriptor)
+            backup_created = True
+            destination = sqlite3.connect(str(backup_path), isolation_level=None)
+            source.backup(destination)
+            if destination.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                raise StoreError('runtime_backup_unverified')
+            backup_counts = {name: destination.execute(f'SELECT COUNT(*) FROM {name}').fetchone()[0]
+                             for name in ('binding', 'instances', 'operations')}
+            if backup_counts != counts:
+                raise StoreError('runtime_backup_unverified')
+            destination.close()
+            destination = None
+            backup_valid = True
+
+            # Acquire the writer lock only after SQLite's backup API completes.
+            # If any other connection committed during the backup, abort without ALTER.
+            source.execute('BEGIN IMMEDIATE')
+            current_version = source.execute('PRAGMA data_version').fetchone()[0]
+            current_counts = {name: source.execute(f'SELECT COUNT(*) FROM {name}').fetchone()[0]
+                              for name in ('binding', 'instances', 'operations')}
+            if current_version != data_version or current_counts != counts:
+                raise StoreError('runtime_migration_concurrent_write')
+            source.execute(
+                "ALTER TABLE instances ADD COLUMN network_profile TEXT NOT NULL DEFAULT 'legacy_none'")
+            migrated_rows = source.execute('SELECT COUNT(*) FROM instances').fetchone()[0]
+            if (source.execute("SELECT COUNT(*) FROM instances WHERE network_profile!='legacy_none'").fetchone()[0]
+                    != 0 or source.execute('PRAGMA integrity_check').fetchone()[0] != 'ok'):
+                raise StoreError('runtime_migration_unverified')
+            source.execute('COMMIT')
+            return {'legacy_rows': migrated_rows, 'backup_path': str(backup_path)}
+        except BaseException:
+            if source.in_transaction:
+                source.execute('ROLLBACK')
+            if backup_created and not backup_valid:
+                try:
+                    backup_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if destination is not None:
+                destination.close()
+            source.close()
 
     @contextmanager
     def transaction(self):
@@ -274,9 +365,10 @@ class RuntimeStore:
                        in zip(self.totals(), limits, capacities)):
                     raise StoreError('capacity_exhausted')
                 instance_id = uuid.uuid4().hex
-                self.db.execute('INSERT INTO instances (id,actor,active,state,settings,revision,ram,cpu,disk,gateway_token,storage,container_id) VALUES (?,?,1,?,?,?,?,?,?,?,NULL,NULL)',
+                self.db.execute('INSERT INTO instances (id,actor,active,state,settings,revision,ram,cpu,disk,gateway_token,storage,container_id,network_profile) VALUES (?,?,1,?,?,?,?,?,?,?,NULL,NULL,?)',
                                 (instance_id, actor, 'preparing', canonical(payload['settings']),
-                                 payload['settings_revision'], *limits, secrets.token_urlsafe(32)))
+                                 payload['settings_revision'], *limits, secrets.token_urlsafe(32),
+                                 self.NETWORK_PROFILE_LEGACY))
             elif action not in {'purge', 'restore'}:
                 if instance is None:
                     raise StoreError('instance_not_found')
