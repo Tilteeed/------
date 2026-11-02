@@ -124,7 +124,8 @@ class PlatformApiTests(unittest.TestCase):
                 self.calls.append(owner_id)
                 if owner_id == "alice":
                     return {"runtime": {"state": "running", "gateway": "ready",
-                                        "instance_id": instance_id}}
+                                        "instance_id": instance_id,
+                                        "network_profile": "agent_internal_v1"}}
                 return {"runtime": {"state": "not_created", "gateway": "not_connected",
                                     "instance_id": None}}
 
@@ -133,7 +134,7 @@ class PlatformApiTests(unittest.TestCase):
         app.include_router(api.create_router(
             verified_test_user, self.store, runtime=runtime,
             public_origin="https://bezr.example.test",
-            control_ui_domain="agents.example.test"))
+            control_ui_domain="agents.example.test", control_ui_proxy_ready=True))
         client = TestClient(app)
         self.addCleanup(client.close)
         status = client.get(self.base + "/control-ui/status", headers=self.alice)
@@ -166,6 +167,47 @@ class PlatformApiTests(unittest.TestCase):
         with self.assertRaises(InvalidControlUiTicket):
             self.store.consume_control_ui_ticket(result["launch_ticket"], audience=origin)
         self.assertEqual(runtime.calls, ["alice", "bob", "bob", "alice"])
+
+    def test_control_ui_status_rejects_legacy_network_even_when_gateway_is_ready(self):
+        instance_id = 'c' * 32
+        class Runtime:
+            def get(self, _owner_id):
+                return {'runtime': {'state': 'running', 'gateway': 'ready',
+                                    'instance_id': instance_id, 'network_profile': 'legacy_none'}}
+
+        app = FastAPI()
+        app.include_router(api.create_router(
+            verified_test_user, self.store, runtime=Runtime(),
+            public_origin='https://bezr.example.test',
+            control_ui_domain='agents.example.test', control_ui_proxy_ready=True))
+        client = TestClient(app)
+        self.addCleanup(client.close)
+        status = client.get(self.base + '/control-ui/status', headers=self.alice)
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(status.json(), {'available': False, 'origin': None})
+        launch = client.post(self.base + '/control-ui/launch', headers=self.alice, json={})
+        self.assertEqual(launch.status_code, 503)
+
+    def test_control_ui_status_requires_live_proxy_route_even_on_private_network(self):
+        instance_id = 'd' * 32
+        class Runtime:
+            def get(self, _owner_id):
+                return {'runtime': {'state': 'running', 'gateway': 'ready',
+                                    'instance_id': instance_id,
+                                    'network_profile': 'agent_internal_v1'}}
+
+        app = FastAPI()
+        app.include_router(api.create_router(
+            verified_test_user, self.store, runtime=Runtime(),
+            public_origin='https://bezr.example.test',
+            control_ui_domain='agents.example.test'))
+        client = TestClient(app)
+        self.addCleanup(client.close)
+        status = client.get(self.base + '/control-ui/status', headers=self.alice)
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(status.json(), {'available': False, 'origin': None})
+        launch = client.post(self.base + '/control-ui/launch', headers=self.alice, json={})
+        self.assertEqual(launch.status_code, 503)
 
     def test_control_ui_launch_rejects_client_targets_and_unconfigured_domain(self):
         class Runtime:

@@ -22,7 +22,7 @@
 | --- | --- | --- |
 | Порт веба | `WEB_PORT` в локальной `.env`; описание в `.env.example` | Выбрать доступный порт; проверить фактическую публикацию Compose. |
 | Публичный origin кабинета | `AGENT_PLATFORM_PUBLIC_ORIGIN` в `.env` | Указать фактические схему, hostname и порт доступа, не копировать лабораторный localhost без проверки. Для Control UI launch нужен HTTPS origin. |
-| Суффикс отдельного Control UI origin | `AGENT_CONTROL_UI_DOMAIN` в `.env` | Пустой по умолчанию. Заполнять только после настройки wildcard DNS/TLS и owner-scoped Access Proxy, например `agents.example.test`; не является DNS/TLS или reverse-proxy настройкой само по себе. |
+| Суффикс отдельного Control UI origin | `AGENT_CONTROL_UI_DOMAIN` в `.env` | Пустой по умолчанию. Заполнять только после wildcard DNS/TLS и owner-scoped HTTP/WS proxy; API дополнительно требует per-instance `agent_internal_v1` и отключённый по умолчанию server-side proxy-ready gate. Переменная сама по себе не создаёт DNS/TLS/reverse proxy. |
 | Память/CPU веба | `WEB_MEMORY_LIMIT`, `WEB_CPU_LIMIT` в `.env` | Подобрать по ресурсам и замерам новой машины. |
 | Ключ веб-сессий | `WEBUI_SECRET_KEY` в `.env` | Для независимого нового стенда сгенерировать локально через `scripts/init_env.py`; не копировать лабораторный секрет. Генератор не перезаписывает существующую `.env`. |
 | Начальная установка веба | `docs/deployment.md`, `compose.yaml` | Инструкция относится к веб-части, не к готовому персональному provisioning. |

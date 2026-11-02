@@ -115,6 +115,7 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             result = service.action(payload)
             self.assertEqual(result['runtime']['state'], 'running')
             self.assertEqual(result['runtime']['instance_id'], instance_id)
+            self.assertEqual(result['runtime']['network_profile'], 'legacy_none')
             self.assertEqual(engine.network_profiles[-1], 'legacy_none')
             engine.network_profiles[-1] = 'agent_internal_v1'
             with self.assertRaises(ServiceError):

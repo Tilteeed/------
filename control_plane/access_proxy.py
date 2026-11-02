@@ -50,12 +50,14 @@ def _handoff_error(status, detail):
     })
 
 
-def create_handoff_router(store, *, public_origin, control_ui_domain):
-    """Create a clean-URL handoff route; disabled unless both origins are trusted HTTPS config."""
+def create_handoff_router(store, *, public_origin, control_ui_domain, proxy_ready=False):
+    """Create a handoff route; disabled unless origins are trusted HTTPS and proxy is mounted."""
+    if type(proxy_ready) is not bool:
+        raise ValueError('Control UI proxy readiness must be an explicit boolean')
     router = APIRouter(include_in_schema=False)
     app_origin = _configured_origin(public_origin, control_ui_domain) or ''
     domain = control_ui_domain if type(control_ui_domain) is str else ''
-    domain_enabled = (bool(app_origin and domain) and len(domain) <= 253
+    domain_enabled = (proxy_ready and bool(app_origin and domain) and len(domain) <= 253
                       and all(_LABEL_RE.fullmatch(label) for label in domain.split('.')))
 
     def request_binding(request):

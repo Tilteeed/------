@@ -45,14 +45,17 @@ def _https_origin(value):
 
 
 def create_router(verified_user, store, *, public_origin: str | None = None, runtime=None,
-                  control_ui_domain: str | None = None):
+                  control_ui_domain: str | None = None, control_ui_proxy_ready: bool = False):
     """Use upstream verified identity; only trusted deployment config sets UI domain."""
+    if type(control_ui_proxy_ready) is not bool:
+        raise ValueError('Control UI proxy readiness must be an explicit boolean')
     if control_ui_domain is not None:
         label = r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
         if (type(control_ui_domain) is not str or len(control_ui_domain) > 253
                 or re.fullmatch(label + r'(?:\.' + label + r')*', control_ui_domain) is None):
             raise ValueError('Invalid Control UI domain configuration')
-    control_ui_enabled = control_ui_domain is not None and _https_origin(public_origin)
+    control_ui_configured = control_ui_domain is not None and _https_origin(public_origin)
+    control_ui_enabled = control_ui_configured and control_ui_proxy_ready
     router = APIRouter(prefix="/api/v1/agent-platform", tags=["agent-platform"])
 
     def unique_object(pairs):
@@ -154,8 +157,12 @@ def create_router(verified_user, store, *, public_origin: str | None = None, run
         if type(info) is not dict:
             return None, 'supervisor_unavailable'
         instance_id = info.get('instance_id')
-        if (info.get('state') != 'running' or info.get('gateway') != 'ready'
-                or type(instance_id) is not str or re.fullmatch(r'[0-9a-f]{32}', instance_id) is None):
+        if info.get('state') != 'running' or info.get('gateway') != 'ready':
+            return None, 'gateway_not_ready'
+        if info.get('network_profile') != 'agent_internal_v1':
+            return None, 'network_policy_unavailable'
+        if (type(instance_id) is not str
+                or re.fullmatch(r'[0-9a-f]{32}', instance_id) is None):
             return None, 'gateway_not_ready'
         return instance_id, None
 
@@ -182,9 +189,12 @@ def create_router(verified_user, store, *, public_origin: str | None = None, run
         payload = await mutation_body(request)
         if type(payload) is not dict or payload:
             raise HTTPException(400, 'An empty JSON object is required')
-        if not control_ui_enabled:
+        if not control_ui_configured:
             raise HTTPException(503, {'code': 'control_ui_not_configured',
                                       'message': 'Control UI domain is not configured.'})
+        if not control_ui_proxy_ready:
+            raise HTTPException(503, {'code': 'control_ui_proxy_unavailable',
+                                      'message': 'Control UI proxy is not available.'})
         instance_id, reason = await run_in_threadpool(control_ui_instance, user.id)
         if instance_id is None:
             code = reason or 'gateway_not_ready'
@@ -192,6 +202,7 @@ def create_router(verified_user, store, *, public_origin: str | None = None, run
                 'runtime_not_connected': 'Supervisor is not connected.',
                 'supervisor_unavailable': 'Supervisor is unavailable.',
                 'gateway_not_ready': 'Your Gateway is not ready yet.',
+                'network_policy_unavailable': 'Your Gateway network is not eligible for proxied access.',
             }
             raise HTTPException(503, {'code': code, 'message': messages.get(code, 'Gateway unavailable.')})
         origin = f'https://{instance_id}.{control_ui_domain}'

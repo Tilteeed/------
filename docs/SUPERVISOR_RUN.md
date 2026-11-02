@@ -4,7 +4,7 @@
 
 Кабинет передаёт проверенную Open WebUI identity через приватный Unix socket. Только host-supervisor обращается к Docker и XFS. Веб и агенты не получают Docker socket. Пользовательский отчёт для `2afe2b5` подтверждает отдельный реальный purge/XFS сценарий на disposable dataset. Restore и workspace browser реализованы локально, но не прошли VM/browser приёмку.
 
-Текущий незакоммиченный локальный slice версионирует сеть: обычный create пока остаётся на legacy `NetworkMode=none`; spec с отдельным `Internal=true` bridge — opt-in candidate. Есть только owner-scoped launch-ticket/session handoff; HTTP/WS Gateway proxy и ручное pairing не подключены. Internal bridge сам по себе не блокирует host services, поэтому его нельзя активировать до host-firewall policy и trusted Access Proxy/model path. Модель и Web Egress также не подключены. Не считать это готовой LLM/чат-функцией и не переносить на ВМ без отдельного согласия.
+Текущий незакоммиченный локальный slice версионирует сеть: обычный create пока остаётся на legacy `NetworkMode=none`; spec с отдельным `Internal=true` bridge — opt-in candidate. Launch status теперь отказывает старому `legacy_none` и остаётся выключен в production до регистрации фактического прокси. Есть только owner-scoped ticket/session handoff; HTTP/WS Gateway proxy и ручное pairing не подключены. Internal bridge сам по себе не блокирует host services, поэтому его нельзя активировать до host-firewall policy и trusted Access Proxy/model path. Модель и Web Egress также не подключены. Не считать это готовой LLM/чат-функцией и не переносить на ВМ без отдельного согласия.
 
 ## Подготовка на Linux-ВМ
 

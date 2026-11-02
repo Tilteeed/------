@@ -17,12 +17,12 @@ class ControlUiHandoffTests(unittest.TestCase):
         self.instance_id = 'a' * 32
         self.audience = f'https://{self.instance_id}.agents.example.test'
 
-    def make_client(self, *, host=None):
+    def make_client(self, *, host=None, proxy_ready=True):
         from control_plane.access_proxy import create_handoff_router
         app = FastAPI()
         app.include_router(create_handoff_router(
             self.store, public_origin='https://bezr.example.test',
-            control_ui_domain='agents.example.test'))
+            control_ui_domain='agents.example.test', proxy_ready=proxy_ready))
         return TestClient(app, base_url=host or self.audience)
 
     def test_entry_get_does_not_offer_anonymous_gateway_access(self):
@@ -30,6 +30,18 @@ class ControlUiHandoffTests(unittest.TestCase):
         self.addCleanup(client.close)
         response = client.get('/_bezr/enter')
         self.assertEqual(response.status_code, 405)
+
+    def test_handoff_is_disabled_until_proxy_is_ready(self):
+        ticket = self.store.issue_control_ui_ticket(
+            'alice', self.instance_id, self.audience)['ticket']
+        client = self.make_client(proxy_ready=False)
+        self.addCleanup(client.close)
+        response = client.post('/_bezr/enter', headers={'Origin': 'https://bezr.example.test'},
+                               data={'ticket': ticket}, follow_redirects=False)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.store.consume_control_ui_ticket(ticket, audience=self.audience), {
+            'owner_id': 'alice', 'instance_id': self.instance_id, 'audience': self.audience,
+        })
 
     def test_ticket_exchange_sets_host_only_secure_cookie_and_redirects_cleanly(self):
         ticket = self.store.issue_control_ui_ticket(

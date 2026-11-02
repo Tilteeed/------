@@ -296,7 +296,10 @@ class RuntimeService:
         if info and instance and instance['active']:
             runtime['state'] = (state if state in {'preparing', 'failed', 'not_created'} else 'absent') if self._absent(info) else info['state']
             # Never return arbitrary engine fields, endpoints, tokens or Docker IDs.
+            network_profile = info.get('network_profile')
             gateway = info.get('gateway')
+            if network_profile in {'legacy_none', 'agent_internal_v1'}:
+                runtime['network_profile'] = network_profile
             if gateway in ('connected', 'ready', 'starting', 'not_connected', 'unavailable', 'unknown', 'not_ready'):
                 runtime['gateway'] = gateway
         result: dict[str, Any] = dict(runtime=runtime,

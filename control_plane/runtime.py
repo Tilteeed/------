@@ -126,6 +126,7 @@ class SupervisorClient:
             safe_runtime = {k: v for k, v in runtime.items() if k in (
                 'state', 'gateway', 'model', 'telegram', 'instance_id', 'container_id',
                 'settings_revision', 'operation_status', 'error_code', 'retained_data',
+                'network_profile',
                 'pending_create_key', 'pending_create_revision',
                 'pending_restore_key', 'pending_restore_revision',
                 'pending_purge_key', 'pending_purge_revision',

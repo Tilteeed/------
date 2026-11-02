@@ -36,6 +36,39 @@ class WorkspaceBridgeTests(unittest.TestCase):
             with self.assertRaises(RuntimeUnavailable):
                 client.workspace_list('alice', 'a' * 32, 'notes', 0)
 
+    def test_supervisor_bridge_preserves_only_the_validated_network_profile(self):
+        class Response:
+            status = 200
+            def __init__(self, content):
+                self.content = content
+            def read(self, _limit):
+                return self.content
+
+        class Connection:
+            def __init__(self, response):
+                self.response = response
+            def request(self, *_args, **_kwargs):
+                pass
+            def getresponse(self):
+                return self.response
+            def close(self):
+                pass
+
+        payload = json.dumps({
+            'runtime': {'state': 'running', 'gateway': 'ready', 'instance_id': 'a' * 32,
+                        'network_profile': 'agent_internal_v1', 'proxy_ip': '10.0.0.4'},
+            'capabilities': {}, 'retained': [],
+        }).encode('utf-8')
+        with tempfile.TemporaryDirectory() as tmp:
+            token_file = Path(tmp) / 'token'
+            token_file.write_text('A' * 32, encoding='ascii')
+            client = SupervisorClient('unused.sock', token_file)
+            with patch('control_plane.runtime.UnixConnection',
+                       return_value=Connection(Response(payload))):
+                result = client.get('alice')
+        self.assertEqual(result['runtime']['network_profile'], 'agent_internal_v1')
+        self.assertNotIn('proxy_ip', result['runtime'])
+
     def test_preview_accepts_text_larger_than_default_json_response_limit(self):
         class Response:
             status = 200

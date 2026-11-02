@@ -22,8 +22,10 @@ router.include_router(create_router(
     public_origin=public_origin,
     runtime=configured_client(),
     control_ui_domain=control_ui_domain,
+    control_ui_proxy_ready=False,  # Fail closed until the HTTP/WS proxy route is mounted.
 ))
 router.include_router(create_handoff_router(
     platform_store, public_origin=public_origin, control_ui_domain=control_ui_domain,
+    proxy_ready=False,
 ))
 router.include_router(create_page_router(Path(__file__).parent / "static"))
