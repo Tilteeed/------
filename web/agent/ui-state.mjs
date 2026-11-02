@@ -5,6 +5,28 @@ export function settingsPayload(name, instructions, revision) {
   return { settings: { name, instructions }, revision };
 }
 
+export function controlUiStatus(data, instanceId) {
+  const unavailable = { available: false, origin: null };
+  if (typeof instanceId !== 'string' || !/^[0-9a-f]{32}$/.test(instanceId)
+      || data?.available !== true || typeof data.origin !== 'string' || data.origin.length > 300) return unavailable;
+  try {
+    const value = new URL(data.origin);
+    if (value.protocol !== 'https:' || value.username || value.password
+        || value.origin !== data.origin || value.pathname !== '/'
+        || value.search || value.hash || !value.hostname.startsWith(`${instanceId}.`)) return unavailable;
+    return { available: true, origin: data.origin };
+  } catch {
+    return unavailable;
+  }
+}
+
+export function controlUiLaunch(data, expectedOrigin) {
+  if (typeof expectedOrigin !== 'string' || data?.origin !== expectedOrigin
+      || typeof data.launch_ticket !== 'string' || !/^[A-Za-z0-9_-]{40,64}$/.test(data.launch_ticket)
+      || !Number.isInteger(data.expires_in) || data.expires_in < 1 || data.expires_in > 60) return null;
+  return { ticket: data.launch_ticket, origin: expectedOrigin };
+}
+
 export function draftView(draft) {
   return draft === null
     ? { state: 'empty', name: '', instructions: '', revision: 0, message: 'Настроек пока нет. Сохраните черновик — это не создаст агента.' }

@@ -1,4 +1,4 @@
-import { draftView, errorView, runtimeView, settingsPayload } from './ui-state.mjs';
+import { controlUiLaunch, controlUiStatus, draftView, errorView, runtimeView, settingsPayload } from './ui-state.mjs';
 
 const $ = (id) => document.getElementById(id);
 const apiRoot = '/api/v1/agent-platform/me';
@@ -14,6 +14,7 @@ let runtimeData = { state: 'not_connected' };
 let capabilities = {};
 let connected = false;
 let workspaceBusy = 0;
+let controlUi = { available: false, origin: null, loading: false, busy: false };
 const operationMemory = new Map();
 let sessionStorageAvailable = true;
 
@@ -352,6 +353,8 @@ function controls() {
   $('reload').disabled = workspaceLocked;
   $('refresh-runtime').disabled = !authenticated || workspaceLocked;
   $('refresh-events').disabled = !authenticated || workspaceLocked || eventsBusy;
+  $('open-agent').disabled = !authenticated || workspaceLocked || controlUi.busy
+    || controlUi.loading || !controlUi.available;
   for (const button of document.querySelectorAll('[data-action]')) {
     const action = button.dataset.action;
     const exists = Boolean(runtimeData.instance_id) && !['removed', 'purged'].includes(runtimeData.state);
@@ -402,6 +405,8 @@ function revoke() {
   connected = false;
   runtimeData = { state: 'not_connected' };
   capabilities = {};
+  controlUi = { available: false, origin: null, loading: false, busy: false };
+  $('control-ui-help').textContent = 'Войдите в BEZR, чтобы проверить доступность прокси.';
   dirty = false;
   $('identity').textContent = 'Учётная запись не подтверждена';
   $('agent-name').value = '';
@@ -461,6 +466,88 @@ function applyDraft(draft) {
   notice(view.state, view.message);
 }
 
+async function refreshControlUiStatus(epoch = identityEpoch) {
+  if (!authenticated || controlUi.loading) return;
+  controlUi = { ...controlUi, available: false, origin: null, loading: true };
+  $('control-ui-help').textContent = 'Проверяем готовность Control UI…';
+  controls();
+  try {
+    const data = await request('/control-ui/status');
+    if (!authenticated || epoch !== identityEpoch) return;
+    const state = controlUiStatus(data, runtimeData.instance_id);
+    controlUi.available = state.available;
+    controlUi.origin = state.origin;
+    $('control-ui-help').textContent = state.available
+      ? 'Gateway и защищённый маршрут готовы.'
+      : 'Доступ пока недоступен: Gateway или защищённый прокси не готовы.';
+  } catch (error) {
+    if (epoch !== identityEpoch) return;
+    controlUi.available = false;
+    controlUi.origin = null;
+    $('control-ui-help').textContent = 'Не удалось безопасно подтвердить доступность Control UI.';
+    if (error.status === 401 || error.status === 403) showError(error);
+  } finally {
+    if (epoch === identityEpoch) {
+      controlUi.loading = false;
+      controls();
+    }
+  }
+}
+
+async function openAgent() {
+  if (!authenticated || !controlUi.available || !controlUi.origin || busy || controlUi.busy) return;
+  let bytes;
+  try { bytes = crypto.getRandomValues(new Uint8Array(12)); }
+  catch {
+    $('control-ui-help').textContent = 'Браузер не предоставил безопасную генерацию имени вкладки.';
+    return;
+  }
+  const targetName = `bezr-control-ui-${Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('')}`;
+  const popup = window.open('about:blank', targetName);
+  if (!popup) {
+    $('control-ui-help').textContent = 'Разрешите всплывающую вкладку и повторите запуск.';
+    return;
+  }
+  try { popup.opener = null; } catch { /* Isolate the new browsing context when supported. */ }
+  const epoch = identityEpoch;
+  controlUi.busy = true;
+  controls();
+  try {
+    const data = await request('/control-ui/launch', 'POST', {});
+    if (!authenticated || epoch !== identityEpoch) { popup.close(); return; }
+    const launch = controlUiLaunch(data, controlUi.origin);
+    if (!launch) throw { status: 0 };
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = `${launch.origin}/_bezr/enter`;
+    form.target = targetName;
+    form.enctype = 'application/x-www-form-urlencoded';
+    form.referrerPolicy = 'no-referrer';
+    const ticket = document.createElement('input');
+    ticket.type = 'hidden';
+    ticket.name = 'ticket';
+    ticket.value = launch.ticket;
+    form.append(ticket);
+    document.body.append(form);
+    form.submit();
+    form.remove();
+    $('control-ui-help').textContent = 'Одноразовый вход отправлен; билет не помещён в адрес страницы.';
+  } catch (error) {
+    try { popup.close(); } catch { /* Ignore a window closed by the user. */ }
+    if (epoch === identityEpoch) {
+      $('control-ui-help').textContent = error.status
+        ? 'Запуск Control UI отклонён. Обновите состояние и повторите попытку.'
+        : 'Не удалось безопасно открыть Control UI.';
+      if (error.status === 401 || error.status === 403) showError(error);
+    }
+  } finally {
+    if (epoch === identityEpoch) {
+      controlUi.busy = false;
+      controls();
+    }
+  }
+}
+
 async function loadEvents() {
   if (!authenticated || eventsBusy) return;
   const epoch = identityEpoch;
@@ -515,6 +602,7 @@ async function load() {
     currentUser = data.user.id;
     $('identity').textContent = data.user.name;
     renderRuntime(data);
+    void refreshControlUiStatus(identityEpoch);
     void loadEvents();
   } catch (error) {
     // A failed initial read must never enable saving against an invented revision.
@@ -585,6 +673,7 @@ async function submitAction(button, action, targetInstanceId = null, savedOperat
     const data = await request('/actions', 'POST', payload);
     if (epoch !== identityEpoch) return;
     renderRuntime(data);
+    void refreshControlUiStatus(epoch);
     // Failed/ambiguous requests retain the same key so a retry cannot duplicate effects.
     if (data.operation?.status === 'succeeded' || data.operation?.status === 'completed') {
       operationSet(storageKey, null);
@@ -600,7 +689,10 @@ async function submitAction(button, action, targetInstanceId = null, savedOperat
         if (error.status === 503) {
           try {
             const latest = await request();
-            if (epoch === identityEpoch) renderRuntime(latest);
+            if (epoch === identityEpoch) {
+              renderRuntime(latest);
+              void refreshControlUiStatus(epoch);
+            }
           } catch { /* Keep the original operation error visible if refresh also fails. */ }
         }
       }
@@ -617,6 +709,7 @@ async function submitAction(button, action, targetInstanceId = null, savedOperat
 for (const button of document.querySelectorAll('[data-action]')) {
   button.addEventListener('click', () => submitAction(button, button.dataset.action));
 }
+$('open-agent').addEventListener('click', openAgent);
 $('refresh-runtime').addEventListener('click', async () => {
   if (!authenticated || busy) return;
   const epoch = identityEpoch;
@@ -624,7 +717,10 @@ $('refresh-runtime').addEventListener('click', async () => {
   controls();
   try {
     const data = await request();
-    if (epoch === identityEpoch) renderRuntime(data);
+    if (epoch === identityEpoch) {
+      renderRuntime(data);
+      await refreshControlUiStatus(epoch);
+    }
   } catch (error) { if (epoch === identityEpoch) showError(error); }
   finally { busy = false; controls(); }
 });

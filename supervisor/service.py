@@ -26,6 +26,7 @@ from urllib.parse import quote
 
 from .config import load_profile, _unique_object, _reject_constant
 from .metrics import HostMetrics, MetricsUnavailable
+from .openclaw_config import build_gateway_config
 from .policy import evaluate_admission
 from .runtime_store import RuntimeStore, StoreError, canonical
 from .workspace_files import RetainedWorkspace, WorkspaceFileError
@@ -174,10 +175,12 @@ def initialize_files(instance, evidence):
     state_fd = workspace_fd = None
     try:
         state_fd = _private_dir_at(root_fd, 'state')
-        # Same bootstrap accepted for the pinned Stage-2 image; no public origins.
-        config = {'gateway': {'mode': 'local', 'bind': 'lan',
-            'auth': {'mode': 'token', 'token': instance['gateway_token']},
-            'controlUi': {'allowedOrigins': ['http://localhost:18789', 'http://127.0.0.1:18789']}}}
+        # Per-agent profile config trusts one exact sidecar IP and one owner;
+        # the legacy/internal profiles retain token auth until explicit migration.
+        try:
+            config = build_gateway_config(instance)
+        except ValueError:
+            raise ServiceError('unsafe_initialization', 503) from None
         _initial_file(state_fd, 'openclaw.json', (canonical(config) + '\n').encode('utf-8'))
         # A torn initial write must not silently permit a container to start.
         fd = os.open('openclaw.json', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=state_fd)
@@ -187,8 +190,7 @@ def initialize_files(instance, evidence):
             raise ServiceError('unsafe_initialization', 503)
         try:
             current = decode_json(blob)
-            if (current['gateway']['mode'] != 'local'
-                    or current['gateway']['auth']['token'] != instance['gateway_token']):
+            if current != config:
                 raise ValueError()
         except (ServiceError, KeyError, TypeError, ValueError):
             raise ServiceError('unsafe_initialization', 503) from None

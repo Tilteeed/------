@@ -10,7 +10,10 @@ UPSTREAM_MAIN_SHA256 = "c40fa80418d08771783c0158b65481793cc31fe8c92220027a669bdf
 ANCHOR = "app.include_router(auths.router, prefix='/api/v1/auths', tags=['auths'])"
 BLOCK = (
     "\n# BEGIN AGENT PLATFORM INTEGRATION\n"
-    "from control_plane.openwebui import router as agent_platform_router\n"
+    "from control_plane.openwebui import router as agent_platform_router, control_ui_proxy_app, control_ui_domain\n"
+    "from control_plane.access_proxy import ControlUiHostMiddleware\n"
+    "if control_ui_domain:\n"
+    "    app.add_middleware(ControlUiHostMiddleware, proxy_app=control_ui_proxy_app, control_ui_domain=control_ui_domain)\n"
     "app.include_router(agent_platform_router)\n"
     "# END AGENT PLATFORM INTEGRATION\n"
 )

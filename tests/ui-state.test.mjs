@@ -33,6 +33,36 @@ test('settings payload contains only editable settings and validates limits with
   }
 });
 
+test('control UI status accepts only the HTTPS origin for the current instance', () => {
+  const instance = 'a'.repeat(32);
+  const origin = `https://${instance}.agents.example.test`;
+  assert.deepEqual(ui.controlUiStatus({ available: true, origin }, instance), { available: true, origin });
+  for (const response of [
+    { available: false, origin },
+    { available: true, origin: `http://${instance}.agents.example.test` },
+    { available: true, origin: `https://${'b'.repeat(32)}.agents.example.test` },
+    { available: true, origin: `https://user@${instance}.agents.example.test` },
+    { available: true, origin: `${origin}/path` },
+    { available: true, origin: `${origin}?target=elsewhere` },
+  ]) {
+    assert.deepEqual(ui.controlUiStatus(response, instance), { available: false, origin: null });
+  }
+});
+
+test('control UI launch tickets are accepted only for the status origin and short TTL', () => {
+  const origin = `https://${'c'.repeat(32)}.agents.example.test`;
+  const launch = { launch_ticket: 'A'.repeat(43), origin, expires_in: 60 };
+  assert.deepEqual(ui.controlUiLaunch(launch, origin), { ticket: launch.launch_ticket, origin });
+  for (const invalid of [
+    { ...launch, origin: `https://${'d'.repeat(32)}.agents.example.test` },
+    { ...launch, launch_ticket: 'bad' },
+    { ...launch, expires_in: 61 },
+    { ...launch, expires_in: 0 },
+  ]) {
+    assert.equal(ui.controlUiLaunch(invalid, origin), null);
+  }
+});
+
 test('runtime never claims an agent is running without a connection', () => {
   for (const runtime of [null, {}, { state: 'not_connected' }, { state: 'running' }]) {
     assert.deepEqual(ui.runtimeView(runtime), {

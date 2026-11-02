@@ -125,9 +125,14 @@ class PlatformApiTests(unittest.TestCase):
                 if owner_id == "alice":
                     return {"runtime": {"state": "running", "gateway": "ready",
                                         "instance_id": instance_id,
-                                        "network_profile": "agent_internal_v1"}}
+                                        "network_profile": "agent_proxy_v1"}}
                 return {"runtime": {"state": "not_created", "gateway": "not_connected",
                                     "instance_id": None}}
+
+            def control_ui_target(self, owner_id, target_instance_id):
+                if owner_id == 'alice' and target_instance_id == instance_id:
+                    return {'ip': '172.31.0.2', 'port': 18790, 'proxy_token': 'P' * 43}
+                return None
 
         runtime = Runtime()
         app = FastAPI()
@@ -208,6 +213,34 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(status.json(), {'available': False, 'origin': None})
         launch = client.post(self.base + '/control-ui/launch', headers=self.alice, json={})
         self.assertEqual(launch.status_code, 503)
+
+    def test_control_ui_status_requires_resolved_sidecar_target(self):
+        instance_id = 'e' * 32
+        class Runtime:
+            def __init__(self):
+                self.target_calls = []
+            def get(self, _owner_id):
+                return {'runtime': {'state': 'running', 'gateway': 'ready',
+                                    'instance_id': instance_id,
+                                    'network_profile': 'agent_proxy_v1'}}
+            def control_ui_target(self, owner_id, target_instance_id):
+                self.target_calls.append((owner_id, target_instance_id))
+                return None
+
+        runtime = Runtime()
+        app = FastAPI()
+        app.include_router(api.create_router(
+            verified_test_user, self.store, runtime=runtime,
+            public_origin='https://bezr.example.test', control_ui_domain='agents.example.test',
+            control_ui_proxy_ready=True))
+        client = TestClient(app)
+        self.addCleanup(client.close)
+        status = client.get(self.base + '/control-ui/status', headers=self.alice)
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json(), {'available': False, 'origin': None})
+        launch = client.post(self.base + '/control-ui/launch', headers=self.alice, json={})
+        self.assertEqual(launch.status_code, 503)
+        self.assertEqual(runtime.target_calls, [('alice', instance_id), ('alice', instance_id)])
 
     def test_control_ui_launch_rejects_client_targets_and_unconfigured_domain(self):
         class Runtime:

@@ -10,6 +10,7 @@ from urllib.parse import quote, urlsplit
 from .policy import require_owner, validate_agent_input
 from .store import RevisionConflict, LaunchRateLimited
 from .runtime import RuntimeRejected, RuntimeUnavailable
+from .access_proxy import validate_proxy_target
 
 
 def _workspace_path(value, *, allow_empty=False):
@@ -159,11 +160,20 @@ def create_router(verified_user, store, *, public_origin: str | None = None, run
         instance_id = info.get('instance_id')
         if info.get('state') != 'running' or info.get('gateway') != 'ready':
             return None, 'gateway_not_ready'
-        if info.get('network_profile') != 'agent_internal_v1':
+        if info.get('network_profile') != 'agent_proxy_v1':
             return None, 'network_policy_unavailable'
         if (type(instance_id) is not str
                 or re.fullmatch(r'[0-9a-f]{32}', instance_id) is None):
             return None, 'gateway_not_ready'
+        target_resolver = getattr(runtime, 'control_ui_target', None)
+        if not callable(target_resolver):
+            return None, 'proxy_unavailable'
+        try:
+            target = target_resolver(owner_id, instance_id)
+        except (RuntimeUnavailable, RuntimeRejected):
+            return None, 'proxy_unavailable'
+        if validate_proxy_target(target) is None:
+            return None, 'proxy_unavailable'
         return instance_id, None
 
     async def revoke_control_ui_if_not_ready(owner_id, result):
@@ -203,6 +213,7 @@ def create_router(verified_user, store, *, public_origin: str | None = None, run
                 'supervisor_unavailable': 'Supervisor is unavailable.',
                 'gateway_not_ready': 'Your Gateway is not ready yet.',
                 'network_policy_unavailable': 'Your Gateway network is not eligible for proxied access.',
+                'proxy_unavailable': 'Your Control UI proxy is unavailable.',
             }
             raise HTTPException(503, {'code': code, 'message': messages.get(code, 'Gateway unavailable.')})
         origin = f'https://{instance_id}.{control_ui_domain}'
