@@ -1,5 +1,6 @@
 """Synthetic Docker API checks for the versioned per-agent network profile."""
 import copy
+import ipaddress
 import json
 import os
 import secrets
@@ -955,6 +956,10 @@ class DockerEngineNetworkTests(unittest.TestCase):
                  'protocol': 'kernel', 'scope': 'link', 'prefsrc': network['gateway']},
                 {'type': 'local', 'dst': network['gateway'], 'dev': network['bridge'],
                  'protocol': 'kernel', 'scope': 'host', 'prefsrc': network['gateway']},
+                {'type': 'broadcast',
+                 'dst': str(ipaddress.IPv4Network(network['subnet']).broadcast_address),
+                 'dev': network['bridge'], 'protocol': 'kernel', 'scope': 'link',
+                 'prefsrc': network['gateway']},
             ))
             address_rows.append({'ifname': network['bridge'], 'addr_info': [{
                 'family': 'inet', 'local': network['gateway'], 'prefixlen': 29}]})
@@ -996,8 +1001,10 @@ class DockerEngineNetworkTests(unittest.TestCase):
         self.assertEqual(restored_instance['agent_subnet'], plan['agent']['subnet'])
         self.assertEqual(restored_instance['sidecar_ip'], plan['agent']['sidecar_ip'])
         foreign_rows = [*route_rows, {
-            'dst': plan['agent']['subnet'], 'dev': plan['agent']['bridge'],
-            'protocol': 'static', 'scope': 'link',
+            'type': 'broadcast',
+            'dst': str(ipaddress.IPv4Network(
+                plan['agent']['subnet']).broadcast_address),
+            'dev': plan['agent']['bridge'], 'protocol': 'static', 'scope': 'link',
         }]
         inventory = parse_ipv4_networks(foreign_rows, address_rows)
         with self.assertRaises(DockerEngineError):

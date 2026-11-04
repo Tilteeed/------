@@ -5,6 +5,8 @@ This intentionally uses a synthetic Docker API fixture: it validates Linux
 route output plus BEZR's Docker-identity checks, not a live Docker daemon.
 """
 from pathlib import Path
+import ipaddress
+import json
 import os
 import shutil
 import signal
@@ -19,6 +21,7 @@ from supervisor.firewall import (
     NFTABLES_SEMANTICS_VALIDATED, NftablesAdapter, expected_ruleset,
 )
 from supervisor.network_routes import read_host_ipv4_networks
+from supervisor.probes import run_command
 
 INSTANCE_ID = '5' * 32
 AGENT_POOL = '10.246.0.0/24'
@@ -35,6 +38,26 @@ def _command(argv, *, timeout=10):
         raise RuntimeError('isolated Linux command failed') from None
     if result.returncode != 0:
         raise RuntimeError('isolated Linux command returned non-zero')
+
+
+def _json_prefix_values(document):
+    matches = []
+    objects = document.get('nftables') if type(document) is dict else None
+    if type(objects) is not list:
+        raise RuntimeError('nft JSON response has no nftables array')
+    for item in objects:
+        rule = item.get('rule') if type(item) is dict else None
+        expressions = rule.get('expr') if type(rule) is dict else None
+        if type(expressions) is not list:
+            continue
+        for expression in expressions:
+            match = expression.get('match') if type(expression) is dict else None
+            right = match.get('right') if type(match) is dict else None
+            if type(right) is dict and type(right.get('prefix')) is dict:
+                matches.append(right['prefix'])
+                if len(matches) >= 32:
+                    return matches
+    return matches
 
 
 def _new_network_namespace():
@@ -88,13 +111,28 @@ def _inside_namespace():
     state = {}
     for role, network_id in (('agent', 'a' * 64), ('frontend', 'b' * 64)):
         payload = engine._proxy_network_payload(INSTANCE_ID, plan[role], role=role)
+        subnet = ipaddress.IPv4Network(plan[role]['subnet'])
+        broadcast = str(subnet.broadcast_address)
         _command(['ip', 'link', 'add', 'name', plan[role]['bridge'], 'type', 'bridge'])
-        _command(['ip', 'address', 'add',
-                  plan[role]['gateway'] + '/29', 'dev', plan[role]['bridge']])
+        _command(['ip', 'address', 'add', plan[role]['gateway'] + '/29',
+                  'brd', broadcast, 'dev', plan[role]['bridge']])
         _command(['ip', 'link', 'set', 'dev', plan[role]['bridge'], 'up'])
         state[network_id] = {
             **payload, 'Id': network_id, 'Ingress': False, 'Containers': {},
         }
+
+    actual_inventory = read_host_ipv4_networks()
+    for role in ('agent', 'frontend'):
+        network = plan[role]
+        broadcast_route = str(ipaddress.IPv4Network(network['subnet']).broadcast_address) + '/32'
+        if not any(
+                route.network == broadcast_route
+                and route.interface == network['bridge']
+                and route.route_type == 'broadcast'
+                and route.protocol == 'kernel' and route.scope == 'link'
+                and route.prefsrc in (None, network['gateway'])
+                for route in actual_inventory.routes):
+            raise RuntimeError('Linux namespace did not expose the expected kernel broadcast route')
 
     creates = []
     def docker_fixture(method, path, payload=None, *, ok=(200,)):
@@ -168,7 +206,23 @@ def _inside_namespace():
     adapter = NftablesAdapter()
     expected = expected_ruleset((policy,))
     adapter.replace(expected)
-    if adapter.read() != expected:
+    prefix_values = {}
+    for family in ('inet', 'bridge'):
+        raw = run_command(
+            [adapter.nft_binary, '-a', '-j', 'list', 'table', family, 'agent_proxy_v1'],
+            timeout=5, max_output_bytes=65536)
+        values = _json_prefix_values(json.loads(raw))
+        if values:
+            prefix_values[family] = values
+    try:
+        readback = adapter.read()
+    except Exception:
+        readback = None
+    if readback != expected:
+        if prefix_values:
+            prefix_sample = json.dumps(prefix_values, sort_keys=True, separators=(',', ':'))[:512]
+            raise RuntimeError(
+                'nft JSON read-back mismatch; prefix objects observed: ' + prefix_sample)
         raise RuntimeError('Live nftables JSON/handle read-back did not match')
     for family in ('inet', 'bridge'):
         table = adapter._family_table(family)
@@ -176,9 +230,9 @@ def _inside_namespace():
             raise RuntimeError('nftables did not return a positive table handle')
     if NFTABLES_SEMANTICS_VALIDATED is not False:
         raise RuntimeError('The production firewall semantics gate must remain disabled')
-    return ('PASS: current netns route data, repeat preparation, restore preparation, '
-            'foreign-route rejection, nft -a -j handles and exact ruleset read-back. '
-            'No Docker daemon or user data used; agent_proxy_v1 remains disabled.')
+    return ('PASS: current netns route data including broadcast routes, repeat preparation, '
+            'restore preparation, foreign-route rejection, nft -a -j handles and exact '
+            'ruleset read-back. No Docker daemon or user data used; agent_proxy_v1 remains disabled.')
 
 
 def main(argv=None):
