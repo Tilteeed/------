@@ -7,10 +7,11 @@ in :mod:`control_plane.proxy_sidecar`; it never accepts a client-selected target
 import asyncio
 import inspect
 import ipaddress
+import json
 import math
 import re
 from contextlib import asynccontextmanager
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request, WebSocket
 from starlette.concurrency import run_in_threadpool
@@ -130,6 +131,13 @@ _MAX_PROXY_BODY = 16 * 1024 * 1024
 _MAX_PROXY_RESPONSE = 32 * 1024 * 1024
 
 
+class ControlUiPairingError(RuntimeError):
+    def __init__(self, status, code):
+        self.status = status
+        self.code = code
+        super().__init__(code)
+
+
 def _scope_header_values(scope, name):
     key = name.lower().encode('ascii')
     return [value.decode('latin-1') for header, value in scope.get('headers', [])
@@ -166,9 +174,11 @@ def _session_cookie(scope):
 
 def _request_client_ip(scope):
     client = scope.get('client')
+    expected_scheme = 'wss' if scope.get('type') == 'websocket' else 'https'
     forwarded_for = _scope_header_values(scope, 'x-forwarded-for')
     forwarded_proto = _scope_header_values(scope, 'x-forwarded-proto')
-    if (type(client) not in (tuple, list) or len(client) < 1
+    if (scope.get('scheme') != expected_scheme
+            or type(client) not in (tuple, list) or len(client) < 1
             or type(client[0]) is not str or len(forwarded_for) != 1
             or len(forwarded_proto) != 1 or forwarded_proto[0] != 'https'):
         raise HTTPException(403, 'Forbidden', headers={'Cache-Control': 'no-store'})
@@ -247,6 +257,25 @@ def _safe_proxy_response_headers(headers, *, origin):
     output.update({'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
                    'X-Content-Type-Options': 'nosniff'})
     return output
+
+
+def _reserved_proxy_path(value):
+    """Hide private Sidecar pairing and Admin RPC paths from browser relay."""
+    try:
+        path = urlsplit(value).path
+    except (TypeError, ValueError):
+        return True
+    reserved = ('/api/v1/admin/rpc', '/_bezr/pairing-rpc')
+    for _ in range(5):
+        normalized = path.rstrip('/') or '/'
+        if any(normalized == prefix or normalized.startswith(prefix + '/')
+               for prefix in reserved):
+            return True
+        decoded = unquote(path)
+        if decoded == path:
+            return False
+        path = decoded
+    return '%' in path
 
 
 def _proxy_path(scope):
@@ -395,6 +424,73 @@ def create_control_ui_access_proxy(store, runtime, *, public_origin, control_ui_
                 'owner_id': owner_id, 'session_id': session_id,
                 'client_ip': client_ip, 'target': target}
 
+    async def pairing_service(owner_id, client_ip, payload):
+        if (type(owner_id) is not str or not owner_id
+                or type(client_ip) is not str or len(client_ip) > 64):
+            raise ControlUiPairingError(403, 'forbidden')
+        if payload == {'action': 'list'}:
+            pass
+        elif (type(payload) is not dict or set(payload) != {
+                'action', 'requestId', 'expectedDeviceId', 'expectedRole',
+                'expectedScopes', 'expectedClientId'} or payload.get('action') != 'approve'):
+            raise ControlUiPairingError(400, 'invalid_pairing_request')
+        if not ready:
+            raise ControlUiPairingError(503, 'control_ui_pairing_unavailable')
+        try:
+            observed = await run_in_threadpool(runtime.get, owner_id)
+            info = observed.get('runtime') if type(observed) is dict else None
+            if type(info) is not dict:
+                raise ControlUiPairingError(503, 'control_ui_pairing_unavailable')
+            instance_id = info.get('instance_id')
+            if (info.get('state') != 'running'
+                    or info.get('gateway') != 'ready'
+                    or info.get('network_profile') != 'agent_proxy_v1'
+                    or type(instance_id) is not str
+                    or re.fullmatch(r'[0-9a-f]{32}', instance_id) is None):
+                raise ControlUiPairingError(503, 'control_ui_pairing_unavailable')
+            target = await run_in_threadpool(target_resolver, owner_id, instance_id)
+            if inspect.isawaitable(target):
+                target = await target
+            target = validate_proxy_target(target)
+            if target is None:
+                raise ControlUiPairingError(503, 'control_ui_pairing_unavailable')
+            address = ipaddress.ip_address(client_ip)
+            if (str(address) != client_ip or address.is_loopback or address.is_link_local
+                    or address.is_multicast or address.is_unspecified):
+                raise ControlUiPairingError(403, 'forbidden')
+            host = instance_id + '.' + domain
+            origin = 'https://' + host
+            headers = _sidecar_headers(
+                {'content-type': 'application/json'}, host=host, origin=origin,
+                target=target, client_ip=client_ip)
+            status, _response_headers, content = await transport.request(
+                target, 'POST', '/_bezr/pairing-rpc', headers,
+                json.dumps(payload, separators=(',', ':')).encode('utf-8'))
+        except ControlUiPairingError:
+            raise
+        except Exception:
+            raise ControlUiPairingError(503, 'control_ui_pairing_unavailable') from None
+        if status == 409:
+            raise ControlUiPairingError(409, 'pairing_request_changed')
+        if status != 200 or type(content) is not bytes or len(content) > 65536:
+            raise ControlUiPairingError(503, 'control_ui_pairing_unavailable')
+        try:
+            result = json.loads(content)
+        except (ValueError, UnicodeError, RecursionError):
+            raise ControlUiPairingError(503, 'control_ui_pairing_unavailable') from None
+        if type(result) is not dict:
+            raise ControlUiPairingError(503, 'control_ui_pairing_unavailable')
+        if payload == {'action': 'list'}:
+            requests = result.get('requests')
+            if type(requests) is not list or len(requests) > 64:
+                raise ControlUiPairingError(503, 'control_ui_pairing_unavailable')
+            return {'requests': requests}
+        if (result.get('approved') is not True
+                or result.get('device_id') != payload['expectedDeviceId']
+                or result.get('scopes') != payload['expectedScopes']):
+            raise ControlUiPairingError(503, 'control_ui_pairing_unavailable')
+        return {'approved': True, 'device_id': result['device_id'], 'scopes': result['scopes']}
+
     async def http_proxy(request: Request, _path=''):
         if request.method not in _PROXY_METHODS:
             raise HTTPException(405, 'Method not allowed', headers={'Cache-Control': 'no-store'})
@@ -402,6 +498,8 @@ def create_control_ui_access_proxy(store, runtime, *, public_origin, control_ui_
         path = _proxy_path(request.scope)
         if path is None:
             raise HTTPException(400, 'Invalid path', headers={'Cache-Control': 'no-store'})
+        if _reserved_proxy_path(path):
+            raise HTTPException(404, 'Not found', headers={'Cache-Control': 'no-store'})
         body = bytearray()
         async for chunk in request.stream():
             if len(body) + len(chunk) > _MAX_PROXY_BODY:
@@ -430,8 +528,8 @@ def create_control_ui_access_proxy(store, runtime, *, public_origin, control_ui_
         try:
             context = await authorize(websocket.scope, 'GET', websocket=True)
             path = _proxy_path(websocket.scope)
-            if path is None:
-                raise HTTPException(400, 'Invalid path')
+            if path is None or _reserved_proxy_path(path):
+                raise HTTPException(404, 'Not found')
             requested = []
             for value in websocket.headers.getlist('sec-websocket-protocol'):
                 requested.extend(part.strip() for part in value.split(',') if part.strip())
@@ -510,4 +608,5 @@ def create_control_ui_access_proxy(store, runtime, *, public_origin, control_ui_
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.include_router(router)
     app.state.proxy_ready = ready
+    app.state.pairing_service = pairing_service if ready else None
     return app

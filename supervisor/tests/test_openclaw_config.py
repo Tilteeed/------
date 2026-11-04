@@ -30,7 +30,8 @@ class GatewayConfigTests(unittest.TestCase):
             'sidecar_ip': '172.31.4.2',
             'control_ui_origin': 'https://' + 'a' * 32 + '.agents.example.test',
         })
-        gateway = build_gateway_config(instance)['gateway']
+        built = build_gateway_config(instance)
+        gateway = built['gateway']
         self.assertEqual(gateway['publicOrigin'], instance['control_ui_origin'])
         self.assertEqual(gateway['trustedProxies'], ['172.31.4.2'])
         self.assertEqual(gateway['controlUi']['allowedOrigins'], [instance['control_ui_origin']])
@@ -38,7 +39,8 @@ class GatewayConfigTests(unittest.TestCase):
             'mode': 'trusted-proxy',
             'identityScopes': {
                 'owner_123': ['operator.read', 'operator.write',
-                              'operator.approvals', 'operator.questions'],
+                              'operator.approvals', 'operator.questions',
+                              'operator.pairing'],
             },
             'trustedProxy': {
                 'userHeader': 'x-forwarded-user',
@@ -47,6 +49,10 @@ class GatewayConfigTests(unittest.TestCase):
                 'deviceAutoApprove': {'enabled': False},
             },
         })
+        self.assertEqual(built['plugins'], {
+            'entries': {'admin-http-rpc': {'enabled': True}},
+        })
+        self.assertNotIn('operator.admin', gateway['auth']['identityScopes']['owner_123'])
         self.assertNotIn('token', gateway['auth'])
         self.assertNotIn('password', gateway['auth'])
 

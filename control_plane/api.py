@@ -1,5 +1,6 @@
 """FastAPI routes hosted by Open WebUI, not a replacement authentication system."""
 
+import inspect
 import json
 import re
 
@@ -10,7 +11,7 @@ from urllib.parse import quote, urlsplit
 from .policy import require_owner, validate_agent_input
 from .store import RevisionConflict, LaunchRateLimited
 from .runtime import RuntimeRejected, RuntimeUnavailable
-from .access_proxy import validate_proxy_target
+from .access_proxy import ControlUiPairingError, _request_client_ip, validate_proxy_target
 
 
 def _workspace_path(value, *, allow_empty=False):
@@ -46,10 +47,13 @@ def _https_origin(value):
 
 
 def create_router(verified_user, store, *, public_origin: str | None = None, runtime=None,
-                  control_ui_domain: str | None = None, control_ui_proxy_ready: bool = False):
+                  control_ui_domain: str | None = None, control_ui_proxy_ready: bool = False,
+                  control_ui_pairing_service=None):
     """Use upstream verified identity; only trusted deployment config sets UI domain."""
     if type(control_ui_proxy_ready) is not bool:
         raise ValueError('Control UI proxy readiness must be an explicit boolean')
+    if control_ui_pairing_service is not None and not callable(control_ui_pairing_service):
+        raise ValueError('Control UI pairing service must be callable')
     if control_ui_domain is not None:
         label = r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
         if (type(control_ui_domain) is not str or len(control_ui_domain) > 253
@@ -227,6 +231,100 @@ def create_router(verified_user, store, *, public_origin: str | None = None, run
             raise HTTPException(503, {'code': 'control_ui_unavailable',
                                       'message': 'Control UI launch could not be prepared.'}) from None
         return {'origin': origin, 'launch_ticket': launch['ticket'], 'expires_in': 60}
+
+    @router.get('/me/control-ui/pairing')
+    async def control_ui_pairing_requests(request: Request, response: Response,
+                                          user=Depends(actor)):
+        response.headers['Cache-Control'] = 'no-store'
+        service = control_ui_pairing_service
+        if not control_ui_enabled or not callable(service):
+            raise HTTPException(503, {'code': 'control_ui_pairing_unavailable',
+                                      'message': 'Pairing approval is unavailable.'},
+                                headers={'Cache-Control': 'no-store'})
+        instance_id, reason = control_ui_instance(user.id)
+        if instance_id is None:
+            raise HTTPException(503, {'code': reason or 'control_ui_unavailable',
+                                      'message': 'Your Control UI is unavailable.'},
+                                headers={'Cache-Control': 'no-store'})
+        client_ip = _request_client_ip(request.scope)
+        try:
+            result = service(user.id, client_ip, {'action': 'list'})
+            if inspect.isawaitable(result):
+                result = await result
+            if type(result) is not dict:
+                raise ControlUiPairingError(503, 'control_ui_pairing_unavailable')
+            return result
+        except ControlUiPairingError as error:
+            messages = {
+                'forbidden': 'The request could not be authorized.',
+                'control_ui_pairing_unavailable': 'Pairing approval is unavailable.',
+                'pairing_request_changed': 'The pairing request changed. Refresh the list.',
+            }
+            raise HTTPException(error.status, {
+                'code': error.code, 'message': messages.get(error.code, 'Pairing request failed.'),
+            }, headers={'Cache-Control': 'no-store'}) from None
+
+    @router.post('/me/control-ui/pairing/approve')
+    async def approve_control_ui_pairing(request: Request, response: Response,
+                                         user=Depends(actor)):
+        response.headers['Cache-Control'] = 'no-store'
+        service = control_ui_pairing_service
+        if not control_ui_enabled or not callable(service):
+            raise HTTPException(503, {'code': 'control_ui_pairing_unavailable',
+                                      'message': 'Pairing approval is unavailable.'},
+                                headers={'Cache-Control': 'no-store'})
+        payload = await mutation_body(request)
+        expected_keys = {'request_id', 'expected_device_id', 'expected_role',
+                         'expected_scopes', 'expected_client_id'}
+        allowed_scopes = {
+            'operator.read', 'operator.write', 'operator.approvals',
+            'operator.questions', 'operator.pairing',
+        }
+        if (type(payload) is not dict or set(payload) != expected_keys
+                or type(payload['request_id']) is not str
+                or re.fullmatch(r'[A-Za-z0-9_-]{16,128}', payload['request_id']) is None
+                or type(payload['expected_device_id']) is not str
+                or re.fullmatch(r'[A-Za-z0-9_-]{16,128}', payload['expected_device_id']) is None
+                or payload['expected_role'] != 'operator'
+                or payload['expected_client_id'] != 'openclaw-control-ui'
+                or type(payload['expected_scopes']) is not list
+                or not payload['expected_scopes']
+                or any(type(scope) is not str or scope not in allowed_scopes
+                       for scope in payload['expected_scopes'])
+                or payload['expected_scopes'] != sorted(set(payload['expected_scopes']))):
+            raise HTTPException(400, {'code': 'invalid_pairing_request',
+                                      'message': 'Invalid pairing approval request.'},
+                                headers={'Cache-Control': 'no-store'})
+        instance_id, reason = control_ui_instance(user.id)
+        if instance_id is None:
+            raise HTTPException(503, {'code': reason or 'control_ui_unavailable',
+                                      'message': 'Your Control UI is unavailable.'},
+                                headers={'Cache-Control': 'no-store'})
+        client_ip = _request_client_ip(request.scope)
+        sidecar_payload = {
+            'action': 'approve',
+            'requestId': payload['request_id'],
+            'expectedDeviceId': payload['expected_device_id'],
+            'expectedRole': payload['expected_role'],
+            'expectedScopes': payload['expected_scopes'],
+            'expectedClientId': payload['expected_client_id'],
+        }
+        try:
+            result = service(user.id, client_ip, sidecar_payload)
+            if inspect.isawaitable(result):
+                result = await result
+            if type(result) is not dict:
+                raise ControlUiPairingError(503, 'control_ui_pairing_unavailable')
+        except ControlUiPairingError as error:
+            messages = {
+                'forbidden': 'The request could not be authorized.',
+                'control_ui_pairing_unavailable': 'Pairing approval is unavailable.',
+                'pairing_request_changed': 'The request changed or expired. Refresh the list.',
+            }
+            raise HTTPException(error.status, {
+                'code': error.code, 'message': messages.get(error.code, 'Pairing request failed.'),
+            }, headers={'Cache-Control': 'no-store'}) from None
+        return result
 
     @router.post("/me/control-ui/revoke")
     async def revoke_control_ui(request: Request, response: Response, user=Depends(actor)):

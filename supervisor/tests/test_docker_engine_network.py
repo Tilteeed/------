@@ -957,6 +957,10 @@ class DockerEngineNetworkTests(unittest.TestCase):
                 {'type': 'local', 'dst': network['gateway'], 'dev': network['bridge'],
                  'protocol': 'kernel', 'scope': 'host', 'prefsrc': network['gateway']},
                 {'type': 'broadcast',
+                 'dst': str(ipaddress.IPv4Network(network['subnet']).network_address),
+                 'dev': network['bridge'], 'protocol': 'kernel', 'scope': 'link',
+                 'prefsrc': network['gateway']},
+                {'type': 'broadcast',
                  'dst': str(ipaddress.IPv4Network(network['subnet']).broadcast_address),
                  'dev': network['bridge'], 'protocol': 'kernel', 'scope': 'link',
                  'prefsrc': network['gateway']},
@@ -1003,8 +1007,9 @@ class DockerEngineNetworkTests(unittest.TestCase):
         foreign_rows = [*route_rows, {
             'type': 'broadcast',
             'dst': str(ipaddress.IPv4Network(
-                plan['agent']['subnet']).broadcast_address),
+                plan['agent']['subnet']).network_address),
             'dev': plan['agent']['bridge'], 'protocol': 'static', 'scope': 'link',
+            'prefsrc': plan['agent']['gateway'],
         }]
         inventory = parse_ipv4_networks(foreign_rows, address_rows)
         with self.assertRaises(DockerEngineError):

@@ -173,6 +173,94 @@ class PlatformApiTests(unittest.TestCase):
             self.store.consume_control_ui_ticket(result["launch_ticket"], audience=origin)
         self.assertEqual(runtime.calls, ["alice", "bob", "bob", "alice"])
 
+    def test_control_ui_pairing_routes_are_owner_scoped_and_require_explicit_limited_approval(self):
+        instance_id = 'a' * 32
+        scopes = ['operator.approvals', 'operator.pairing', 'operator.questions',
+                  'operator.read', 'operator.write']
+
+        class Runtime:
+            def get(self, owner_id):
+                if owner_id == 'alice':
+                    return {'runtime': {'state': 'running', 'gateway': 'ready',
+                                        'instance_id': instance_id,
+                                        'network_profile': 'agent_proxy_v1'}}
+                return {'runtime': {'state': 'not_created', 'gateway': 'not_connected',
+                                    'instance_id': None}}
+            def control_ui_target(self, owner_id, target_instance_id):
+                if owner_id == 'alice' and target_instance_id == instance_id:
+                    return {'ip': '172.31.0.2', 'port': 18790, 'proxy_token': 'P' * 43}
+                return None
+
+        calls = []
+        async def pairing_service(owner_id, client_ip, payload):
+            calls.append((owner_id, client_ip, payload))
+            if payload == {'action': 'list'}:
+                return {'requests': [{
+                    'request_id': 'req_1234567890123456',
+                    'device_id': 'b' * 64,
+                    'role': 'operator', 'scopes': scopes,
+                    'client_id': 'openclaw-control-ui',
+                    'display_name': 'Personal browser', 'platform': 'Linux',
+                    'created_at_ms': 1780000000000,
+                    'approvable': True, 'reason': None,
+                }]}
+            return {'approved': True, 'device_id': 'b' * 64, 'scopes': scopes}
+
+        app = FastAPI()
+        app.include_router(api.create_router(
+            verified_test_user, self.store, runtime=Runtime(),
+            public_origin='https://bezr.example.test',
+            control_ui_domain='agents.example.test', control_ui_proxy_ready=True,
+            control_ui_pairing_service=pairing_service))
+        client = TestClient(app, base_url='https://bezr.example.test',
+                            client=('198.51.100.7', 12345))
+        self.addCleanup(client.close)
+        forwarded = {'X-Forwarded-For': '198.51.100.7', 'X-Forwarded-Proto': 'https'}
+        listing = client.get(self.base + '/control-ui/pairing',
+                             headers={**self.alice, **forwarded})
+        self.assertEqual(listing.status_code, 200, listing.text)
+        self.assertEqual(listing.json()['requests'][0]['device_id'], 'b' * 64)
+        self.assertEqual(calls[0], ('alice', '198.51.100.7', {'action': 'list'}))
+        self.assertNotIn('proxy_token', listing.text)
+        self.assertNotIn('operator.admin', listing.text)
+        insecure_client = TestClient(app, base_url='http://bezr.example.test',
+                                     client=('198.51.100.7', 12345))
+        self.addCleanup(insecure_client.close)
+        insecure = insecure_client.get(self.base + '/control-ui/pairing',
+                                      headers={**self.alice, **forwarded})
+        self.assertEqual(insecure.status_code, 403)
+        self.assertEqual(len(calls), 1)
+        idor = client.post(self.base + '/control-ui/pairing/approve',
+            headers={**self.alice, **forwarded, 'Origin': 'https://bezr.example.test'},
+            json={'instance_id': 'c' * 32, 'request_id': 'req_1234567890123456',
+                  'expected_device_id': 'b' * 64, 'expected_role': 'operator',
+                  'expected_scopes': scopes, 'expected_client_id': 'openclaw-control-ui'})
+        self.assertEqual(idor.status_code, 400)
+        self.assertEqual(len(calls), 1)
+
+        approval = client.post(self.base + '/control-ui/pairing/approve',
+            headers={**self.alice, **forwarded, 'Origin': 'https://bezr.example.test'},
+            json={'request_id': 'req_1234567890123456', 'expected_device_id': 'b' * 64,
+                  'expected_role': 'operator', 'expected_scopes': scopes,
+                  'expected_client_id': 'openclaw-control-ui'})
+        self.assertEqual(approval.status_code, 200, approval.text)
+        self.assertTrue(approval.json()['approved'])
+        self.assertEqual(calls[1][0], 'alice')
+        self.assertEqual(calls[1][2]['action'], 'approve')
+        self.assertNotIn('operator.admin', calls[1][2]['expectedScopes'])
+
+        denied = client.get(self.base + '/control-ui/pairing',
+                            headers={**self.bob, **forwarded})
+        self.assertEqual(denied.status_code, 503)
+        self.assertEqual(len(calls), 2)
+        cross_origin = client.post(self.base + '/control-ui/pairing/approve',
+            headers={**self.alice, **forwarded, 'Origin': 'https://attacker.invalid'},
+            json={'request_id': 'req_1234567890123456', 'expected_device_id': 'b' * 64,
+                  'expected_role': 'operator', 'expected_scopes': scopes,
+                  'expected_client_id': 'openclaw-control-ui'})
+        self.assertEqual(cross_origin.status_code, 403)
+        self.assertEqual(len(calls), 2)
+
     def test_control_ui_status_rejects_legacy_network_even_when_gateway_is_ready(self):
         instance_id = 'c' * 32
         class Runtime:

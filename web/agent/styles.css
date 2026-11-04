@@ -73,6 +73,14 @@ input:disabled, textarea:disabled { color: #a5a8b6; background: #13141a; }
 dt { color: var(--muted); }
 dd { margin: 0; text-align: right; color: #c9ccd8; }
 .lifecycle { display: flex; flex-wrap: wrap; gap: 8px; }
+.pairing-controls { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
+.pairing-controls h3 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+.pairing-controls .field-help { margin-bottom: 12px; }
+#pairing-status { color: var(--muted); font-size: 12px; }
+#pairing-requests { list-style: none; padding: 0; margin: 10px 0 0; }
+#pairing-requests li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; border-top: 1px solid var(--border); padding: 12px 0; }
+#pairing-requests li p { margin: 3px 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+#pairing-requests button { font-size: 12px; }
 #retained-list { list-style: none; padding: 0; margin: 16px 0 0; }
 #retained-list li { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; border-top: 1px solid var(--border); padding: 12px 0; }
 #retained-list li span { min-width: 0; overflow-wrap: anywhere; }

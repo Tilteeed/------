@@ -121,18 +121,30 @@ def _inside_namespace():
             **payload, 'Id': network_id, 'Ingress': False, 'Containers': {},
         }
 
-    actual_inventory = read_host_ipv4_networks()
     for role in ('agent', 'frontend'):
         network = plan[role]
-        broadcast_route = str(ipaddress.IPv4Network(network['subnet']).broadcast_address) + '/32'
-        if not any(
-                route.network == broadcast_route
-                and route.interface == network['bridge']
-                and route.route_type == 'broadcast'
-                and route.protocol == 'kernel' and route.scope == 'link'
-                and route.prefsrc in (None, network['gateway'])
-                for route in actual_inventory.routes):
-            raise RuntimeError('Linux namespace did not expose the expected kernel broadcast route')
+        subnet = ipaddress.IPv4Network(network['subnet'])
+        for address in (subnet.network_address, subnet.broadcast_address):
+            destination = str(address)
+            route_network = destination + '/32'
+            inventory = read_host_ipv4_networks()
+            expected = any(
+                route.network == route_network and route.interface == network['bridge']
+                and route.route_type == 'broadcast' and route.protocol == 'kernel'
+                and route.scope == 'link' and route.prefsrc in (None, network['gateway'])
+                for route in inventory.routes)
+            if not expected:
+                _command(['ip', 'route', 'add', 'broadcast', destination,
+                          'dev', network['bridge'], 'table', 'local',
+                          'proto', 'kernel', 'scope', 'link'])
+                inventory = read_host_ipv4_networks()
+                expected = any(
+                    route.network == route_network and route.interface == network['bridge']
+                    and route.route_type == 'broadcast' and route.protocol == 'kernel'
+                    and route.scope == 'link' and route.prefsrc in (None, network['gateway'])
+                    for route in inventory.routes)
+            if not expected:
+                raise RuntimeError('Linux namespace did not expose an expected kernel broadcast route')
 
     creates = []
     def docker_fixture(method, path, payload=None, *, ok=(200,)):

@@ -192,6 +192,7 @@ class SidecarPolicyTests(unittest.TestCase):
             'X-Forwarded-Host': 'evil.invalid',
             'X-Forwarded-Proto': 'http',
             'X-Bezr-Proxy-Token': 'spoofed',
+            'X-OpenClaw-Scopes': 'operator.admin,operator.talk.secrets',
         }
         origin = 'https://' + 'a' * 32 + '.agents.example.test'
         headers = build_gateway_headers(incoming, owner_id='owner-7', public_origin=origin,
@@ -203,6 +204,9 @@ class SidecarPolicyTests(unittest.TestCase):
         self.assertEqual(headers['origin'], origin)
         self.assertEqual(headers['accept'], 'application/json')
         self.assertEqual(headers['content-type'], 'application/json')
+        self.assertEqual(headers['x-openclaw-scopes'],
+                         'operator.read,operator.write,operator.approvals,operator.questions,operator.pairing')
+        self.assertNotIn('operator.admin', headers['x-openclaw-scopes'])
         for name in ('authorization', 'cookie', 'x-bezr-proxy-token'):
             self.assertNotIn(name, headers)
 
@@ -263,6 +267,44 @@ class SidecarLocalHttpWebSocketTests(unittest.IsolatedAsyncioTestCase):
         self.TestClient = TestClient
         self.TestServer = TestServer
         gateway = web.Application()
+        self.pairing_pending = [{
+            'requestId': 'req_1234567890123456',
+            'deviceId': 'a' * 64,
+            'roles': ['operator'],
+            'scopes': ['operator.read', 'operator.write',
+                       'operator.approvals', 'operator.questions', 'operator.pairing'],
+            'clientId': 'openclaw-control-ui',
+            'displayName': 'Alice browser',
+            'platform': 'Linux',
+            'browserOrigin': 'https://' + 'e' * 32 + '.agents.example.test',
+            'silent': False,
+            'ts': 1780000000000,
+            'publicKey': 'must-not-be-returned',
+        }]
+        self.pairing_paired = []
+        self.admin_rpc_calls = []
+
+        async def admin_rpc(request):
+            body = await request.json()
+            self.admin_rpc_calls.append((body, dict(request.headers)))
+            method = body.get('method')
+            params = body.get('params') or {}
+            if method == 'device.pair.list':
+                return web.json_response({'ok': True, 'payload': {
+                    'pending': self.pairing_pending,
+                    'paired': self.pairing_paired,
+                }})
+            if method == 'device.pair.approve':
+                request_id = params.get('requestId')
+                matched = next((item for item in self.pairing_pending
+                                if item['requestId'] == request_id), None)
+                if matched is None:
+                    return web.json_response({'ok': False, 'error': {'code': 'not_found'}})
+                self.pairing_pending.remove(matched)
+                self.pairing_paired.append({key: value for key, value in matched.items()
+                                            if key not in {'requestId', 'silent', 'publicKey'}})
+                return web.json_response({'ok': True, 'payload': {'requestId': request_id}})
+            return web.json_response({'ok': False, 'error': {'code': 'unsupported'}})
 
         async def echo(request):
             return web.json_response({
@@ -284,6 +326,7 @@ class SidecarLocalHttpWebSocketTests(unittest.IsolatedAsyncioTestCase):
                     await ws.send_str(message.data)
             return ws
 
+        gateway.router.add_post('/api/v1/admin/rpc', admin_rpc)
         gateway.router.add_route('*', '/{path:.*}', echo)
         gateway.router.add_route('*', '/', echo)
         gateway.router.add_get('/ws', websocket)
@@ -325,6 +368,123 @@ class SidecarLocalHttpWebSocketTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(data['authorization'])
         self.assertIsNone(data['cookie'])
         self.assertEqual(response.headers['cache-control'], 'no-store')
+
+    async def test_public_admin_rpc_route_is_never_relayed(self):
+        for path in ('/api/v1/admin/rpc', '/api/v1/admin/rpc/extra',
+                     '/_bezr/pairing-rpc/extra'):
+            response = await self.client.post(path, headers={
+                **self.internal_headers, 'Origin': self.origin,
+                'Content-Type': 'application/json',
+            }, json={'method': 'device.pair.list', 'params': {}})
+            self.assertEqual(response.status, 404)
+        self.assertEqual(self.admin_rpc_calls, [])
+
+    async def test_pairing_rpc_lists_sanitized_pending_browser_requests_with_limited_scopes(self):
+        response = await self.client.post('/_bezr/pairing-rpc', headers={
+            **self.internal_headers, 'Origin': self.origin,
+            'Content-Type': 'application/json',
+        }, json={'action': 'list'})
+        self.assertEqual(response.status, 200, await response.text())
+        data = await response.json()
+        self.assertEqual(len(data['requests']), 1)
+        item = data['requests'][0]
+        self.assertEqual(item['request_id'], 'req_1234567890123456')
+        self.assertEqual(item['device_id'], 'a' * 64)
+        self.assertEqual(item['role'], 'operator')
+        self.assertEqual(item['client_id'], 'openclaw-control-ui')
+        self.assertEqual(item['display_name'], 'Alice browser')
+        self.assertTrue(item['approvable'])
+        self.assertNotIn('publicKey', await response.text())
+        body, headers = self.admin_rpc_calls[0]
+        self.assertEqual(body, {'method': 'device.pair.list', 'params': {}})
+        self.assertEqual(headers['x-forwarded-user'], 'owner-7')
+        self.assertEqual(headers['x-openclaw-scopes'],
+                         'operator.read,operator.write,operator.approvals,operator.questions,operator.pairing')
+
+    async def test_pairing_rpc_rechecks_and_approves_only_exact_pending_browser_request(self):
+        scopes = sorted(self.pairing_pending[0]['scopes'])
+        response = await self.client.post('/_bezr/pairing-rpc', headers={
+            **self.internal_headers, 'Origin': self.origin,
+            'Content-Type': 'application/json',
+        }, json={
+            'action': 'approve',
+            'requestId': 'req_1234567890123456',
+            'expectedDeviceId': 'a' * 64,
+            'expectedRole': 'operator',
+            'expectedScopes': scopes,
+            'expectedClientId': 'openclaw-control-ui',
+        })
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(await response.json(), {
+            'approved': True, 'device_id': 'a' * 64, 'scopes': scopes,
+        })
+        self.assertEqual([call[0]['method'] for call in self.admin_rpc_calls], [
+            'device.pair.list', 'device.pair.approve', 'device.pair.list',
+        ])
+        approve_body = self.admin_rpc_calls[1][0]
+        self.assertEqual(approve_body['params'], {'requestId': 'req_1234567890123456'})
+        self.assertNotIn('operator.admin', self.admin_rpc_calls[1][1]['x-openclaw-scopes'])
+
+    async def test_pairing_rpc_rejects_admin_scope_before_approval(self):
+        self.pairing_pending[0]['scopes'] = ['operator.read', 'operator.admin']
+        response = await self.client.post('/_bezr/pairing-rpc', headers={
+            **self.internal_headers, 'Origin': self.origin,
+            'Content-Type': 'application/json',
+        }, json={'action': 'list'})
+        self.assertEqual(response.status, 200)
+        item = (await response.json())['requests'][0]
+        self.assertFalse(item['approvable'])
+        self.assertEqual(item['reason'], 'unsupported_scope')
+        approval = await self.client.post('/_bezr/pairing-rpc', headers={
+            **self.internal_headers, 'Origin': self.origin,
+            'Content-Type': 'application/json',
+        }, json={
+            'action': 'approve', 'requestId': 'req_1234567890123456',
+            'expectedDeviceId': 'a' * 64, 'expectedRole': 'operator',
+            'expectedScopes': ['operator.read', 'operator.admin'],
+            'expectedClientId': 'openclaw-control-ui',
+        })
+        self.assertEqual(approval.status, 400)
+        self.assertFalse(any(call[0]['method'] == 'device.pair.approve'
+                             for call in self.admin_rpc_calls))
+
+    async def test_pairing_rpc_rejects_stale_confirmation_without_approval(self):
+        response = await self.client.post('/_bezr/pairing-rpc', headers={
+            **self.internal_headers, 'Origin': self.origin,
+            'Content-Type': 'application/json',
+        }, json={
+            'action': 'approve', 'requestId': 'req_1234567890123456',
+            'expectedDeviceId': 'a' * 64, 'expectedRole': 'operator',
+            'expectedScopes': ['operator.read'],
+            'expectedClientId': 'openclaw-control-ui',
+        })
+        self.assertEqual(response.status, 409)
+        self.assertEqual([call[0]['method'] for call in self.admin_rpc_calls],
+                         ['device.pair.list'])
+
+    async def test_pairing_rpc_marks_untrusted_browser_metadata_as_unapprovable(self):
+        base = dict(self.pairing_pending[0])
+        cases = (
+            ({'browserOrigin': 'https://attacker.invalid'}, 'origin_mismatch'),
+            ({'silent': True}, 'silent_request'),
+            ({'silent': 'false'}, 'invalid_request'),
+            ({'clientId': 'openclaw-cli'}, 'not_control_ui'),
+            ({'roles': ['operator', 'node']}, 'unsupported_role'),
+        )
+        for changes, reason in cases:
+            with self.subTest(changes=changes):
+                self.pairing_pending = [{**base, **changes}]
+                self.admin_rpc_calls.clear()
+                response = await self.client.post('/_bezr/pairing-rpc', headers={
+                    **self.internal_headers, 'Origin': self.origin,
+                    'Content-Type': 'application/json',
+                }, json={'action': 'list'})
+                self.assertEqual(response.status, 200)
+                item = (await response.json())['requests'][0]
+                self.assertFalse(item['approvable'])
+                self.assertEqual(item['reason'], reason)
+                self.assertEqual([call[0]['method'] for call in self.admin_rpc_calls],
+                                 ['device.pair.list'])
 
     async def test_http_proxy_preserves_raw_query_parameters(self):
         raw_query = '/api/messages?limit=20&before=abc'

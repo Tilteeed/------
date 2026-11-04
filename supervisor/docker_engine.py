@@ -787,9 +787,11 @@ class DockerEngine:
             if (route_network == local_gateway_route and route.route_type == 'local'
                     and route.scope == 'host'):
                 continue
-            broadcast_route = ipaddress.IPv4Network(
-                str(subnet.broadcast_address) + '/32')
-            if (route_network == broadcast_route and route.route_type == 'broadcast'
+            broadcast_routes = {
+                ipaddress.IPv4Network(str(address) + '/32')
+                for address in (subnet.network_address, subnet.broadcast_address)
+            }
+            if (route_network in broadcast_routes and route.route_type == 'broadcast'
                     and route.scope == 'link'):
                 continue
             return True

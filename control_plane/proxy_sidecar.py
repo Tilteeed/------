@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import hmac
 import http.client
 import ipaddress
+import json
 import os
 import re
 import stat
@@ -19,12 +20,26 @@ MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_WS_MESSAGE_BYTES = 16 * 1024 * 1024
 SIDECAR_PORT = 18790
 GATEWAY_PORT = 18789
+CONTROL_UI_OPERATOR_SCOPES = (
+    'operator.read', 'operator.write', 'operator.approvals',
+    'operator.questions', 'operator.pairing',
+)
+_CONTROL_UI_SCOPES_HEADER = ','.join(CONTROL_UI_OPERATOR_SCOPES)
 SIDECAR_TOKEN_FILE = '/run/secrets/bezr-proxy-token'
 _TOKEN_FILE_ENV = 'BEZR_SIDECAR_PROXY_TOKEN_FILE'
 _OWNER_RE = re.compile(r"[^\x00-\x20\x7f]{1,256}\Z")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{40,64}\Z")
 _ORIGIN_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _HEADER_TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}\Z")
+_PAIRING_ID_RE = re.compile(r'[A-Za-z0-9_-]{16,128}\Z')
+_PAIRING_DEVICE_RE = re.compile(r'[A-Za-z0-9_-]{16,128}\Z')
+_PAIRING_SCOPE_RE = re.compile(r'[a-z][a-z0-9._-]{0,63}\Z')
+_PAIRING_RPC_PATH = '/_bezr/pairing-rpc'
+_ADMIN_RPC_PATH = '/api/v1/admin/rpc'
+_PAIRING_SCOPES = frozenset(CONTROL_UI_OPERATOR_SCOPES)
+_MAX_PAIRING_REQUESTS = 64
+_MAX_PAIRING_BODY = 8192
+_MAX_PAIRING_RPC_RESPONSE = 65536
 _ALLOWED_REQUEST_HEADERS = {
     'accept', 'accept-encoding', 'accept-language', 'cache-control',
     'content-type', 'if-match', 'if-modified-since', 'if-none-match',
@@ -157,7 +172,100 @@ def build_gateway_headers(incoming, *, owner_id, public_origin, client_ip):
     output['x-forwarded-for'] = client_ip
     output['x-forwarded-proto'] = 'https'
     output['x-forwarded-host'] = host
+    output['x-openclaw-scopes'] = _CONTROL_UI_SCOPES_HEADER
     return output
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('Duplicate JSON fields')
+        result[key] = value
+    return result
+
+
+def _pairing_path(value):
+    try:
+        path = urlsplit(value).path
+    except (TypeError, ValueError):
+        return None
+    for _ in range(5):
+        decoded = unquote(path)
+        if decoded == path:
+            return path
+        path = decoded
+    return path if '%' not in path else None
+
+
+def _safe_label(value, fallback, limit=96):
+    if type(value) is not str:
+        return fallback
+    value = ''.join(char for char in value if ord(char) >= 32 and ord(char) != 127)
+    return value[:limit] or fallback
+
+
+def _pairing_request_view(item, expected_origin):
+    if type(item) is not dict:
+        raise ValueError('Invalid pairing request')
+    request_id = item.get('requestId')
+    device_id = item.get('deviceId')
+    if (type(request_id) is not str or _PAIRING_ID_RE.fullmatch(request_id) is None
+            or type(device_id) is not str or _PAIRING_DEVICE_RE.fullmatch(device_id) is None):
+        raise ValueError('Invalid pairing request identity')
+    roles = item.get('roles')
+    if roles is None and type(item.get('role')) is str:
+        roles = [item['role']]
+    if (type(roles) is not list or not roles or len(roles) > 4
+            or any(type(role) is not str or len(role) > 64 for role in roles)):
+        role_list = []
+    else:
+        role_list = list(roles)
+    role = ','.join(role_list) if role_list else 'unknown'
+    scopes = item.get('scopes')
+    scope_list_valid = (type(scopes) is list and len(scopes) <= 16
+                        and all(type(scope) is str and _PAIRING_SCOPE_RE.fullmatch(scope)
+                                for scope in scopes)
+                        and len(set(scopes)) == len(scopes))
+    scope_list = sorted(scopes) if type(scopes) is list and scope_list_valid else []
+    silent = item.get('silent', False)
+    if role_list != ['operator']:
+        reason = 'unsupported_role'
+    elif not scope_list_valid or not scope_list or not set(scope_list).issubset(_PAIRING_SCOPES):
+        reason = 'unsupported_scope'
+    elif item.get('clientId') != 'openclaw-control-ui':
+        reason = 'not_control_ui'
+    elif item.get('browserOrigin') != expected_origin:
+        reason = 'origin_mismatch'
+    elif type(silent) is not bool:
+        reason = 'invalid_request'
+    elif silent:
+        reason = 'silent_request'
+    else:
+        reason = None
+    timestamp = item.get('ts')
+    if type(timestamp) is not int or timestamp < 0:
+        timestamp = None
+    return {
+        'request_id': request_id,
+        'device_id': device_id,
+        'role': role,
+        'scopes': scope_list,
+        'client_id': _safe_label(item.get('clientId'), 'unknown-client', 64),
+        'display_name': _safe_label(item.get('displayName'), 'OpenClaw Control UI'),
+        'platform': _safe_label(item.get('platform'), 'unknown', 64),
+        'created_at_ms': timestamp,
+        'approvable': reason is None,
+        'reason': reason,
+    }
+
+
+def _approval_matches(view, body):
+    return (view['approvable'] is True
+            and body.get('expectedDeviceId') == view['device_id']
+            and body.get('expectedRole') == view['role']
+            and body.get('expectedScopes') == view['scopes']
+            and body.get('expectedClientId') == view['client_id'])
 
 
 def normalize_target_path(value):
@@ -214,6 +322,116 @@ def _create_app(config):
     timeout = aiohttp.ClientTimeout(total=60, connect=5, sock_read=30)
     gateway_base = f'http://{config.gateway_ip}:{GATEWAY_PORT}'
 
+    async def gateway_admin_rpc(method, params, client_ip):
+        headers = build_gateway_headers({'content-type': 'application/json'},
+                                        owner_id=config.owner_id,
+                                        public_origin=config.public_origin,
+                                        client_ip=client_ip)
+        try:
+            async with aiohttp.ClientSession(
+                    timeout=timeout, trust_env=False, auto_decompress=False) as session:
+                async with session.post(
+                        gateway_base + _ADMIN_RPC_PATH, headers=headers,
+                        json={'method': method, 'params': params},
+                        allow_redirects=False) as response:
+                    raw = await response.content.read(_MAX_PAIRING_RPC_RESPONSE + 1)
+                    if len(raw) > _MAX_PAIRING_RPC_RESPONSE:
+                        raise web.HTTPBadGateway(headers={'Cache-Control': 'no-store'})
+                    if method == 'device.pair.approve' and response.status in {400, 404, 409}:
+                        raise web.HTTPConflict(headers={'Cache-Control': 'no-store'})
+                    if response.status != 200:
+                        raise web.HTTPBadGateway(headers={'Cache-Control': 'no-store'})
+        except web.HTTPException:
+            raise
+        except Exception:
+            raise web.HTTPBadGateway(headers={'Cache-Control': 'no-store'}) from None
+        try:
+            envelope = json.loads(raw, object_pairs_hook=_unique_json_object)
+        except (ValueError, UnicodeError, RecursionError):
+            raise web.HTTPBadGateway(headers={'Cache-Control': 'no-store'}) from None
+        if (type(envelope) is not dict or envelope.get('ok') is not True
+                or type(envelope.get('payload')) is not dict):
+            error = envelope.get('error') if type(envelope) is dict else None
+            code = error.get('code') if type(error) is dict else None
+            if method == 'device.pair.approve' and code in {
+                    'not_found', 'request_not_found', 'device_pairing_request_not_found'}:
+                raise web.HTTPConflict(headers={'Cache-Control': 'no-store'})
+            raise web.HTTPBadGateway(headers={'Cache-Control': 'no-store'})
+        return envelope['payload']
+
+    async def list_pairings(client_ip):
+        payload = await gateway_admin_rpc('device.pair.list', {}, client_ip)
+        pending = payload.get('pending')
+        paired = payload.get('paired')
+        if (type(pending) is not list or len(pending) > _MAX_PAIRING_REQUESTS
+                or type(paired) is not list or len(paired) > _MAX_PAIRING_REQUESTS * 4):
+            raise web.HTTPBadGateway(headers={'Cache-Control': 'no-store'})
+        try:
+            views = [_pairing_request_view(item, config.public_origin) for item in pending]
+        except (TypeError, ValueError):
+            raise web.HTTPBadGateway(headers={'Cache-Control': 'no-store'}) from None
+        return views, pending, paired
+
+    async def pairing_rpc(request, client_ip):
+        if request.method != 'POST' or request.rel_url.query_string:
+            raise web.HTTPNotFound(headers={'Cache-Control': 'no-store'})
+        raw = await request.read()
+        if len(raw) > _MAX_PAIRING_BODY:
+            raise web.HTTPRequestEntityTooLarge(_MAX_PAIRING_BODY, len(raw))
+        try:
+            body = json.loads(raw, object_pairs_hook=_unique_json_object)
+        except (ValueError, UnicodeError, RecursionError):
+            raise web.HTTPBadRequest(headers={'Cache-Control': 'no-store'}) from None
+        if type(body) is not dict:
+            raise web.HTTPBadRequest(headers={'Cache-Control': 'no-store'})
+        if body == {'action': 'list'}:
+            views, _pending, _paired = await list_pairings(client_ip)
+            return web.json_response({'requests': views}, headers={'Cache-Control': 'no-store'})
+        expected = {'action', 'requestId', 'expectedDeviceId', 'expectedRole',
+                    'expectedScopes', 'expectedClientId'}
+        if set(body) != expected or body.get('action') != 'approve':
+            raise web.HTTPBadRequest(headers={'Cache-Control': 'no-store'})
+        if (type(body['requestId']) is not str
+                or _PAIRING_ID_RE.fullmatch(body['requestId']) is None
+                or type(body['expectedDeviceId']) is not str
+                or _PAIRING_DEVICE_RE.fullmatch(body['expectedDeviceId']) is None
+                or body['expectedRole'] != 'operator'
+                or type(body['expectedClientId']) is not str
+                or body['expectedClientId'] != 'openclaw-control-ui'
+                or type(body['expectedScopes']) is not list
+                or len(body['expectedScopes']) > len(_PAIRING_SCOPES)
+                or any(type(scope) is not str or scope not in _PAIRING_SCOPES
+                       for scope in body['expectedScopes'])
+                or body['expectedScopes'] != sorted(set(body['expectedScopes']))):
+            raise web.HTTPBadRequest(headers={'Cache-Control': 'no-store'})
+        views, pending, _paired = await list_pairings(client_ip)
+        matches = [view for view in views if view['request_id'] == body['requestId']]
+        if len(matches) != 1 or not _approval_matches(matches[0], body):
+            raise web.HTTPConflict(headers={'Cache-Control': 'no-store'})
+        request_view = matches[0]
+        try:
+            await gateway_admin_rpc('device.pair.approve',
+                                    {'requestId': request_view['request_id']}, client_ip)
+        except web.HTTPConflict:
+            raise
+        views_after, pending_after, paired_after = await list_pairings(client_ip)
+        if any(view['request_id'] == request_view['request_id'] for view in views_after):
+            raise web.HTTPBadGateway(headers={'Cache-Control': 'no-store'})
+        device = next((item for item in paired_after
+                       if type(item) is dict and item.get('deviceId') == request_view['device_id']), None)
+        roles = device.get('roles') if type(device) is dict else None
+        if roles is None and type(device) is dict and type(device.get('role')) is str:
+            roles = [device['role']]
+        paired_scopes = device.get('scopes') if type(device) is dict else None
+        if (type(device) is not dict or roles != ['operator']
+                or type(paired_scopes) is not list
+                or sorted(paired_scopes) != request_view['scopes']):
+            raise web.HTTPBadGateway(headers={'Cache-Control': 'no-store'})
+        return web.json_response({
+            'approved': True, 'device_id': request_view['device_id'],
+            'scopes': request_view['scopes'],
+        }, headers={'Cache-Control': 'no-store'})
+
     def check_request(request):
         if not authorize_internal_request(request.headers, config):
             raise web.HTTPNotFound(headers={'Cache-Control': 'no-store'})
@@ -232,6 +450,17 @@ def _create_app(config):
 
     async def proxy_http(request):
         path, client_ip = check_request(request)
+        decoded_path = _pairing_path(path)
+        if decoded_path == _PAIRING_RPC_PATH:
+            return await pairing_rpc(request, client_ip)
+        if decoded_path is None:
+            raise web.HTTPNotFound(headers={'Cache-Control': 'no-store'})
+        normalized_path = decoded_path.rstrip('/')
+        if (normalized_path == _ADMIN_RPC_PATH
+                or normalized_path.startswith(_ADMIN_RPC_PATH + '/')
+                or normalized_path == _PAIRING_RPC_PATH
+                or normalized_path.startswith(_PAIRING_RPC_PATH + '/')):
+            raise web.HTTPNotFound(headers={'Cache-Control': 'no-store'})
         if request.headers.get('Upgrade', '').lower() == 'websocket':
             return await proxy_websocket(request, path, client_ip)
         body = await request.read()

@@ -49,6 +49,13 @@
               <button class="primary" type="button" id="open-agent" disabled>Открыть агента</button>
               <p class="field-help" id="control-ui-help" role="status" aria-live="polite">Прокси ещё не подключён.</p>
             </div>
+            <div id="control-ui-pairing" class="pairing-controls" hidden>
+              <h3>Сопряжение браузера</h3>
+              <p class="field-help">Откройте штатный Control UI. Если он показывает запрос на сопряжение, проверьте клиента и запрошенные полномочия ниже; одобрение выполняется только после вашего нажатия.</p>
+              <button type="button" id="refresh-pairing" disabled>Проверить запросы</button>
+              <p id="pairing-status" role="status" aria-live="polite">Запросы ещё не проверялись.</p>
+              <ul id="pairing-requests" aria-label="Запросы сопряжения"></ul>
+            </div>
             <div class="lifecycle" role="group" aria-label="Управление агентом" aria-describedby="lifecycle-help"><button data-action="create" disabled>Создать</button><button data-action="start" disabled>Запустить</button><button data-action="stop" disabled>Остановить</button><button data-action="restart" disabled>Перезапустить</button><button data-action="remove" disabled>Удалить, сохранить данные</button><button data-action="restore" disabled hidden>Продолжить восстановление</button><button data-action="purge" disabled>Удалить данные и квоту</button></div>
             <button type="button" id="refresh-runtime">Обновить состояние</button><p class="field-help" id="lifecycle-help">Создание и запуск требуют готовых метрик и проверенной квоты. Модель, чат с агентом и Telegram пока не подключены. Инструкции применяются при первоначальном создании; последующие сохранения остаются черновиком.</p>
           </section>

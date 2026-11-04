@@ -106,7 +106,8 @@ class AccessProxyRequestTests(unittest.TestCase):
             'X-Forwarded-Proto': 'https',
         }
 
-    def make_app(self, *, state='running', profile='agent_proxy_v1', ws_recheck_seconds: float = 15.0):
+    def make_app(self, *, state='running', profile='agent_proxy_v1', ws_recheck_seconds: float = 15.0,
+                 transport_override=None):
         import asyncio
         import aiohttp
         from control_plane.access_proxy import create_control_ui_access_proxy
@@ -154,7 +155,7 @@ class AccessProxyRequestTests(unittest.TestCase):
 
         self_instance = self.instance_id
         runtime = Runtime()
-        transport = Transport()
+        transport = transport_override if transport_override is not None else Transport()
         target = {'ip': '172.31.0.2', 'port': 18790, 'proxy_token': 'T' * 43}
         app = create_control_ui_access_proxy(
             self.store, runtime, public_origin='https://bezr.example.test',
@@ -187,6 +188,57 @@ class AccessProxyRequestTests(unittest.TestCase):
         denied = client.get('/assets/app.js', headers={'Cookie': '__Host-bezr-control-ui=invalid'})
         self.assertEqual(denied.status_code, 404)
         self.assertEqual(len(transport.calls), 1)
+
+    def test_public_proxy_blocks_private_pairing_and_admin_rpc_endpoints(self):
+        app, transport = self.make_app()
+        client = TestClient(app, base_url=self.origin, client=('198.51.100.7', 12345))
+        self.addCleanup(client.close)
+        for path in ('/api/v1/admin/rpc', '/api/v1/admin/rpc/',
+                     '/api/v1/admin/rpc/extra', '/%61pi/v1/admin/rpc',
+                     '/_bezr/pairing-rpc', '/_bezr/pairing-rpc/extra',
+                     '/_bezr/%70airing-rpc'):
+            with self.subTest(path=path):
+                response = client.post(path, headers={
+                    **self.forwarded_headers,
+                    'Cookie': '__Host-bezr-control-ui=' + self.session_id,
+                    'Origin': self.origin,
+                    'Content-Type': 'application/json',
+                }, json={'method': 'device.pair.approve', 'params': {'requestId': 'x'}})
+                self.assertEqual(response.status_code, 404)
+        self.assertEqual(transport.calls, [])
+
+    def test_pairing_service_rechecks_owner_runtime_and_calls_only_private_sidecar_route(self):
+        import asyncio
+        import json
+        class PairingTransport:
+            def __init__(self):
+                self.calls = []
+            async def request(self, target, method, path, headers, body):
+                self.calls.append((target, method, path, headers, body))
+                return 200, {'Content-Type': 'application/json'}, b'{"requests":[]}'
+        transport = PairingTransport()
+        app, transport = self.make_app(transport_override=transport)
+        result = asyncio.run(app.state.pairing_service(
+            'alice', '198.51.100.7', {'action': 'list'}))
+        self.assertEqual(result, {'requests': []})
+        self.assertEqual(len(transport.calls), 1)
+        target, method, path, headers, body = transport.calls[0]
+        self.assertEqual(target['ip'], '172.31.0.2')
+        self.assertEqual((method, path), ('POST', '/_bezr/pairing-rpc'))
+        self.assertEqual(json.loads(body), {'action': 'list'})
+        self.assertEqual(headers['authorization'], 'Bearer ' + 'T' * 43)
+        self.assertEqual(headers['x-bezr-host'], self.instance_id + '.agents.example.test')
+        self.assertEqual(headers['x-bezr-client-ip'], '198.51.100.7')
+
+        stopped_app, stopped_transport = self.make_app(state='stopped')
+        from control_plane.access_proxy import ControlUiPairingError
+        with self.assertRaises(ControlUiPairingError):
+            asyncio.run(stopped_app.state.pairing_service(
+                'alice', '198.51.100.7', {'action': 'list'}))
+        self.assertEqual(stopped_transport.calls, [])
+        with self.assertRaises(ControlUiPairingError):
+            asyncio.run(app.state.pairing_service(
+                'bob', '198.51.100.7', {'action': 'list'}))
 
     def test_access_proxy_rejects_plain_http_origin_before_relay(self):
         app, transport = self.make_app()

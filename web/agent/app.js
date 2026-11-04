@@ -15,6 +15,7 @@ let capabilities = {};
 let connected = false;
 let workspaceBusy = 0;
 let controlUi = { available: false, origin: null, loading: false, busy: false };
+let pairing = { loading: false, approving: false, requests: [] };
 const operationMemory = new Map();
 let sessionStorageAvailable = true;
 
@@ -355,6 +356,13 @@ function controls() {
   $('refresh-events').disabled = !authenticated || workspaceLocked || eventsBusy;
   $('open-agent').disabled = !authenticated || workspaceLocked || controlUi.busy
     || controlUi.loading || !controlUi.available;
+  $('control-ui-pairing').hidden = !authenticated || !controlUi.available;
+  $('refresh-pairing').disabled = !authenticated || !controlUi.available || workspaceLocked
+    || controlUi.busy || pairing.loading || pairing.approving;
+  for (const button of document.querySelectorAll('#pairing-requests [data-pairing-approve]')) {
+    button.disabled = !authenticated || !controlUi.available || workspaceLocked
+      || pairing.loading || pairing.approving || button.dataset.approvable !== 'true';
+  }
   for (const button of document.querySelectorAll('[data-action]')) {
     const action = button.dataset.action;
     const exists = Boolean(runtimeData.instance_id) && !['removed', 'purged'].includes(runtimeData.state);
@@ -406,7 +414,10 @@ function revoke() {
   runtimeData = { state: 'not_connected' };
   capabilities = {};
   controlUi = { available: false, origin: null, loading: false, busy: false };
+  pairing = { loading: false, approving: false, requests: [] };
   $('control-ui-help').textContent = 'Войдите в BEZR, чтобы проверить доступность прокси.';
+  $('pairing-status').textContent = 'Список запросов недоступен без подтверждённого доступа.';
+  $('pairing-requests').replaceChildren();
   dirty = false;
   $('identity').textContent = 'Учётная запись не подтверждена';
   $('agent-name').value = '';
@@ -469,6 +480,9 @@ function applyDraft(draft) {
 async function refreshControlUiStatus(epoch = identityEpoch) {
   if (!authenticated || controlUi.loading) return;
   controlUi = { ...controlUi, available: false, origin: null, loading: true };
+  pairing = { loading: false, approving: false, requests: [] };
+  $('pairing-status').textContent = 'Список запросов нужно проверить повторно.';
+  $('pairing-requests').replaceChildren();
   $('control-ui-help').textContent = 'Проверяем готовность Control UI…';
   controls();
   try {
@@ -492,6 +506,120 @@ async function refreshControlUiStatus(epoch = identityEpoch) {
       controls();
     }
   }
+}
+
+async function renderPairingRequests(requests) {
+  const list = $('pairing-requests');
+  const fragment = document.createDocumentFragment();
+  const entries = Array.isArray(requests) ? requests : [];
+  const reasonText = {
+    unsupported_role: 'Роль не поддерживается политикой BEZR.',
+    unsupported_scope: 'Запрошены полномочия вне разрешённого набора.',
+    not_control_ui: 'Запрос не от штатного Control UI.',
+    origin_mismatch: 'Origin запроса не совпадает с этим экземпляром.',
+    silent_request: 'Тихий запрос нельзя подтвердить вручную.',
+    invalid_request: 'Запрос содержит поля неподдерживаемого формата.',
+  };
+  for (const item of entries) {
+    if (!item || typeof item !== 'object') continue;
+    const row = document.createElement('li');
+    const details = document.createElement('div');
+    const title = document.createElement('strong');
+    title.textContent = `${String(item.display_name || 'OpenClaw Control UI')} · ${String(item.platform || 'unknown')}`;
+    const role = document.createElement('p');
+    role.textContent = `Клиент: ${String(item.client_id || 'unknown')}; роль: ${String(item.role || 'unknown')}`;
+    const scopes = document.createElement('p');
+    const requestedScopes = Array.isArray(item.scopes)
+      ? item.scopes.filter((scope) => typeof scope === 'string') : [];
+    scopes.textContent = `Запрошенные полномочия: ${requestedScopes.length ? requestedScopes.join(', ') : 'не указаны'}`;
+    details.append(title, role, scopes);
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.dataset.pairingApprove = '';
+    button.dataset.approvable = String(item.approvable === true);
+    if (item.approvable === true) {
+      button.textContent = 'Одобрить';
+      button.addEventListener('click', () => approveControlUiPairing(item));
+    } else {
+      button.textContent = 'Отклонено политикой';
+      const reason = document.createElement('p');
+      reason.textContent = reasonText[item.reason] || 'Запрос нельзя подтвердить.';
+      details.append(reason);
+    }
+    row.append(details, button);
+    fragment.append(row);
+  }
+  list.replaceChildren(fragment);
+}
+
+async function refreshControlUiPairing(epoch = identityEpoch) {
+  if (!authenticated || !controlUi.available || pairing.loading || pairing.approving) return;
+  pairing.loading = true;
+  $('pairing-status').textContent = 'Проверяем ожидающие запросы сопряжения…';
+  controls();
+  try {
+    const data = await request('/control-ui/pairing');
+    if (!authenticated || epoch !== identityEpoch) return;
+    if (!Array.isArray(data.requests)) throw { status: 0 };
+    pairing.requests = data.requests;
+    await renderPairingRequests(data.requests);
+    $('pairing-status').textContent = data.requests.length
+      ? `Найдено запросов: ${data.requests.length}. Одобряйте только тот браузер, который вы только что открыли.`
+      : 'Ожидающих запросов сопряжения нет.';
+  } catch (error) {
+    if (epoch !== identityEpoch) return;
+    $('pairing-status').textContent = error.status === 401 || error.status === 403
+      ? 'Сессия BEZR недействительна; войдите снова.'
+      : 'Не удалось получить список сопряжения. Обновите состояние и повторите.';
+    if (error.status === 401 || error.status === 403) showError(error);
+  } finally {
+    if (epoch === identityEpoch) {
+      pairing.loading = false;
+      controls();
+    }
+  }
+}
+
+async function approveControlUiPairing(item) {
+  if (!authenticated || !controlUi.available || pairing.loading || pairing.approving
+      || !item || item.approvable !== true || !Array.isArray(item.scopes)) return;
+  const scopes = item.scopes.filter((scope) => typeof scope === 'string');
+  const prompt = `Одобрить сопряжение браузера ${String(item.display_name || 'OpenClaw Control UI')}?\n\nРоль: ${String(item.role || 'unknown')}\nПолномочия: ${scopes.join(', ')}\n\nЗапрос проверяется повторно перед одобрением. operator.admin не выдаётся.`;
+  if (!window.confirm(prompt)) return;
+  const epoch = identityEpoch;
+  pairing.approving = true;
+  controls();
+  let refresh = false;
+  try {
+    const result = await request('/control-ui/pairing/approve', 'POST', {
+      request_id: item.request_id,
+      expected_device_id: item.device_id,
+      expected_role: item.role,
+      expected_scopes: scopes,
+      expected_client_id: item.client_id,
+    });
+    if (!authenticated || epoch !== identityEpoch) return;
+    if (result.approved !== true) throw { status: 0 };
+    $('pairing-status').textContent = 'Запрос одобрен. Переподключение штатного Control UI может занять несколько секунд.';
+    refresh = true;
+  } catch (error) {
+    if (epoch !== identityEpoch) return;
+    if (error.status === 409) {
+      $('pairing-status').textContent = 'Запрос изменился или истёк. Список обновляется; проверьте новые полномочия перед повторным одобрением.';
+      refresh = true;
+    } else if (error.status === 401 || error.status === 403) {
+      showError(error);
+    } else {
+      $('pairing-status').textContent = 'Не удалось подтвердить результат. Обновите список перед повтором.';
+      refresh = true;
+    }
+  } finally {
+    if (epoch === identityEpoch) {
+      pairing.approving = false;
+      controls();
+    }
+  }
+  if (refresh && epoch === identityEpoch) await refreshControlUiPairing(epoch);
 }
 
 async function openAgent() {
@@ -710,6 +838,7 @@ for (const button of document.querySelectorAll('[data-action]')) {
   button.addEventListener('click', () => submitAction(button, button.dataset.action));
 }
 $('open-agent').addEventListener('click', openAgent);
+$('refresh-pairing').addEventListener('click', () => refreshControlUiPairing());
 $('refresh-runtime').addEventListener('click', async () => {
   if (!authenticated || busy) return;
   const epoch = identityEpoch;

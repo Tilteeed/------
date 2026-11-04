@@ -74,7 +74,8 @@ def build_gateway_config(instance):
             'mode': 'trusted-proxy',
             'identityScopes': {
                 owner_id: ['operator.read', 'operator.write',
-                           'operator.approvals', 'operator.questions'],
+                           'operator.approvals', 'operator.questions',
+                           'operator.pairing'],
             },
             'trustedProxy': {
                 'userHeader': 'x-forwarded-user',
@@ -84,4 +85,7 @@ def build_gateway_config(instance):
             },
         },
     })
-    return {'gateway': gateway}
+    return {
+        'gateway': gateway,
+        'plugins': {'entries': {'admin-http-rpc': {'enabled': True}}},
+    }

@@ -2,14 +2,12 @@
 
 ## Локальная проверка текущих изменений
 
-- `python scripts/smoke_runtime.py`: последний разрешённый PASS был до добавления restore; сценарий не обновлялся и не запускался повторно, поэтому не подтверждает restore.
-- `python -m unittest supervisor.tests.test_runtime_service -v`: 6 тестов, OK. Включают create→start→stop→remove→restore→remove→purge, same instance/storage path и marker preservation, отсутствие новой disk allocation, owner rejection, restore retry после quota verification failure, scrub operation payloads, частичный purge/retry и WAL-checkpoint gating.
-- `python -m unittest supervisor.tests.test_policy -v`: 7 тестов, OK; включая валидный нулевой новый disk request для reuse retained quota.
-- `python -m unittest tests.test_api -v`: 9 тестов, OK.
-- `node --check web/agent/app.js` и `node --test tests/ui-state.test.mjs`: 4 теста, OK; не браузерный execution test.
-- `python -m compileall -q supervisor control_plane scripts` и `git diff --check`: OK.
-
-Только созданный для service workflow тестовый каталог/marker временный и синтетический; настоящий Docker, XFS quota/xattrs, Linux directory-descriptor syscalls и AF_UNIX не вызваны для restore. Это не ВМ-приёмка и не forensic secure-erase proof.
+- `python -m unittest discover -s tests -v`: **74 теста, OK**. Pairing, owner-scoping, HTTPS-проверки и запреты прямых маршрутов проверялись тестовыми клиентами/fake Gateway RPC; это не live-проверка OpenClaw.
+- `python -m unittest discover -s supervisor/tests -v`: **165 тестов, OK**. Включает retained `/29` регрессию для обоих адресов — network и broadcast.
+- `python -m compileall -q supervisor control_plane scripts tests`, `node --check web/agent/app.js`, `node --test tests/ui-state.test.mjs` (**6 тестов, OK**) и `git diff --check`: OK. Node-тесты не являются browser E2E.
+- `python scripts/linux_docker_proxy_acceptance.py --help` и `python scripts/control_ui_two_user_acceptance.py --help`: CLI разбирает параметры; запускался только help, не live-приёмка.
+- `scripts/linux_proxy_isolated_check.py` на Linux не запускался; предыдущий вызов на Windows остановился на platform guard (`This acceptance check requires Linux`) до сетевых действий. Namespace/nft/Docker-проверки не было.
+- Linux/Docker/реальный OpenClaw Gateway, TLS/WSS/browser pairing и live two-user приёмка не выполнялись. `NFTABLES_SEMANTICS_VALIDATED` остаётся `False`; `agent_proxy_v1` остаётся fail-closed и не является default. Подготовленные скрипты требуют отдельно согласованной disposable-среды.
 
 ## Успешные локальные проверки (исторический базис первой части)
 
