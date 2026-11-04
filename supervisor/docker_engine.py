@@ -25,7 +25,7 @@ from .firewall import (
     EndpointPair, FirewallManager, NftablesAdapter, NetworkPolicy,
     NFTABLES_SEMANTICS_VALIDATED, validate_networks,
 )
-from .network_routes import HostRouteInventoryError, read_host_ipv4_networks
+from .network_routes import HostIPv4Inventory, read_host_ipv4_networks
 
 
 class DockerEngineError(RuntimeError):
@@ -115,7 +115,7 @@ class DockerEngine:
 
     def __init__(self, image, engine_socket='/var/run/docker.sock', *,
                  agent_network_pool=None, frontend_network_pool=None,
-                 firewall=None, host_route_provider: Callable[[], tuple[str, ...]] | None = None):
+                 firewall=None, host_route_provider: Callable[[], HostIPv4Inventory] | None = None):
         if not isinstance(image, str) or not self._IMAGE.fullmatch(image):
             raise ValueError('An explicit immutable Docker image digest is required')
         if (not isinstance(engine_socket, str) or not engine_socket.startswith('/')
@@ -745,17 +745,60 @@ class DockerEngine:
         if self._network_rows(instance_id):
             raise DockerEngineError('Managed network removal could not be verified')
 
+    def _retained_proxy_network_has_foreign_host_route(
+            self, inventory, instance_id, role, network_id, observed, plan):
+        """Ignore only routes corroborated by a fully inspected BEZR Docker bridge."""
+        if not isinstance(inventory, HostIPv4Inventory):
+            raise DockerEngineError('Host IPv4 route inventory is unavailable')
+        network_id = self._object(network_id)
+        expected = self._proxy_network_payload(instance_id, plan, role=role)
+        if (type(observed) is not dict or observed.get('Id') != network_id
+                or observed.get('Name') != expected['Name']
+                or observed.get('Labels') != expected['Labels']
+                or observed.get('Options') != expected['Options']):
+            raise DockerEngineError('Retained proxy Docker network identity failed verification')
+        subnet = ipaddress.IPv4Network(expected['IPAM']['Config'][0]['Subnet'])
+        bridge = expected['Options']['com.docker.network.bridge.name']
+        gateway = expected['IPAM']['Config'][0]['Gateway']
+        gateway_address_present = any(
+            address.ifname == bridge and address.local == gateway
+            and address.prefixlen == subnet.prefixlen
+            for address in inventory.addresses)
+        for address in inventory.addresses:
+            address_network = ipaddress.IPv4Network(address.network)
+            if not address_network.overlaps(subnet):
+                continue
+            if (gateway_address_present and address.ifname == bridge
+                    and address.local == gateway and address.prefixlen == subnet.prefixlen):
+                continue
+            return True
+        for route in inventory.routes:
+            route_network = ipaddress.IPv4Network(route.network)
+            if not route_network.overlaps(subnet):
+                continue
+            if (not gateway_address_present or route.interface != bridge
+                    or route.protocol != 'kernel'
+                    or route.prefsrc not in (None, gateway)):
+                return True
+            if (route_network == subnet and route.scope == 'link'
+                    and route.route_type in (None, 'unicast')):
+                continue
+            local_gateway_route = ipaddress.IPv4Network(gateway + '/32')
+            if (route_network == local_gateway_route and route.route_type == 'local'
+                    and route.scope == 'host'):
+                continue
+            return True
+        return False
+
     def ensure_proxy_networks(self, instance_id, *, agent_network_pool, frontend_network_pool):
         """Create or reuse exact per-agent /29 networks without changing retained IPAM."""
         instance_id = self._instance(instance_id)
         agent_pool = self._proxy_pool(agent_network_pool)
         frontend_pool = self._proxy_pool(frontend_network_pool)
         try:
-            host_routes = tuple(self.host_route_provider())
-            if len(host_routes) > 4096:
+            host_inventory = self.host_route_provider()
+            if not isinstance(host_inventory, HostIPv4Inventory):
                 raise ValueError
-            route_networks = tuple(ipaddress.IPv4Network(value, strict=True)
-                                   for value in host_routes)
         except Exception:
             raise DockerEngineError('Host IPv4 route inventory is unavailable') from None
         rows = self._request('GET', '/networks')
@@ -790,16 +833,15 @@ class DockerEngine:
             role_pool = agent_pool if role == 'agent' else frontend_pool
             plan[role] = self._proxy_network_from_observation(
                 instance_id, role, observed, role_pool)
-            retained_subnet = ipaddress.IPv4Network(plan[role]['subnet'])
-            if any(route.prefixlen > 0 and retained_subnet.overlaps(route)
-                   for route in route_networks):
+            if self._retained_proxy_network_has_foreign_host_route(
+                    host_inventory, instance_id, role, network_id, observed, plan[role]):
                 raise DockerEngineError('Retained proxy subnet overlaps a host route')
             existing_ids[role] = network_id
         if len(plan) != 2:
             allocated = self._proxy_network_plan(
                 instance_id, agent_network_pool=str(agent_pool),
                 frontend_network_pool=str(frontend_pool), occupied_subnets=occupied,
-                host_routes=host_routes)
+                host_routes=host_inventory.networks)
             for role in ('agent', 'frontend'):
                 if role not in plan:
                     plan[role] = allocated[role]

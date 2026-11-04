@@ -13,6 +13,7 @@ from urllib.parse import parse_qs
 from supervisor.config import AgentLimits
 from supervisor.docker_engine import DockerEngine, DockerEngineError
 from supervisor.firewall import FirewallManager, NftablesAdapter
+from supervisor.network_routes import HostIPv4Inventory, parse_ipv4_networks
 
 
 class DockerEngineNetworkTests(unittest.TestCase):
@@ -652,7 +653,7 @@ class DockerEngineNetworkTests(unittest.TestCase):
         engine = DockerEngine('sha256:' + 'a' * 64,
                               agent_network_pool='10.244.0.0/24',
                               frontend_network_pool='10.245.0.0/24',
-                              host_route_provider=lambda: ())
+                              host_route_provider=lambda: HostIPv4Inventory((), ()))
         self.assertIsInstance(engine.firewall, FirewallManager)
         self.assertIsInstance(engine.firewall.adapter, NftablesAdapter)
         self.assertFalse(engine.firewall.can_apply)
@@ -767,7 +768,7 @@ class DockerEngineNetworkTests(unittest.TestCase):
 
     def test_proxy_network_lifecycle_creates_and_verifies_both_networks(self):
         engine = DockerEngine('sha256:' + 'a' * 64,
-                              host_route_provider=lambda: ())
+                              host_route_provider=lambda: HostIPv4Inventory((), ()))
         instance_id = '3' * 32
         state = {}
         calls = []
@@ -819,7 +820,7 @@ class DockerEngineNetworkTests(unittest.TestCase):
         engine = DockerEngine('sha256:' + 'a' * 64,
                               agent_network_pool='10.240.0.0/24',
                               frontend_network_pool='10.241.0.0/24',
-                              host_route_provider=lambda: ())
+                              host_route_provider=lambda: HostIPv4Inventory((), ()))
         instance_id, other_id = '2' * 32, '3' * 32
         plan = engine._proxy_network_plan(
             instance_id, agent_network_pool=engine.agent_network_pool,
@@ -874,7 +875,7 @@ class DockerEngineNetworkTests(unittest.TestCase):
         engine = DockerEngine('sha256:' + 'a' * 64,
                               agent_network_pool='10.240.0.0/24',
                               frontend_network_pool='10.241.0.0/24',
-                              host_route_provider=lambda: ())
+                              host_route_provider=lambda: HostIPv4Inventory((), ()))
         instance_id, other_id = '2' * 32, '3' * 32
         other_plan = engine._proxy_network_plan(
             other_id, agent_network_pool=engine.agent_network_pool,
@@ -927,10 +928,11 @@ class DockerEngineNetworkTests(unittest.TestCase):
         self.assertEqual(deleted, [])
 
     def test_proxy_network_lifecycle_reuses_retained_subnets_without_reallocation(self):
+        inventory = HostIPv4Inventory((), ())
         engine = DockerEngine('sha256:' + 'a' * 64,
                               agent_network_pool='10.246.0.0/24',
                               frontend_network_pool='10.247.0.0/24',
-                              host_route_provider=lambda: ())
+                              host_route_provider=lambda: inventory)
         instance_id = '5' * 32
         plan = engine._proxy_network_plan(
             instance_id, agent_network_pool=engine.agent_network_pool,
@@ -945,6 +947,18 @@ class DockerEngineNetworkTests(unittest.TestCase):
                        'Containers': {'e' * 64: {'Name': 'web'},
                                       'd' * 64: {'Name': 'pa-proxy-' + instance_id}}},
         }
+        route_rows, address_rows = [], []
+        for role in ('agent', 'frontend'):
+            network = plan[role]
+            route_rows.extend((
+                {'dst': network['subnet'], 'dev': network['bridge'],
+                 'protocol': 'kernel', 'scope': 'link', 'prefsrc': network['gateway']},
+                {'type': 'local', 'dst': network['gateway'], 'dev': network['bridge'],
+                 'protocol': 'kernel', 'scope': 'host', 'prefsrc': network['gateway']},
+            ))
+            address_rows.append({'ifname': network['bridge'], 'addr_info': [{
+                'family': 'inet', 'local': network['gateway'], 'prefixlen': 29}]})
+        inventory = parse_ipv4_networks(route_rows, address_rows)
         created = []
         def request(method, path, payload=None, *, ok=(200,)):
             if method == 'GET' and path == '/networks':
@@ -962,6 +976,46 @@ class DockerEngineNetworkTests(unittest.TestCase):
             frontend_network_pool=engine.frontend_network_pool)
         self.assertEqual(restored, plan)
         self.assertEqual(created, [])
+        from supervisor.service import RuntimeService
+        def prepare_restore(instance_id_value, owner_id, domain, host_path):
+            plan_value = engine.ensure_proxy_networks(
+                instance_id_value, agent_network_pool=engine.agent_network_pool,
+                frontend_network_pool=engine.frontend_network_pool)
+            return {'sidecar_ip': plan_value['agent']['sidecar_ip'],
+                    'agent_subnet': plan_value['agent']['subnet'],
+                    'control_ui_origin': f'https://{instance_id_value}.{domain}'}
+        engine.__dict__['prepare_control_ui'] = prepare_restore
+        service = RuntimeService.__new__(RuntimeService)
+        service.engine = engine
+        service.control_ui_domain = 'agents.example.test'
+        service.agent_network_pool = engine.agent_network_pool
+        restored_instance = service._prepare_control_ui_instance({
+            'id': instance_id, 'actor': 'owner-5', 'gateway_token': 'synthetic-token',
+            'network_profile': 'agent_proxy_v1',
+        }, action='restore', host_path='/srv/agent-data/' + instance_id)
+        self.assertEqual(restored_instance['agent_subnet'], plan['agent']['subnet'])
+        self.assertEqual(restored_instance['sidecar_ip'], plan['agent']['sidecar_ip'])
+        foreign_rows = [*route_rows, {
+            'dst': plan['agent']['subnet'], 'dev': plan['agent']['bridge'],
+            'protocol': 'static', 'scope': 'link',
+        }]
+        inventory = parse_ipv4_networks(foreign_rows, address_rows)
+        with self.assertRaises(DockerEngineError):
+            engine.ensure_proxy_networks(instance_id,
+                agent_network_pool=engine.agent_network_pool,
+                frontend_network_pool=engine.frontend_network_pool)
+        inventory = parse_ipv4_networks(route_rows, address_rows)
+        state['a' * 64]['Labels'][engine.INSTANCE_LABEL] = 'different-owner'
+        with self.assertRaises(DockerEngineError):
+            engine.ensure_proxy_networks(instance_id,
+                agent_network_pool=engine.agent_network_pool,
+                frontend_network_pool=engine.frontend_network_pool)
+        state['a' * 64]['Labels'][engine.INSTANCE_LABEL] = instance_id
+        state['a' * 64]['Id'] = 'c' * 64
+        with self.assertRaises(DockerEngineError):
+            engine.ensure_proxy_networks(instance_id,
+                agent_network_pool=engine.agent_network_pool,
+                frontend_network_pool=engine.frontend_network_pool)
 
     def test_legacy_none_spec_remains_verifiable_without_implicit_migration(self):
         engine = DockerEngine('sha256:' + 'a' * 64)

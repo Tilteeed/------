@@ -43,6 +43,23 @@ def network(hex_digit='a', subnet='192.0.2.0/29'):
 
 
 class NftablesAdapterTests(unittest.TestCase):
+    def test_inventory_requests_handle_metadata_for_list_and_detail(self):
+        calls = []
+        def runner(argv):
+            calls.append(tuple(argv))
+            if argv[-3:] == ('list', 'tables', 'inet'):
+                return ('{"nftables":[{"table":{"family":"inet","name":"agent_proxy_v1",'
+                        '"handle":12,"comment":"BEZR managed firewall agent_proxy_v1 v1"}}]}')
+            return ('{"nftables":[{"table":{"family":"inet","name":"agent_proxy_v1",'
+                    '"handle":12,"comment":"BEZR managed firewall agent_proxy_v1 v1"}}]}')
+        adapter = NftablesAdapter(nft_binary='nft-test', runner=runner,
+                                  batch_runner=lambda *_args: None)
+        self.assertEqual(adapter._family_table('inet')['handle'], 12)
+        self.assertEqual(calls, [
+            ('nft-test', '-a', '-j', 'list', 'tables', 'inet'),
+            ('nft-test', '-a', '-j', 'list', 'table', 'inet', 'agent_proxy_v1'),
+        ])
+
     def test_nft_json_readback_matches_and_detects_rule_drift(self):
         expected = expected_ruleset((network(),))
         drift = {'enabled': False}

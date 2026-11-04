@@ -246,7 +246,7 @@ class NftablesAdapter:
             raise FirewallError('nftables read failed') from None
 
     def _family_table(self, family):
-        text = self._read_text((self.nft_binary, '-j', 'list', 'tables', family))
+        text = self._read_text((self.nft_binary, '-a', '-j', 'list', 'tables', family))
         try:
             items = json.loads(text)['nftables']
             if type(items) is not list or len(items) > 4096:
@@ -262,7 +262,7 @@ class NftablesAdapter:
             listed_handle = found[0].get('handle')
             if type(listed_handle) is not int or listed_handle <= 0:
                 raise ValueError
-            detail = self._read_text((self.nft_binary, '-j', 'list', 'table', family, TABLE_NAME))
+            detail = self._read_text((self.nft_binary, '-a', '-j', 'list', 'table', family, TABLE_NAME))
             manifest, handle = self._normalise_table(detail, family)
             if handle != listed_handle:
                 raise ValueError
