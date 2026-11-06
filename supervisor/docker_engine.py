@@ -1181,10 +1181,12 @@ class DockerEngine:
                     raise ValueError
             env_items = config.get('Env') or []
             if (type(env_items) is not list
-                    or any(type(item) is not str or '=' not in item for item in env_items)
+                    or any(type(item) is not str or not item.split('=', 1)[0]
+                           for item in env_items)
                     or len({item.split('=', 1)[0] for item in env_items}) != len(env_items)):
                 raise ValueError
-            env = dict(item.split('=', 1) for item in env_items)
+            env = dict(item.split('=', 1) for item in env_items if '=' in item)
+            observed_unset = {item for item in env_items if '=' not in item}
             expected_env_items = expected.get('Env')
             if type(expected_env_items) is not list:
                 raise ValueError
@@ -1207,6 +1209,8 @@ class DockerEngine:
                 raise ValueError
             wanted_env = dict(expected_assignments)
             if any(env.get(key) != value for key, value in wanted_env.items()):
+                raise ValueError
+            if observed_unset - set(unset_env):
                 raise ValueError
             if set(env).intersection(unset_env):
                 raise ValueError

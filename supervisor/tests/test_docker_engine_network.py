@@ -385,7 +385,8 @@ class DockerEngineNetworkTests(unittest.TestCase):
             'Image', 'User', 'Entrypoint', 'Cmd', 'WorkingDir', 'Env',
             'Healthcheck', 'StopTimeout', 'Labels')}
         config['Env'] = ['PATH=/usr/bin', 'HOME=/home/app'] + [
-            item for item in payload['Env'] if '=' in item]
+            item for item in payload['Env'] if '=' in item] + [
+            item for item in payload['Env'] if '=' not in item]
         mount = payload['HostConfig']['Mounts'][0]
         observed = {
             'Id': container_id, 'Image': payload['Image'], 'Config': config,
@@ -405,6 +406,10 @@ class DockerEngineNetworkTests(unittest.TestCase):
         network_ids = {'agent': agent_id, 'frontend': frontend_id}
         self.assertEqual(engine._verify_proxy_sidecar(
             instance_id, observed, payload, plan, network_ids), container_id)
+        config['Env'].append('UNEXPECTED')
+        with self.assertRaises(DockerEngineError):
+            engine._verify_proxy_sidecar(instance_id, observed, payload, plan, network_ids)
+        config['Env'].pop()
         config['Env'].append('WEBUI_SECRET_KEY=bad')
         with self.assertRaises(DockerEngineError):
             engine._verify_proxy_sidecar(instance_id, observed, payload, plan, network_ids)
