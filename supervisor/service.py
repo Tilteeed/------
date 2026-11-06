@@ -1138,7 +1138,8 @@ def serve(config):
             raise ValueError('Unsafe service target')
     engine = DockerEngine(
         config['image'], agent_network_pool=config['agent_network_pool'],
-        frontend_network_pool=config['frontend_network_pool'])
+        frontend_network_pool=config['frontend_network_pool'],
+        firewall=_runtime_firewall(config))
     engine.check_host()
     metrics = HostMetrics(profile.storage.mountpoint)
     metrics.collect()

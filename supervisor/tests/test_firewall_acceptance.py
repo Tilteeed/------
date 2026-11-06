@@ -2,8 +2,11 @@ import hashlib
 import json
 import os
 import stat
+import sys
+import types
 import unittest
-from pathlib import Path
+from contextlib import ExitStack
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -340,6 +343,107 @@ class FirewallAcceptanceReceiptTests(unittest.TestCase):
                    return_value=True):
             manager = _runtime_firewall(config)
         self.assertTrue(manager.can_apply)
+
+    def test_serve_injects_receipt_gated_firewall_manager_into_docker_engine(self):
+        from supervisor import firewall_acceptance as acceptance
+        from supervisor import service
+        from supervisor.firewall import FirewallManager
+
+        config = {
+            'profile_path': '/etc/personal-agent/profile.json',
+            'state_dir': '/var/lib/personal-agent-supervisor',
+            'socket_path': '/run/personal-agent/control.sock',
+            'token_file': '/var/lib/personal-agent-supervisor/service.token',
+            'image': 'sha256:' + 'a' * 64,
+            'agent_network_pool': self.AGENT_POOL,
+            'frontend_network_pool': self.FRONTEND_POOL,
+        }
+        profile = SimpleNamespace(storage=SimpleNamespace(mountpoint='/srv/pool'))
+
+        class FakePath:
+            def __init__(self, value):
+                self.value = str(value)
+
+            @property
+            def parent(self):
+                return FakePath(PurePosixPath(self.value).parent)
+
+            @property
+            def name(self):
+                return PurePosixPath(self.value).name
+
+            def __truediv__(self, child):
+                return FakePath(PurePosixPath(self.value) / str(child))
+
+            def __eq__(self, other):
+                return type(other) is FakePath and self.value == other.value
+
+            def __str__(self):
+                return self.value
+
+            def is_relative_to(self, _other):
+                return False
+
+            def lstat(self):
+                return SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0)
+
+            def resolve(self, *, strict=False):
+                return self
+
+            def is_symlink(self):
+                return False
+
+        class StopBeforeHostCheck(Exception):
+            pass
+
+        for receipt_state, accepted in (('valid', True), ('missing', False), ('invalid', False)):
+            with self.subTest(receipt_state=receipt_state):
+                captured = {}
+                receipt = self.receipt()
+                if receipt_state == 'invalid':
+                    receipt['agent_network_pool'] = '10.250.0.0/24'
+
+                class ProbeDockerEngine:
+                    def __init__(self, *args, **kwargs):
+                        captured['args'] = args
+                        captured['kwargs'] = kwargs
+
+                    def check_host(self):
+                        raise StopBeforeHostCheck
+
+                with ExitStack() as stack:
+                    stack.enter_context(patch.dict(
+                        sys.modules, {'fcntl': types.ModuleType('fcntl')}))
+                    stack.enter_context(patch.object(service, 'Path', FakePath))
+                    stack.enter_context(patch.object(
+                        service, 'load_profile', return_value=profile))
+                    stack.enter_context(patch.object(service, '_trusted_directory'))
+                    stack.enter_context(patch.object(service.os, 'umask'))
+                    stack.enter_context(patch.object(
+                        service.os.path, 'lexists', return_value=False))
+                    stack.enter_context(patch(
+                        'supervisor.docker_engine.DockerEngine', ProbeDockerEngine))
+                    stack.enter_context(patch.object(
+                        acceptance, 'machine_id_sha256', return_value=self.HOST))
+                    stack.enter_context(patch.object(
+                        acceptance, '_open_state_directory', return_value=123))
+                    if receipt_state == 'missing':
+                        read_receipt = stack.enter_context(patch.object(
+                            acceptance, '_read_receipt', side_effect=FileNotFoundError))
+                    else:
+                        read_receipt = stack.enter_context(patch.object(
+                            acceptance, '_read_receipt', return_value=receipt))
+                    stack.enter_context(patch.object(acceptance.os, 'close'))
+                    with self.assertRaises(StopBeforeHostCheck):
+                        service.serve(config)
+
+                manager = captured['kwargs'].get('firewall')
+                self.assertIsInstance(manager, FirewallManager)
+                self.assertIs(manager.can_apply, accepted)
+                self.assertEqual(captured['args'], (config['image'],))
+                self.assertEqual(captured['kwargs']['agent_network_pool'], self.AGENT_POOL)
+                self.assertEqual(captured['kwargs']['frontend_network_pool'], self.FRONTEND_POOL)
+                read_receipt.assert_called_once_with(123)
 
 
 if __name__ == '__main__':
