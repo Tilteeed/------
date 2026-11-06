@@ -13,6 +13,7 @@ def create_env(path: str | Path) -> Path:
         "WEB_PORT=3000\n"
         "AGENT_PLATFORM_PUBLIC_ORIGIN=http://localhost:3000\n"
         "AGENT_CONTROL_UI_DOMAIN=\n"
+        "FORWARDED_ALLOW_IPS=127.0.0.1\n"
         "WEB_MEMORY_LIMIT=2g\n"
         "WEB_CPU_LIMIT=2.0\n"
     )

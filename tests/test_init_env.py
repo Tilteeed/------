@@ -14,6 +14,7 @@ class EnvironmentSetupTests(unittest.TestCase):
             content = first.read_text(encoding="utf-8")
             self.assertIn("WEBUI_SECRET_KEY=", content)
             self.assertIn("AGENT_CONTROL_UI_DOMAIN=\n", content)
+            self.assertIn("FORWARDED_ALLOW_IPS=127.0.0.1\n", content)
             key = content.split("WEBUI_SECRET_KEY=", 1)[1].splitlines()[0]
             self.assertGreaterEqual(len(key), 64)
             self.assertNotEqual(first.read_bytes(), second.read_bytes())

@@ -33,11 +33,9 @@ services:
       WHISPER_MODEL_AUTO_UPDATE: "false"
       DO_NOT_TRACK: "true"
       ANONYMIZED_TELEMETRY: "false"
-      # Intended frontend: host-local TLS edge via the loopback-only published port.
-      # Uvicorn trusts forwarded headers only from 127.0.0.1; the edge must overwrite
-      # X-Forwarded-For with one client IP and set X-Forwarded-Proto=https.
-      # Confirm the peer seen by ASGI on the target VM; never broaden this to '*'.
-      FORWARDED_ALLOW_IPS: "127.0.0.1"
+      # Uvicorn trusts forwarded headers only from explicit IPs. The Supervisor
+      # verifies that the live Compose `web` bridge gateway is included; never use '*'.
+      FORWARDED_ALLOW_IPS: "${FORWARDED_ALLOW_IPS:-127.0.0.1}"
       AGENT_PLATFORM_PUBLIC_ORIGIN: "${AGENT_PLATFORM_PUBLIC_ORIGIN:-http://localhost:3000}"
       AGENT_CONTROL_UI_DOMAIN: "${AGENT_CONTROL_UI_DOMAIN:-}"
     volumes:

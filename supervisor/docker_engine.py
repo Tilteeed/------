@@ -413,6 +413,78 @@ class DockerEngine:
             raise DockerEngineError('Proxy network configuration verification failed')
         return plan
 
+    @staticmethod
+    def _parse_forwarded_allow_ips(value):
+        """Accept only a comma-separated set of literal, canonical IP addresses."""
+        if type(value) is not str or not value:
+            raise DockerEngineError('Control Plane forwarded proxy allowlist is invalid')
+        tokens = value.split(',')
+        if any(not token or token != token.strip() or token == '*' for token in tokens):
+            raise DockerEngineError('Control Plane forwarded proxy allowlist is invalid')
+        parsed = []
+        for token in tokens:
+            try:
+                address = ipaddress.ip_address(token)
+            except ValueError:
+                raise DockerEngineError('Control Plane forwarded proxy allowlist is invalid') from None
+            if (str(address) != token or address.is_unspecified or address.is_multicast
+                    or (isinstance(address, ipaddress.IPv4Address)
+                        and address == ipaddress.IPv4Address('255.255.255.255'))
+                    or token in parsed):
+                raise DockerEngineError('Control Plane forwarded proxy allowlist is invalid')
+            parsed.append(token)
+        return set(parsed)
+
+    def _control_plane_web_gateway(self, labels, networks):
+        """Verify the live Compose `web` bridge identity and Docker gateway."""
+        project = labels.get('com.docker.compose.project') if type(labels) is dict else None
+        if type(project) is not str or not project or len(project) > 128:
+            raise DockerEngineError('Control Plane Compose identity is invalid')
+        if type(networks) is not dict or not networks:
+            raise DockerEngineError('Control Plane network attachment is unavailable')
+        if any(type(name) is str and name.startswith('pa-agent-') for name in networks):
+            raise DockerEngineError('Control Plane is attached to an agent network')
+
+        candidates = []
+        for name, endpoint in networks.items():
+            if type(name) is not str or type(endpoint) is not dict:
+                raise DockerEngineError('Control Plane network attachment is invalid')
+            network_id = self._object(endpoint.get('NetworkID'))
+            observed = self._request('GET', '/networks/' + network_id)
+            if type(observed) is not dict or observed.get('Id') != network_id:
+                raise DockerEngineError('Control Plane network identity verification failed')
+            network_labels = observed.get('Labels')
+            if (type(network_labels) is dict
+                    and network_labels.get('com.docker.compose.project') == project
+                    and network_labels.get('com.docker.compose.network') == 'web'):
+                if observed.get('Name') != name:
+                    raise DockerEngineError('Control Plane Compose network name changed')
+                candidates.append((network_id, endpoint, observed))
+        if len(candidates) != 1:
+            raise DockerEngineError('Exactly one Compose web network is required')
+
+        network_id, endpoint, network = candidates[0]
+        ipam = network.get('IPAM')
+        configs = ipam.get('Config') if type(ipam) is dict else None
+        if (network.get('Driver') != 'bridge' or network.get('Internal') is not False
+                or network.get('EnableIPv6') is not False
+                or type(configs) is not list or len(configs) != 1
+                or type(configs[0]) is not dict):
+            raise DockerEngineError('Control Plane Compose network configuration is invalid')
+        config = configs[0]
+        try:
+            subnet = ipaddress.IPv4Network(config.get('Subnet'), strict=True)
+            gateway = ipaddress.IPv4Address(config.get('Gateway'))
+            endpoint_gateway = ipaddress.IPv4Address(endpoint.get('Gateway'))
+            endpoint_ip = ipaddress.IPv4Address(endpoint.get('IPAddress'))
+        except (ValueError, TypeError):
+            raise DockerEngineError('Control Plane Docker gateway is invalid') from None
+        if (gateway not in subnet or gateway in (subnet.network_address, subnet.broadcast_address)
+                or endpoint_gateway != gateway or endpoint_ip not in subnet
+                or endpoint_ip in (subnet.network_address, subnet.broadcast_address, gateway)):
+            raise DockerEngineError('Control Plane Docker gateway does not match its network')
+        return str(gateway)
+
     def _find_control_plane_web(self, control_ui_domain):
         """Select one running labeled web container and pin its immutable image ID."""
         if type(control_ui_domain) is not str or len(control_ui_domain) > 253:
@@ -440,12 +512,20 @@ class DockerEngine:
                 or labels.get(self.CONTROL_PLANE_LABEL) != 'true'):
             raise DockerEngineError('Control Plane container is not uniquely running and labeled')
         env = config.get('Env')
-        if type(env) is not list or any(type(item) is not str or '=' not in item for item in env):
-            raise DockerEngineError('Control Plane domain environment is invalid')
+        if (type(env) is not list
+                or any(type(item) is not str or '=' not in item
+                       or not item.split('=', 1)[0]
+                       for item in env)):
+            raise DockerEngineError('Control Plane environment is invalid')
         domains = [item.split('=', 1)[1] for item in env
                    if item.split('=', 1)[0] == 'AGENT_CONTROL_UI_DOMAIN']
+        forwarded_values = [item.split('=', 1)[1] for item in env
+                            if item.split('=', 1)[0] == 'FORWARDED_ALLOW_IPS']
         if domains != [control_ui_domain]:
             raise DockerEngineError('Control Plane domain does not match configured domain')
+        network_settings = observed.get('NetworkSettings')
+        networks = network_settings.get('Networks') if type(network_settings) is dict else None
+        docker_gateway = self._control_plane_web_gateway(labels, networks)
         image_id = observed.get('Image')
         if type(image_id) is not str or re.fullmatch(r'sha256:[0-9a-f]{64}', image_id) is None:
             raise DockerEngineError('Control Plane image ID is not immutable')
@@ -453,12 +533,35 @@ class DockerEngine:
         if (type(image) is not dict or image.get('Id') != image_id
                 or type(image.get('Config')) is not dict):
             raise DockerEngineError('Control Plane image ID failed verification')
-        network_settings = observed.get('NetworkSettings')
-        networks = network_settings.get('Networks') if type(network_settings) is dict else None
         if type(networks) is not dict or not networks:
             raise DockerEngineError('Control Plane network attachment is unavailable')
         return {'container_id': container_id, 'image_id': image_id,
-                'networks': networks, 'image_info': image}
+                'networks': networks, 'image_info': image,
+                'docker_gateway': docker_gateway,
+                'forwarded_allow_values': tuple(forwarded_values)}
+
+    def _verify_control_plane_forwarded_trust(self, web):
+        values = web.get('forwarded_allow_values') if type(web) is dict else None
+        if type(values) is not tuple or len(values) != 1:
+            raise DockerEngineError('Control Plane forwarded proxy allowlist is invalid')
+        allowlist = self._parse_forwarded_allow_ips(values[0])
+        gateway = web.get('docker_gateway')
+        if type(gateway) is not str or gateway not in allowlist:
+            raise DockerEngineError('Control Plane Docker gateway is not trusted for forwarded headers')
+
+    def _proxy_sidecar_image_info(self, sidecar_image_id, web):
+        if (type(sidecar_image_id) is not str
+                or re.fullmatch(r'sha256:[0-9a-f]{64}', sidecar_image_id) is None):
+            raise DockerEngineError('Proxy Sidecar image identity is invalid')
+        if type(web) is not dict:
+            raise DockerEngineError('Control Plane image metadata is unavailable')
+        if web.get('image_id') == sidecar_image_id:
+            return web.get('image_info')
+        image = self._request('GET', '/images/' + quote(sidecar_image_id, safe='') + '/json')
+        if (type(image) is not dict or image.get('Id') != sidecar_image_id
+                or type(image.get('Config')) is not dict):
+            raise DockerEngineError('Proxy Sidecar image identity failed verification')
+        return image
 
     def _discover_control_plane_image(self, control_ui_domain):
         return self._find_control_plane_web(control_ui_domain)['image_id']
@@ -1116,6 +1219,13 @@ class DockerEngine:
         if (not callable(firewall_ready) or not callable(firewall_apply)
                 or getattr(self.firewall, 'can_apply', False) is not True):
             raise DockerEngineError('Per-agent firewall readiness is unavailable')
+        # Validate the WebUI identity and trusted Docker peer before creating
+        # per-agent networks, tokens, or Sidecars.
+        web = self._find_control_plane_web(control_ui_domain)
+        self._verify_control_plane_forwarded_trust(web)
+        if any(type(name) is str and name.startswith('pa-agent-')
+               for name in web['networks']):
+            raise DockerEngineError('Control Plane is attached to an agent network')
         plan = self.ensure_proxy_networks(
             instance_id, agent_network_pool=self.agent_network_pool,
             frontend_network_pool=self.frontend_network_pool)
@@ -1124,10 +1234,6 @@ class DockerEngine:
         if firewall_ready(policies) is not True:
             raise DockerEngineError('Per-agent firewall policy is not ready')
         self._ensure_proxy_token_file(host_path)
-        web = self._find_control_plane_web(control_ui_domain)
-        if any(type(name) is str and name.startswith('pa-agent-')
-               for name in web['networks']):
-            raise DockerEngineError('Control Plane is attached to an agent network')
         network_ids = {
             role: self._proxy_network_id(instance_id, role, plan[role])
             for role in ('agent', 'frontend')
@@ -1782,6 +1888,7 @@ class DockerEngine:
             self._proxy_network_payload(instance_id, plan['agent'], role='agent')
             self._proxy_network_payload(instance_id, plan['frontend'], role='frontend')
             web = self._find_control_plane_web(domain)
+            self._verify_control_plane_forwarded_trust(web)
             if web['image_id'] != sidecar_spec['image_id']:
                 return None
             network_ids = {
@@ -1796,6 +1903,17 @@ class DockerEngine:
                 plan=plan, image_info=web['image_info'])
             sidecar_id = self._verify_proxy_sidecar(
                 instance_id, sidecar, expected_sidecar, plan, network_ids)
+            web_after_connect = self._ensure_container_network(
+                web['container_id'], network_ids['frontend'],
+                plan['frontend']['name'], plan['frontend']['web_ip'])
+            if type(web_after_connect) is not dict or web_after_connect.get('Id') != web['container_id']:
+                return None
+            web_settings = web_after_connect.get('NetworkSettings')
+            web_networks = web_settings.get('Networks') if type(web_settings) is dict else None
+            if type(web_networks) is not dict:
+                return None
+            web = dict(web)
+            web['networks'] = web_networks
             self._verify_proxy_endpoint(
                 {'State': {'Status': 'running'},
                  'NetworkSettings': {'Networks': web['networks']}},
@@ -2002,20 +2120,31 @@ class DockerEngine:
             self._proxy_network_payload(instance_id, plan['agent'], role='agent')
             self._proxy_network_payload(instance_id, plan['frontend'], role='frontend')
             web = self._find_control_plane_web(domain)
-            if web['image_id'] != sidecar_spec['image_id']:
-                return False
             network_ids = {
                 'agent': self._proxy_network_id(instance_id, 'agent', plan['agent']),
                 'frontend': self._proxy_network_id(instance_id, 'frontend', plan['frontend']),
             }
+            sidecar_image_info = self._proxy_sidecar_image_info(
+                sidecar_spec['image_id'], web)
             expected_sidecar = self._proxy_sidecar_payload(
                 instance_id, owner_id=gateway_spec['owner_id'],
                 control_ui_origin=origin, gateway_ip=plan['agent']['gateway_ip'],
                 listen_ip=plan['frontend']['sidecar_ip'],
                 image_id=sidecar_spec['image_id'], host_path=sidecar_spec['host_path'],
-                plan=plan, image_info=web['image_info'])
+                plan=plan, image_info=sidecar_image_info)
             sidecar_id = self._verify_proxy_sidecar(
                 instance_id, sidecar, expected_sidecar, plan, network_ids)
+            web_after_connect = self._ensure_container_network(
+                web['container_id'], network_ids['frontend'],
+                plan['frontend']['name'], plan['frontend']['web_ip'])
+            if type(web_after_connect) is not dict or web_after_connect.get('Id') != web['container_id']:
+                return False
+            web_settings = web_after_connect.get('NetworkSettings')
+            web_networks = web_settings.get('Networks') if type(web_settings) is dict else None
+            if type(web_networks) is not dict:
+                return False
+            web = dict(web)
+            web['networks'] = web_networks
             gateway_id = self._object(gateway.get('Id'))
             self._verify_proxy_endpoint(
                 {'State': {'Status': 'running'},

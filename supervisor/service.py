@@ -787,7 +787,10 @@ class RuntimeService:
         return unavailable
 
     def reconcile(self):
-        """Inspect known IDs only; never create/start queued or failed intents."""
+        """Inspect known IDs; verified proxy inspection may reattach the WebUI frontend endpoint.
+
+        Never create/start queued or failed intents, remove containers, or touch agent data.
+        """
         with self.lock:
             for instance in self.store.all_instances():
                 info = self._inspect(instance['id'])

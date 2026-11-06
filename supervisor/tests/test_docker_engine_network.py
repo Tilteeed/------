@@ -152,9 +152,21 @@ class DockerEngineNetworkTests(unittest.TestCase):
             if method == 'GET' and path == f'/containers/{container_id}/json':
                 return {'Id': container_id, 'Image': image_id,
                         'State': {'Running': True, 'Status': 'running'},
-                        'NetworkSettings': {'Networks': {'web': {'NetworkID': 'e' * 64}}},
-                        'Config': {'Labels': {engine.CONTROL_PLANE_LABEL: 'true'},
-                                   'Env': ['AGENT_CONTROL_UI_DOMAIN=' + domain]}}
+                        'NetworkSettings': {'Networks': {'web': {
+                            'NetworkID': 'e' * 64, 'Gateway': '172.30.0.1',
+                            'IPAddress': '172.30.0.2'}}},
+                        'Config': {'Labels': {
+                            engine.CONTROL_PLANE_LABEL: 'true',
+                            'com.docker.compose.project': 'personal-agent-platform'},
+                            'Env': ['AGENT_CONTROL_UI_DOMAIN=' + domain,
+                                    'FORWARDED_ALLOW_IPS=127.0.0.1,172.30.0.1']}}
+            if method == 'GET' and path == '/networks/' + 'e' * 64:
+                return {'Id': 'e' * 64, 'Name': 'web', 'Driver': 'bridge',
+                        'Internal': False, 'EnableIPv6': False,
+                        'Labels': {'com.docker.compose.project': 'personal-agent-platform',
+                                   'com.docker.compose.network': 'web'},
+                        'IPAM': {'Config': [{'Subnet': '172.30.0.0/24',
+                                             'Gateway': '172.30.0.1'}]}}
             if method == 'GET' and path.startswith('/images/'):
                 return {'Id': image_id, 'Config': {'Volumes': None}}
             raise AssertionError((method, path))
@@ -537,7 +549,9 @@ class DockerEngineNetworkTests(unittest.TestCase):
         engine._ensure_proxy_token_file = lambda _path: 'S' * 43
         engine._find_control_plane_web = lambda control_ui_domain: {
             'container_id': web_id, 'image_id': image_id,
-            'image_info': self._sidecar_image_info(image_id), 'networks': {'web': {}}}
+            'image_info': self._sidecar_image_info(image_id), 'networks': {'web': {}},
+            'docker_gateway': '172.30.0.1',
+            'forwarded_allow_values': ('172.30.0.1',)}
         engine._proxy_network_id = lambda _instance, role, _expected: (
             'c' * 64 if role == 'agent' else 'd' * 64)
         endpoints = []
@@ -887,13 +901,22 @@ class DockerEngineNetworkTests(unittest.TestCase):
         engine._verify = lambda instance_id, observed, expected_spec=None, expected_token=None: gateway_id
         engine._find_proxy_sidecar = lambda instance_id: sidecar
         engine._verify_proxy_sidecar = lambda instance_id, observed, expected, plan, network_ids: sidecar_id
+        web_networks = {}
+        trust_state = {'values': ('127.0.0.1,172.30.0.1',)}
         engine._find_control_plane_web = lambda control_ui_domain: {
             'container_id': web_id, 'image_id': image_id, 'image_info': image_info,
-            'networks': {plan['frontend']['name']: {
-                'NetworkID': '6' * 64, 'IPAddress': plan['frontend']['web_ip'],
-                'IPAMConfig': {'IPv4Address': plan['frontend']['web_ip']}}}}
+            'networks': web_networks, 'docker_gateway': '172.30.0.1',
+            'forwarded_allow_values': trust_state['values']}
         engine._proxy_network_id = lambda instance_id, role, expected: (
             '5' * 64 if role == 'agent' else '6' * 64)
+        reconnects = []
+        def reconnect_web(container_id, network_id, network_name, ipv4):
+            reconnects.append((container_id, network_id, network_name, ipv4))
+            web_networks[network_name] = {
+                'NetworkID': network_id, 'IPAddress': ipv4,
+                'IPAMConfig': {'IPv4Address': ipv4}}
+            return {'Id': container_id, 'NetworkSettings': {'Networks': web_networks}}
+        engine._ensure_container_network = reconnect_web
         engine.proxy_network_policies = lambda: (engine._proxy_firewall_policy(instance_id, plan),)
         verified_memberships = []
         engine.__dict__['_verify_proxy_network_membership'] = (
@@ -909,7 +932,31 @@ class DockerEngineNetworkTests(unittest.TestCase):
         })
         self.assertEqual([role for role, _ in verified_memberships],
                          ['agent', 'frontend', 'agent', 'frontend'])
+        self.assertEqual(reconnects, [(web_id, '6' * 64, plan['frontend']['name'],
+                                       plan['frontend']['web_ip'])])
         self.assertEqual(len(engine.firewall.policies), 1)
+        web_networks.clear()
+        self.assertTrue(engine._proxy_firewall_ready(instance_id, gateway_spec))
+        self.assertEqual(len(reconnects), 2)
+        trust_state['values'] = ('*',)
+        self.assertIsNone(engine.control_ui_target(instance_id, owner_id))
+        self.assertTrue(engine._proxy_firewall_ready(instance_id, gateway_spec))
+        self.assertEqual(len(reconnects), 3)
+        trust_state['values'] = ('127.0.0.1,172.30.0.1',)
+        sidecar_labels = sidecar['Config']['Labels']
+        stale_image_id = 'sha256:' + 'f' * 64
+        stale_sidecar_spec = json.loads(sidecar_labels[engine.SIDECAR_SPEC_LABEL])
+        stale_sidecar_spec['image_id'] = stale_image_id
+        sidecar_labels[engine.SIDECAR_SPEC_LABEL] = engine._json(stale_sidecar_spec)
+        sidecar_labels[engine.SIDECAR_CONFIG_LABEL] = engine._hash(stale_sidecar_spec)
+        engine._proxy_sidecar_image_info = lambda sidecar_image_id, web: {
+            'Id': sidecar_image_id, 'Config': image_info['Config']}
+        stopped = []
+        engine._stop_proxy_containers = lambda instance_id: stopped.append(instance_id) or True
+        inspected = engine.inspect(instance_id)
+        self.assertEqual(inspected['state'], 'running')
+        self.assertEqual(inspected['proxy_state'], 'not_ready')
+        self.assertEqual(stopped, [])
         sidecar['State']['Status'] = 'created'
         self.assertIsNone(engine.control_ui_target(instance_id, owner_id))
 

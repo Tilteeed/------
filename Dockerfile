@@ -14,6 +14,7 @@ WORKDIR /app/backend
 COPY control_plane/ ./control_plane/
 COPY scripts/ ./scripts/
 COPY supervisor/ ./supervisor/
+COPY ops/ ./ops/
 COPY tests/ ./platform_tests/
 RUN python -m unittest discover -s platform_tests -v
 
