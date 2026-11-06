@@ -100,11 +100,14 @@ class StaticPageTests(unittest.TestCase):
             app.include_router(pages.create_page_router(
                 root, control_ui_domain="agents.bezr.test"))
             with TestClient(app) as client:
+                page = client.get("/agent")
                 self.assertEqual(
-                    self._directives(client.get("/agent"))["form-action"],
+                    self._directives(page)["form-action"],
                     "'self' https://*.agents.bezr.test")
+                self.assertEqual(page.headers["referrer-policy"], "strict-origin")
                 asset = client.get("/agent-assets/app.js")
                 self.assertEqual(self._directives(asset)["form-action"], "'self'")
+                self.assertEqual(asset.headers["referrer-policy"], "same-origin")
 
 
 if __name__ == "__main__":

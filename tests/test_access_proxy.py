@@ -46,6 +46,14 @@ class ControlUiHandoffTests(unittest.TestCase):
             'owner_id': 'alice', 'instance_id': self.instance_id, 'audience': self.audience,
         })
 
+    def test_open_agent_keeps_ticket_post_without_form_referrer_override(self):
+        source = (Path(__file__).resolve().parents[1] / 'web' / 'agent' / 'app.js').read_text(
+            encoding='utf-8')
+        self.assertNotIn('form.referrerPolicy', source)
+        self.assertIn("form.method = 'POST';", source)
+        self.assertIn('form.action = `${launch.origin}/_bezr/enter`;', source)
+        self.assertIn("form.enctype = 'application/x-www-form-urlencoded';", source)
+
     def test_ticket_exchange_sets_host_only_secure_cookie_and_redirects_cleanly(self):
         ticket = self.store.issue_control_ui_ticket(
             'alice', self.instance_id, self.audience)['ticket']
@@ -73,6 +81,16 @@ class ControlUiHandoffTests(unittest.TestCase):
                              data={'ticket': ticket}, follow_redirects=False)
         self.assertEqual(replay.status_code, 404)
 
+    def test_handoff_rejects_expired_ticket(self):
+        ticket = self.store.issue_control_ui_ticket(
+            'alice', self.instance_id, self.audience, now=1000, ttl_seconds=60)['ticket']
+        client = self.make_client()
+        self.addCleanup(client.close)
+        response = client.post(
+            '/_bezr/enter', headers={'Origin': 'https://bezr.example.test'},
+            data={'ticket': ticket}, follow_redirects=False)
+        self.assertEqual(response.status_code, 404)
+
     def test_entry_rejects_wrong_origin_host_and_body(self):
         ticket = self.store.issue_control_ui_ticket(
             'alice', self.instance_id, self.audience)['ticket']
@@ -90,6 +108,41 @@ class ControlUiHandoffTests(unittest.TestCase):
         self.assertEqual(other.get('/_bezr/enter').status_code, 405)
         self.assertEqual(other.post('/_bezr/enter', headers={'Origin': 'https://bezr.example.test'},
                                     data={'ticket': ticket}).status_code, 404)
+
+    def test_ticket_exchange_rejects_null_missing_and_duplicate_origin(self):
+        ticket = self.store.issue_control_ui_ticket(
+            'alice', self.instance_id, self.audience)['ticket']
+        client = self.make_client()
+        self.addCleanup(client.close)
+        requests = (
+            ('null', {'Origin': 'null'}),
+            ('missing', {}),
+            ('duplicate', [
+                ('Origin', 'https://bezr.example.test'),
+                ('Origin', 'https://bezr.example.test'),
+            ]),
+        )
+        for label, headers in requests:
+            with self.subTest(origin=label):
+                response = client.post(
+                    '/_bezr/enter', headers=headers, data={'ticket': ticket},
+                    follow_redirects=False)
+                self.assertEqual(response.status_code, 403)
+        accepted = client.post(
+            '/_bezr/enter', headers={'Origin': 'https://bezr.example.test'},
+            data={'ticket': ticket}, follow_redirects=False)
+        self.assertEqual(accepted.status_code, 303)
+
+    def test_handoff_rejects_wrong_content_type_with_valid_origin(self):
+        ticket = self.store.issue_control_ui_ticket(
+            'alice', self.instance_id, self.audience)['ticket']
+        client = self.make_client()
+        self.addCleanup(client.close)
+        response = client.post(
+            '/_bezr/enter', headers={
+                'Origin': 'https://bezr.example.test', 'Content-Type': 'text/plain'},
+            content='ticket=' + ticket, follow_redirects=False)
+        self.assertEqual(response.status_code, 415)
 
 
 class AccessProxyRequestTests(unittest.TestCase):

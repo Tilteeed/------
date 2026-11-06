@@ -650,7 +650,6 @@ async function openAgent() {
     form.action = `${launch.origin}/_bezr/enter`;
     form.target = targetName;
     form.enctype = 'application/x-www-form-urlencoded';
-    form.referrerPolicy = 'no-referrer';
     const ticket = document.createElement('input');
     ticket.type = 'hidden';
     ticket.name = 'ticket';

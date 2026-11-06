@@ -37,7 +37,10 @@ def _page_headers(control_ui_domain=None):
 def create_page_router(asset_directory: str | Path, *, control_ui_domain: str | None = None):
     root = Path(asset_directory)
     router = APIRouter(include_in_schema=False)
-    page_headers = _page_headers(control_ui_domain)
+    page_headers = {
+        **_page_headers(control_ui_domain),
+        'Referrer-Policy': 'strict-origin',
+    }
     asset_headers = _page_headers()
 
     @router.get("/agent")
