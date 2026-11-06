@@ -32,4 +32,5 @@ router.include_router(create_router(
     control_ui_proxy_ready=control_ui_proxy_app.state.proxy_ready,
     control_ui_pairing_service=control_ui_proxy_app.state.pairing_service,
 ))
-router.include_router(create_page_router(Path(__file__).parent / "static"))
+router.include_router(create_page_router(
+    Path(__file__).parent / "static", control_ui_domain=control_ui_domain))
