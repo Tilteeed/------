@@ -276,6 +276,42 @@ class NftablesAdapter:
     def _without_handle(value):
         return {key: item for key, item in value.items() if key not in {'handle', 'index'}}
 
+    @staticmethod
+    def _normalise_prefix(right):
+        if type(right) is not dict or set(right) != {'prefix'}:
+            raise ValueError
+        prefix = right['prefix']
+        if type(prefix) is not dict or set(prefix) != {'addr', 'len'}:
+            raise ValueError
+        address, prefixlen = prefix['addr'], prefix['len']
+        if (type(address) is not str or type(prefixlen) is not int
+                or not 0 <= prefixlen <= 32):
+            raise ValueError
+        network = ipaddress.IPv4Network(f'{address}/{prefixlen}', strict=True)
+        if str(network.network_address) != address:
+            raise ValueError
+        return str(network)
+
+    @classmethod
+    def _normalise_rule(cls, rule):
+        if type(rule) is not dict or type(rule.get('expr')) is not list:
+            return rule
+        address_lvalues = (
+            {'payload': {'protocol': 'ip', 'field': 'saddr'}},
+            {'payload': {'protocol': 'ip', 'field': 'daddr'}},
+        )
+        for expression in rule['expr']:
+            if type(expression) is not dict or set(expression) != {'match'}:
+                continue
+            match = expression['match']
+            if (type(match) is not dict or set(match) != {'left', 'op', 'right'}
+                    or match['left'] not in address_lvalues):
+                continue
+            right = match['right']
+            if type(right) is dict and 'prefix' in right:
+                match['right'] = cls._normalise_prefix(right)
+        return rule
+
     def _normalise_table(self, text, family):
         try:
             items = json.loads(text)['nftables']
@@ -298,7 +334,7 @@ class NftablesAdapter:
                     if kind == 'chain':
                         chains.append(self._without_handle(value))
                     elif kind == 'rule':
-                        rules.append(self._without_handle(value))
+                        rules.append(self._normalise_rule(self._without_handle(value)))
                     else:
                         raise ValueError
             if type(handle) is not int or handle <= 0 or table is None:

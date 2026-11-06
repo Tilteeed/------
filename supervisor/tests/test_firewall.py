@@ -31,6 +31,45 @@ class FakeAdapter:
         self.state = None
 
 
+def nft_prefix_fixture(*, prefix_objects=True, src_addr='10.246.0.0', src_len=29,
+                       dst_addr='10.246.0.0', dst_len=29, src_right=None,
+                       iif='bza' + 'e' * 12, verdict='accept', reverse_expr=False,
+                       comment='BEZR eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee routed agent'):
+    def right(addr, prefixlen, override):
+        if override is not None:
+            return override
+        if prefix_objects:
+            return {'prefix': {'addr': addr, 'len': prefixlen}}
+        return f'{addr}/{prefixlen}'
+
+    iif_match = {'match': {'left': {'meta': {'key': 'iifname'}},
+                           'op': '==', 'right': iif}}
+    oif_match = {'match': {'left': {'meta': {'key': 'oifname'}},
+                           'op': '==', 'right': iif}}
+    source_match = {'match': {
+        'left': {'payload': {'protocol': 'ip', 'field': 'saddr'}},
+        'op': '==', 'right': right(src_addr, src_len, src_right)}}
+    destination_match = {'match': {
+        'left': {'payload': {'protocol': 'ip', 'field': 'daddr'}},
+        'op': '==', 'right': right(dst_addr, dst_len, None)}}
+    expressions = [iif_match, oif_match, source_match, destination_match, {verdict: None}]
+    if reverse_expr:
+        expressions[0], expressions[1] = expressions[1], expressions[0]
+    rule = {
+        'family': 'inet', 'table': 'agent_proxy_v1', 'chain': 'forward',
+        'expr': expressions, 'comment': comment, 'handle': 100,
+    }
+    return json.dumps({'nftables': [
+        {'table': {'family': 'inet', 'name': 'agent_proxy_v1', 'handle': 17,
+                   'comment': 'BEZR managed firewall agent_proxy_v1 v1'}},
+        {'chain': {'family': 'inet', 'table': 'agent_proxy_v1', 'name': 'forward',
+                   'type': 'filter', 'hook': 'forward', 'prio': -10,
+                   'policy': 'accept', 'comment': 'BEZR agent_proxy_v1 inet forward v1',
+                   'handle': 20}},
+        {'rule': rule},
+    ]})
+
+
 def network(hex_digit='a', subnet='192.0.2.0/29'):
     ident = hex_digit * 32
     import ipaddress
@@ -84,6 +123,67 @@ class NftablesAdapterTests(unittest.TestCase):
         self.assertEqual(adapter.read(), expected)
         drift['enabled'] = True
         self.assertNotEqual(adapter.read(), expected)
+
+    def test_nft_readback_normalises_prefix_objects_for_ip_source_and_destination(self):
+        adapter = NftablesAdapter()
+        expected, handle = adapter._normalise_table(
+            nft_prefix_fixture(prefix_objects=False), 'inet')
+        raw = nft_prefix_fixture()
+        rule = json.loads(raw)['nftables'][2]['rule']
+        self.assertEqual(rule['expr'][2]['match']['right'], {
+            'prefix': {'addr': '10.246.0.0', 'len': 29}})
+        self.assertEqual(rule['expr'][3]['match']['right'], {
+            'prefix': {'addr': '10.246.0.0', 'len': 29}})
+        normalized, actual_handle = adapter._normalise_table(raw, 'inet')
+        self.assertEqual((actual_handle, normalized), (handle, expected))
+        right_values = [expression['match']['right']
+                        for expression in normalized['tables']['inet']['rules'][0]['expr']
+                        if 'match' in expression]
+        self.assertIn('10.246.0.0/29', right_values)
+
+    def test_valid_changed_prefix_address_or_mask_is_not_hidden(self):
+        adapter = NftablesAdapter()
+        expected, _ = adapter._normalise_table(
+            nft_prefix_fixture(prefix_objects=False), 'inet')
+        for changed in (
+            nft_prefix_fixture(src_addr='10.246.0.8'),
+            nft_prefix_fixture(src_len=28),
+        ):
+            with self.subTest(changed=changed):
+                normalized, _ = adapter._normalise_table(changed, 'inet')
+                self.assertNotEqual(normalized, expected)
+
+    def test_invalid_or_noncanonical_prefix_objects_are_rejected(self):
+        adapter = NftablesAdapter()
+        invalid_fixtures = (
+            nft_prefix_fixture(src_addr='10.246.0.1'),
+            nft_prefix_fixture(src_addr='2001:db8::'),
+            nft_prefix_fixture(src_len=33),
+            nft_prefix_fixture(src_len=True),
+            nft_prefix_fixture(src_right={
+                'prefix': {'addr': '10.246.0.0', 'len': 29, 'extra': 1}}),
+            nft_prefix_fixture(src_right={
+                'prefix': {'addr': '10.246.0.0', 'len': 29}, 'extra': 1}),
+        )
+        for raw in invalid_fixtures:
+            with self.subTest(raw=raw):
+                with self.assertRaises(FirewallError):
+                    adapter._normalise_table(raw, 'inet')
+
+    def test_prefix_normalisation_keeps_other_rule_fields_and_expression_order_strict(self):
+        adapter = NftablesAdapter()
+        expected, _ = adapter._normalise_table(
+            nft_prefix_fixture(prefix_objects=False), 'inet')
+        changed_fixtures = (
+            nft_prefix_fixture(reverse_expr=True),
+            nft_prefix_fixture(iif='bza' + 'f' * 12),
+            nft_prefix_fixture(verdict='drop'),
+            nft_prefix_fixture(comment='BEZR changed'),
+        )
+        for raw in changed_fixtures:
+            with self.subTest(raw=raw):
+                normalized, _ = adapter._normalise_table(raw, 'inet')
+                self.assertNotEqual(normalized, expected)
 
     def test_batch_is_atomic_scoped_to_bezr_tables_and_never_flushes_host_rules(self):
         invocations = []
