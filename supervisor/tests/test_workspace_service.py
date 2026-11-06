@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 from supervisor.config import validate_profile
 from supervisor.runtime_store import RuntimeStore, canonical
@@ -72,34 +73,35 @@ class RetainedWorkspaceServiceTests(unittest.TestCase):
                     'idempotency_key': 'remove-workspace', 'settings_revision': 1,
                     'settings': {'name': 'Agent', 'instructions': 'test'}})
 
-                listing = service.retained_workspace({'actor_id': 'alice', 'instance_id': instance_id,
-                    'action': 'list', 'directory': '', 'offset': 0})
-                self.assertEqual([item['name'] for item in listing['entries']], ['readme.md', 'report.bin'])
-                self.assertNotIn('PRIVATE_TOKEN', str(listing))
-                self.assertNotIn('PRIVATE_SECRET', str(listing))
-                preview = service.retained_workspace({'actor_id': 'alice', 'instance_id': instance_id,
-                    'action': 'preview', 'path': 'readme.md'})
-                self.assertEqual(preview['text'], 'Сохранённый текст\n')
-                download = service.retained_workspace({'actor_id': 'alice', 'instance_id': instance_id,
-                    'action': 'download', 'path': 'report.bin'})
-                self.assertEqual(download.name, 'report.bin')
-                self.assertEqual(download.content, b'\x00report')
+                with patch("supervisor.workspace_files.sys.platform", "win32"):
+                    listing = service.retained_workspace({'actor_id': 'alice', 'instance_id': instance_id,
+                        'action': 'list', 'directory': '', 'offset': 0})
+                    self.assertEqual([item['name'] for item in listing['entries']], ['readme.md', 'report.bin'])
+                    self.assertNotIn('PRIVATE_TOKEN', str(listing))
+                    self.assertNotIn('PRIVATE_SECRET', str(listing))
+                    preview = service.retained_workspace({'actor_id': 'alice', 'instance_id': instance_id,
+                        'action': 'preview', 'path': 'readme.md'})
+                    self.assertEqual(preview['text'], 'Сохранённый текст\n')
+                    download = service.retained_workspace({'actor_id': 'alice', 'instance_id': instance_id,
+                        'action': 'download', 'path': 'report.bin'})
+                    self.assertEqual(download.name, 'report.bin')
+                    self.assertEqual(download.content, b'\x00report')
 
-                with self.assertRaises(ServiceError) as foreign:
-                    service.retained_workspace({'actor_id': 'bob', 'instance_id': instance_id,
-                        'action': 'list', 'directory': '', 'offset': 0})
-                self.assertEqual(foreign.exception.status, 404)
-                with self.assertRaises(ServiceError) as traversal:
-                    service.retained_workspace({'actor_id': 'alice', 'instance_id': instance_id,
-                        'action': 'download', 'path': '../secrets/credential'})
-                self.assertEqual(traversal.exception.status, 400)
-                service.action({'actor_id': 'alice', 'action': 'restore',
-                    'idempotency_key': 'restore-workspace', 'settings_revision': 1,
-                    'instance_id': instance_id})
-                with self.assertRaises(ServiceError) as active:
-                    service.retained_workspace({'actor_id': 'alice', 'instance_id': instance_id,
-                        'action': 'list', 'directory': '', 'offset': 0})
-                self.assertEqual(active.exception.status, 404)
+                    with self.assertRaises(ServiceError) as foreign:
+                        service.retained_workspace({'actor_id': 'bob', 'instance_id': instance_id,
+                            'action': 'list', 'directory': '', 'offset': 0})
+                    self.assertEqual(foreign.exception.status, 404)
+                    with self.assertRaises(ServiceError) as traversal:
+                        service.retained_workspace({'actor_id': 'alice', 'instance_id': instance_id,
+                            'action': 'download', 'path': '../secrets/credential'})
+                    self.assertEqual(traversal.exception.status, 400)
+                    service.action({'actor_id': 'alice', 'action': 'restore',
+                        'idempotency_key': 'restore-workspace', 'settings_revision': 1,
+                        'instance_id': instance_id})
+                    with self.assertRaises(ServiceError) as active:
+                        service.retained_workspace({'actor_id': 'alice', 'instance_id': instance_id,
+                            'action': 'list', 'directory': '', 'offset': 0})
+                    self.assertEqual(active.exception.status, 404)
             finally:
                 store.close()
 
