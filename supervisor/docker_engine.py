@@ -437,8 +437,8 @@ class DockerEngine:
         try:
             root_fd = os.open(host_path, os.O_RDONLY | directory_flag | nofollow | cloexec)
             root_info = os.fstat(root_fd)
-            if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != 1000
-                    or root_info.st_gid != 1000 or stat.S_IMODE(root_info.st_mode) != 0o700):
+            if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != 0
+                    or root_info.st_gid != 0 or stat.S_IMODE(root_info.st_mode) != 0o700):
                 raise DockerEngineError('Sidecar secret parent directory failed verification')
             file_fd = os.open(self.PROXY_TOKEN_FILE_HOST,
                               os.O_RDONLY | nofollow | cloexec, dir_fd=root_fd)
@@ -479,8 +479,8 @@ class DockerEngine:
         try:
             root_fd = os.open(host_path, os.O_RDONLY | directory_flag | nofollow | cloexec)
             root_info = os.fstat(root_fd)
-            if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != 1000
-                    or root_info.st_gid != 1000 or stat.S_IMODE(root_info.st_mode) != 0o700):
+            if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != 0
+                    or root_info.st_gid != 0 or stat.S_IMODE(root_info.st_mode) != 0o700):
                 raise DockerEngineError('Sidecar secret parent directory failed verification')
             fchown = getattr(os, 'fchown', None)
             fchmod = getattr(os, 'fchmod', None)
