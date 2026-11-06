@@ -286,6 +286,40 @@ class DockerEngineNetworkTests(unittest.TestCase):
         engine._request = request
         self.assertEqual(engine._find_proxy_sidecar(instance_id), inspect)
 
+    def test_container_network_created_accepts_static_ipam_before_live_endpoint_exists(self):
+        engine = DockerEngine('sha256:' + 'a' * 64)
+        container_id, network_id = 'c' * 64, 'd' * 64
+        network_name, address = 'pa-agent-' + 'e' * 32, '10.251.0.2'
+        observed = {
+            'Id': container_id, 'State': {'Status': 'created'},
+            'NetworkSettings': {'Networks': {network_name: {
+                'NetworkID': '', 'IPAddress': '',
+                'IPAMConfig': {'IPv4Address': address},
+            }}},
+        }
+        calls = []
+        def request(method, path, payload=None, *, ok=(200,)):
+            calls.append((method, path, payload))
+            if method == 'GET' and path == f'/containers/{container_id}/json':
+                return observed
+            raise AssertionError((method, path, payload))
+        engine._request = request
+        self.assertEqual(engine._ensure_container_network(
+            container_id, network_id, network_name, address), observed)
+        self.assertFalse(any(method == 'POST' for method, *_ in calls))
+        endpoint = observed['NetworkSettings']['Networks'][network_name]
+        endpoint['IPAMConfig']['IPv4Address'] = '10.251.0.99'
+        with self.assertRaises(DockerEngineError):
+            engine._ensure_container_network(container_id, network_id, network_name, address)
+        endpoint['IPAMConfig']['IPv4Address'] = address
+        endpoint['NetworkID'] = 'f' * 64
+        with self.assertRaises(DockerEngineError):
+            engine._ensure_container_network(container_id, network_id, network_name, address)
+        endpoint['NetworkID'] = ''
+        endpoint['IPAddress'] = '10.251.0.99'
+        with self.assertRaises(DockerEngineError):
+            engine._ensure_container_network(container_id, network_id, network_name, address)
+
     def test_container_network_attach_uses_static_ip_and_verifies_readback(self):
         engine = DockerEngine('sha256:' + 'a' * 64)
         container_id, network_id = 'c' * 64, 'd' * 64
@@ -295,9 +329,12 @@ class DockerEngineNetworkTests(unittest.TestCase):
         def request(method, path, payload=None, *, ok=(200,)):
             calls.append((method, path, payload))
             if method == 'GET' and path == f'/containers/{container_id}/json':
-                networks = ({network_name: {'NetworkID': network_id, 'IPAddress': address}}
+                networks = ({network_name: {
+                    'NetworkID': network_id, 'IPAddress': address,
+                    'IPAMConfig': {'IPv4Address': address}}}
                             if state['attached'] else {})
-                return {'Id': container_id, 'NetworkSettings': {'Networks': networks}}
+                return {'Id': container_id, 'State': {'Status': 'running'},
+                        'NetworkSettings': {'Networks': networks}}
             if method == 'POST' and path == f'/networks/{network_id}/connect':
                 assert payload is not None
                 self.assertEqual(payload['EndpointConfig']['IPAMConfig']['IPv4Address'], address)
@@ -314,8 +351,10 @@ class DockerEngineNetworkTests(unittest.TestCase):
         container_id, network_id = 'c' * 64, 'd' * 64
         network_name, address = 'pa-front-' + 'e' * 32, '10.251.0.3'
         engine._request = lambda method, path, payload=None, *, ok=(200,): {
-            'Id': container_id, 'NetworkSettings': {'Networks': {
-                network_name: {'NetworkID': network_id, 'IPAddress': '10.251.0.4'}}}}
+            'Id': container_id, 'State': {'Status': 'running'},
+            'NetworkSettings': {'Networks': {
+                network_name: {'NetworkID': network_id, 'IPAddress': '10.251.0.4',
+                               'IPAMConfig': {'IPv4Address': address}}}}}
         with self.assertRaises(DockerEngineError):
             engine._ensure_container_network(container_id, network_id, network_name, address)
 
@@ -341,17 +380,37 @@ class DockerEngineNetworkTests(unittest.TestCase):
             'HostConfig': copy.deepcopy(payload['HostConfig']),
             'Mounts': [{'Type': 'bind', 'Source': mount['Source'],
                         'Destination': mount['Target'], 'RW': False}],
+            'State': {'Status': 'running'},
             'NetworkSettings': {'Ports': {}, 'Networks': {
                 plan['agent']['name']: {'NetworkID': agent_id,
-                                        'IPAddress': plan['agent']['sidecar_ip']},
+                                        'IPAddress': plan['agent']['sidecar_ip'],
+                                        'IPAMConfig': {'IPv4Address': plan['agent']['sidecar_ip']}},
                 plan['frontend']['name']: {'NetworkID': frontend_id,
-                                           'IPAddress': plan['frontend']['sidecar_ip']},
+                                           'IPAddress': plan['frontend']['sidecar_ip'],
+                                           'IPAMConfig': {'IPv4Address': plan['frontend']['sidecar_ip']}},
             }},
         }
         network_ids = {'agent': agent_id, 'frontend': frontend_id}
         self.assertEqual(engine._verify_proxy_sidecar(
             instance_id, observed, payload, plan, network_ids), container_id)
         observed['NetworkSettings']['Networks']['rogue'] = {}
+        with self.assertRaises(DockerEngineError):
+            engine._verify_proxy_sidecar(instance_id, observed, payload, plan, network_ids)
+        observed['NetworkSettings']['Networks'].pop('rogue')
+        observed['State'] = {'Status': 'created'}
+        for role in ('agent', 'frontend'):
+            endpoint = observed['NetworkSettings']['Networks'][plan[role]['name']]
+            endpoint.update({'NetworkID': '', 'IPAddress': '',
+                             'IPAMConfig': {'IPv4Address': plan[role]['sidecar_ip']}})
+        self.assertEqual(engine._verify_proxy_sidecar(
+            instance_id, observed, payload, plan, network_ids), container_id)
+        observed['NetworkSettings']['Networks'][plan['agent']['name']][
+            'IPAMConfig']['IPv4Address'] = '10.252.0.99'
+        with self.assertRaises(DockerEngineError):
+            engine._verify_proxy_sidecar(instance_id, observed, payload, plan, network_ids)
+        endpoint = observed['NetworkSettings']['Networks'][plan['agent']['name']]
+        endpoint['IPAMConfig']['IPv4Address'] = plan['agent']['sidecar_ip']
+        endpoint['IPAddress'] = '10.252.0.99'
         with self.assertRaises(DockerEngineError):
             engine._verify_proxy_sidecar(instance_id, observed, payload, plan, network_ids)
 
@@ -372,12 +431,12 @@ class DockerEngineNetworkTests(unittest.TestCase):
         calls = []
         def inspect_sidecar():
             networks = {plan['frontend']['name']: {
-                'NetworkID': frontend_network_id,
-                'IPAddress': plan['frontend']['sidecar_ip']}}
+                'NetworkID': '', 'IPAddress': '',
+                'IPAMConfig': {'IPv4Address': plan['frontend']['sidecar_ip']}}}
             if state['agent_connected']:
                 networks[plan['agent']['name']] = {
-                    'NetworkID': agent_network_id,
-                    'IPAddress': plan['agent']['sidecar_ip']}
+                    'NetworkID': '', 'IPAddress': '',
+                    'IPAMConfig': {'IPv4Address': plan['agent']['sidecar_ip']}}
             mount = payload['HostConfig']['Mounts'][0]
             return {
                 'Id': sidecar_id, 'Image': payload['Image'],
@@ -387,6 +446,7 @@ class DockerEngineNetworkTests(unittest.TestCase):
                 'HostConfig': copy.deepcopy(payload['HostConfig']),
                 'Mounts': [{'Type': 'bind', 'Source': mount['Source'],
                             'Destination': mount['Target'], 'RW': False}],
+                'State': {'Status': 'created'},
                 'NetworkSettings': {'Ports': {}, 'Networks': networks},
             }
         def request(method, path, payload=None, *, ok=(200,)):
@@ -408,9 +468,13 @@ class DockerEngineNetworkTests(unittest.TestCase):
         engine._request = request
         self.assertEqual(engine._create_proxy_sidecar(instance_id, payload, plan, {
             'agent': agent_network_id, 'frontend': frontend_network_id}), sidecar_id)
+        self.assertEqual(engine._create_proxy_sidecar(instance_id, payload, plan, {
+            'agent': agent_network_id, 'frontend': frontend_network_id}), sidecar_id)
         self.assertTrue(state['agent_connected'])
-        self.assertTrue(any(method == 'POST' and path.startswith('/containers/create?')
-                            for method, path, _ in calls))
+        self.assertEqual(sum(method == 'POST' and path.startswith('/containers/create?')
+                             for method, path, _ in calls), 1)
+        self.assertEqual(sum(method == 'POST' and path == f'/networks/{agent_network_id}/connect'
+                             for method, path, _ in calls), 1)
 
     def test_prepare_control_ui_connects_frontend_web_and_returns_agent_sidecar_identity(self):
         engine = DockerEngine('sha256:' + 'a' * 64,
@@ -450,8 +514,9 @@ class DockerEngineNetworkTests(unittest.TestCase):
             payloads.append('created') or sidecar_id)
         memberships = []
         engine.__dict__['_verify_proxy_network_membership'] = (
-            lambda instance_id, role, network_id, expected_plan, expected_ids:
-            (memberships.append((instance_id, role, network_id, expected_plan, expected_ids)) or {}))
+            lambda instance_id, role, network_id, expected_plan, expected_ids, **kwargs:
+            (memberships.append((instance_id, role, network_id, expected_plan,
+                                 expected_ids, kwargs)) or {}))
         result = engine.prepare_control_ui(instance_id, owner_id, domain,
                                            '/srv/agent-data/' + instance_id)
         self.assertEqual(result, {
@@ -483,6 +548,171 @@ class DockerEngineNetworkTests(unittest.TestCase):
                                       '/srv/agent-data/' + instance_id)
         self.assertEqual(calls, [])
 
+    def test_proxy_gateway_verify_accepts_created_ipam_then_requires_live_endpoint(self):
+        engine = DockerEngine('sha256:' + 'a' * 64,
+                              agent_network_pool='10.244.0.0/24',
+                              frontend_network_pool='10.245.0.0/24')
+        instance_id = 'b' * 32
+        gateway_id, sidecar_id, network_id = 'c' * 64, 'd' * 64, 'e' * 64
+        limits = AgentLimits(ram_bytes=2**30, cpu_millicores=1000,
+                             pids_limit=256, disk_bytes=10 * 1024**3)
+        plan = engine._proxy_network_plan(
+            instance_id, agent_network_pool=engine.agent_network_pool,
+            frontend_network_pool=engine.frontend_network_pool)
+        origin = f'https://{instance_id}.agents.example.test'
+        spec = engine._spec('/srv/agent-data/' + instance_id, limits, version=3,
+                            instance_id=instance_id, proxy_network=plan['agent'],
+                            owner_id='owner-b', control_ui_origin=origin)
+        image_info = {'Id': engine.image,
+                      'Config': {'Env': [], 'Entrypoint': [], 'WorkingDir': ''}}
+        payload = engine._payload(instance_id, spec, None, image_info,
+                                  proxy_network=plan['agent'])
+        digest = engine._hash(engine._projection(
+            payload, payload['HostConfig'], engine._expected_mounts(payload), image_info['Id']))
+        payload['Labels'].update({engine.SPEC_LABEL: engine._json(spec),
+                                  engine.CONFIG_LABEL: digest})
+        attached = {'NetworkID': '', 'IPAddress': '',
+                    'IPAMConfig': {'IPv4Address': plan['agent']['gateway_ip']}}
+        observed = {
+            'Id': gateway_id, 'Image': image_info['Id'],
+            'Config': {key: copy.deepcopy(payload[key]) for key in (
+                'Image', 'User', 'Cmd', 'Env', 'Entrypoint', 'WorkingDir',
+                'Healthcheck', 'StopTimeout', 'Labels', 'Tty', 'OpenStdin', 'StdinOnce')},
+            'HostConfig': copy.deepcopy(payload['HostConfig']),
+            'Mounts': engine._expected_mounts(payload),
+            'NetworkSettings': {'Ports': {}, 'Networks': {
+                plan['agent']['name']: copy.deepcopy(attached)}},
+            'State': {'Status': 'created'},
+        }
+        engine._image_info = lambda: image_info
+        engine._proxy_network_id = lambda *_args, **_kwargs: network_id
+        engine.__dict__['_find_proxy_sidecar'] = lambda instance_id: {'Id': sidecar_id}
+        membership_calls = []
+        engine._verify_proxy_network_membership = lambda *args, **kwargs: (
+            membership_calls.append((args, kwargs)) or {})
+        self.assertEqual(engine._verify(instance_id, observed, spec), gateway_id)
+        self.assertTrue(membership_calls[0][1]['allow_unstarted'])
+        for lifecycle in ('paused', 'restarting'):
+            observed['State'] = {'Status': lifecycle}
+            with self.assertRaises(DockerEngineError):
+                engine._verify(instance_id, observed, spec)
+        observed['State'] = {'Status': 'created'}
+
+        observed['NetworkSettings']['Networks'][plan['agent']['name']]['IPAMConfig']['IPv4Address'] = '10.244.0.99'
+        with self.assertRaises(DockerEngineError):
+            engine._verify(instance_id, observed, spec)
+        endpoint = observed['NetworkSettings']['Networks'][plan['agent']['name']]
+        endpoint['IPAMConfig']['IPv4Address'] = plan['agent']['gateway_ip']
+        endpoint['NetworkID'] = network_id
+        endpoint['IPAddress'] = plan['agent']['gateway_ip']
+        observed['State'] = {'Status': 'running'}
+        self.assertEqual(engine._verify(instance_id, observed, spec), gateway_id)
+        endpoint['NetworkID'] = ''
+        with self.assertRaises(DockerEngineError):
+            engine._verify(instance_id, observed, spec)
+        endpoint['NetworkID'] = network_id
+        endpoint['IPAddress'] = ''
+        with self.assertRaises(DockerEngineError):
+            engine._verify(instance_id, observed, spec)
+        endpoint['IPAddress'] = '10.244.0.99'
+        with self.assertRaises(DockerEngineError):
+            engine._verify(instance_id, observed, spec)
+
+    def test_proxy_network_membership_allows_created_endpoint_without_runtime_member(self):
+        engine = DockerEngine('sha256:' + 'a' * 64,
+                              agent_network_pool='10.244.0.0/24',
+                              frontend_network_pool='10.245.0.0/24')
+        instance_id = '0' * 32
+        plan = engine._proxy_network_plan(
+            instance_id, agent_network_pool=engine.agent_network_pool,
+            frontend_network_pool=engine.frontend_network_pool)
+        network_id, gateway_id, sidecar_id = 'a' * 64, 'b' * 64, 'c' * 64
+        expected_ips = {gateway_id: plan['agent']['gateway_ip'],
+                        sidecar_id: plan['agent']['sidecar_ip']}
+        network = engine._proxy_network_payload(instance_id, plan['agent'], role='agent')
+        network.update({'Id': network_id, 'Ingress': False, 'Containers': {}})
+        containers = {
+            container_id: {
+                'Id': container_id, 'State': {'Status': 'created'},
+                'NetworkSettings': {'Networks': {plan['agent']['name']: {
+                    'NetworkID': '', 'IPAddress': '',
+                    'IPAMConfig': {'IPv4Address': address}}}},
+            }
+            for container_id, address in expected_ips.items()
+        }
+        def request(method, path, payload=None, *, ok=(200,)):
+            if method == 'GET' and path == f'/networks/{network_id}':
+                return network
+            if method == 'GET' and path.startswith('/containers/') and path.endswith('/json'):
+                return containers[path.split('/')[2]]
+            raise AssertionError((method, path))
+        engine._request = request
+        result = engine._verify_proxy_network_membership(
+            instance_id, 'agent', network_id, plan['agent'], set(expected_ips),
+            expected_ips=expected_ips, allow_unstarted=True)
+        self.assertEqual(result, network)
+        for lifecycle in ('paused', 'restarting'):
+            containers[gateway_id]['State']['Status'] = lifecycle
+            with self.assertRaises(DockerEngineError):
+                engine._verify_proxy_network_membership(
+                    instance_id, 'agent', network_id, plan['agent'], set(expected_ips),
+                    expected_ips=expected_ips, allow_unstarted=True)
+        containers[gateway_id]['State']['Status'] = 'created'
+        with self.assertRaises(DockerEngineError):
+            engine._verify_proxy_network_membership(
+                instance_id, 'agent', network_id, plan['agent'], set(expected_ips),
+                expected_ips=expected_ips)
+        containers[sidecar_id]['NetworkSettings']['Networks'][plan['agent']['name']][
+            'IPAMConfig']['IPv4Address'] = '10.244.0.99'
+        with self.assertRaises(DockerEngineError):
+            engine._verify_proxy_network_membership(
+                instance_id, 'agent', network_id, plan['agent'], set(expected_ips),
+                expected_ips=expected_ips, allow_unstarted=True)
+
+    def test_proxy_network_membership_requires_running_runtime_membership_and_ip(self):
+        engine = DockerEngine('sha256:' + 'a' * 64,
+                              agent_network_pool='10.244.0.0/24',
+                              frontend_network_pool='10.245.0.0/24')
+        instance_id, network_id, gateway_id = '0' * 32, 'a' * 64, 'b' * 64
+        plan = engine._proxy_network_plan(
+            instance_id, agent_network_pool=engine.agent_network_pool,
+            frontend_network_pool=engine.frontend_network_pool)
+        address = plan['agent']['gateway_ip']
+        network = engine._proxy_network_payload(instance_id, plan['agent'], role='agent')
+        network.update({'Id': network_id, 'Ingress': False, 'Containers': {}})
+        container = {
+            'Id': gateway_id, 'State': {'Status': 'running'},
+            'NetworkSettings': {'Networks': {plan['agent']['name']: {
+                'NetworkID': network_id, 'IPAddress': address,
+                'IPAMConfig': {'IPv4Address': address}}}},
+        }
+        engine._request = lambda method, path, payload=None, *, ok=(200,): (
+            network if path == f'/networks/{network_id}' else container)
+        expected_ips = {gateway_id: address}
+        with self.assertRaises(DockerEngineError):
+            engine._verify_proxy_network_membership(
+                instance_id, 'agent', network_id, plan['agent'], {gateway_id},
+                expected_ips=expected_ips, allow_unstarted=True)
+        prefix = ipaddress.ip_network(plan['agent']['subnet']).prefixlen
+        network['Containers'] = {gateway_id: {'IPv4Address': f'{address}/{prefix}'}}
+        self.assertEqual(engine._verify_proxy_network_membership(
+            instance_id, 'agent', network_id, plan['agent'], {gateway_id},
+            expected_ips=expected_ips, allow_unstarted=True), network)
+        self.assertEqual(engine._verify_proxy_network_membership(
+            instance_id, 'agent', network_id, plan['agent'], {gateway_id},
+            expected_ips=expected_ips), network)
+        for lifecycle in ('paused', 'restarting'):
+            container['State']['Status'] = lifecycle
+            self.assertEqual(engine._verify_proxy_network_membership(
+                instance_id, 'agent', network_id, plan['agent'], {gateway_id},
+                expected_ips=expected_ips, allow_unstarted=True), network)
+        container['State']['Status'] = 'running'
+        network['Containers'][gateway_id]['IPv4Address'] = '10.244.0.99/29'
+        with self.assertRaises(DockerEngineError):
+            engine._verify_proxy_network_membership(
+                instance_id, 'agent', network_id, plan['agent'], {gateway_id},
+                expected_ips=expected_ips, allow_unstarted=True)
+
     def test_proxy_network_membership_rejects_unexpected_container_attachment(self):
         engine = DockerEngine('sha256:' + 'a' * 64,
                               agent_network_pool='10.244.0.0/24',
@@ -498,7 +728,8 @@ class DockerEngineNetworkTests(unittest.TestCase):
         engine._request = lambda method, path, payload=None, *, ok=(200,): observed
         with self.assertRaises(DockerEngineError):
             engine._verify_proxy_network_membership(
-                instance_id, 'agent', network_id, plan['agent'], {'b' * 64})
+                instance_id, 'agent', network_id, plan['agent'], {'b' * 64},
+                expected_ips={'b' * 64: plan['agent']['sidecar_ip']})
 
     def test_proxy_gateway_payload_uses_agent_network_without_gateway_token(self):
         engine = DockerEngine('sha256:' + 'a' * 64)
@@ -600,9 +831,11 @@ class DockerEngineNetworkTests(unittest.TestCase):
                         'Destination': engine.PROXY_TOKEN_FILE_CONTAINER, 'RW': False}],
             'NetworkSettings': {'Networks': {
                 plan['agent']['name']: {'NetworkID': '5' * 64,
-                                        'IPAddress': plan['agent']['sidecar_ip']},
+                                        'IPAddress': plan['agent']['sidecar_ip'],
+                                        'IPAMConfig': {'IPv4Address': plan['agent']['sidecar_ip']}},
                 plan['frontend']['name']: {'NetworkID': '6' * 64,
-                                           'IPAddress': plan['frontend']['sidecar_ip']},
+                                           'IPAddress': plan['frontend']['sidecar_ip'],
+                                           'IPAMConfig': {'IPv4Address': plan['frontend']['sidecar_ip']}},
             }},
             'State': {'Status': 'running', 'Health': {'Status': 'healthy'}},
         }
@@ -618,13 +851,14 @@ class DockerEngineNetworkTests(unittest.TestCase):
         engine._find_control_plane_web = lambda control_ui_domain: {
             'container_id': web_id, 'image_id': image_id,
             'networks': {plan['frontend']['name']: {
-                'NetworkID': '6' * 64, 'IPAddress': plan['frontend']['web_ip']}}}
+                'NetworkID': '6' * 64, 'IPAddress': plan['frontend']['web_ip'],
+                'IPAMConfig': {'IPv4Address': plan['frontend']['web_ip']}}}}
         engine._proxy_network_id = lambda instance_id, role, expected: (
             '5' * 64 if role == 'agent' else '6' * 64)
         engine.proxy_network_policies = lambda: (engine._proxy_firewall_policy(instance_id, plan),)
         verified_memberships = []
         engine.__dict__['_verify_proxy_network_membership'] = (
-            lambda instance_id, role, network_id, expected_plan, expected_ids:
+            lambda instance_id, role, network_id, expected_plan, expected_ids, **kwargs:
             (verified_memberships.append((role, expected_ids)) or {}))
         token = 'T' * 43
         engine._read_existing_proxy_token_file = lambda host_path: token
@@ -637,6 +871,8 @@ class DockerEngineNetworkTests(unittest.TestCase):
         self.assertEqual([role for role, _ in verified_memberships],
                          ['agent', 'frontend', 'agent', 'frontend'])
         self.assertEqual(len(engine.firewall.policies), 1)
+        sidecar['State']['Status'] = 'created'
+        self.assertIsNone(engine.control_ui_target(instance_id, owner_id))
 
     def test_proxy_firewall_readiness_rejects_sidecar_runtime_drift(self):
         engine = DockerEngine('sha256:' + 'a' * 64,
@@ -719,6 +955,155 @@ class DockerEngineNetworkTests(unittest.TestCase):
         with self.assertRaises(DockerEngineError):
             engine.start(instance_id)
         self.assertFalse(any(path.endswith('/start') for _, path in calls))
+
+    def test_proxy_start_stops_gateway_and_sidecar_after_live_check_failure(self):
+        engine = DockerEngine('sha256:' + 'a' * 64,
+                              agent_network_pool='10.244.0.0/24',
+                              frontend_network_pool='10.245.0.0/24')
+        instance_id = 'c' * 32
+        gateway_id, sidecar_id = 'd' * 64, 'e' * 64
+        limits = AgentLimits(ram_bytes=2**30, cpu_millicores=1000,
+                             pids_limit=256, disk_bytes=10 * 1024**3)
+        plan = engine._proxy_network_plan(
+            instance_id, agent_network_pool=engine.agent_network_pool,
+            frontend_network_pool=engine.frontend_network_pool)
+        spec = engine._spec('/srv/agent-data/' + instance_id, limits, version=3,
+                            instance_id=instance_id, proxy_network=plan['agent'],
+                            owner_id='owner-c',
+                            control_ui_origin=f'https://{instance_id}.agents.example.test')
+        gateway = {'Id': gateway_id, 'Config': {'Labels': {
+            **engine._labels(instance_id), engine.SPEC_LABEL: engine._json(spec)}},
+            'State': {'Status': 'created'}}
+        sidecar = {'Id': sidecar_id, 'State': {'Status': 'created'}}
+        engine._find = lambda instance_id: gateway
+        engine._find_proxy_sidecar = lambda instance_id: sidecar
+        engine._verify = lambda instance_id, observed, expected_spec=None, expected_token=None: gateway_id
+        readiness_calls = []
+        engine._proxy_firewall_ready = lambda instance_id, gateway_spec: (
+            readiness_calls.append('check') or len(readiness_calls) == 1)
+        engine._action = lambda instance_id, action: (
+            gateway['State'].__setitem__('Status', 'running') or
+            {'state': 'running', 'container_id': gateway_id})
+        calls = []
+        def request(method, path, payload=None, *, ok=(200,)):
+            calls.append((method, path))
+            if path == f'/containers/{sidecar_id}/start':
+                sidecar['State']['Status'] = 'running'
+            elif path == f'/containers/{sidecar_id}/stop?t=10':
+                sidecar['State']['Status'] = 'exited'
+            elif path == f'/containers/{gateway_id}/stop?t=10':
+                gateway['State']['Status'] = 'exited'
+            return None
+        engine._request = request
+        with self.assertRaises(DockerEngineError):
+            engine.start(instance_id)
+        self.assertEqual(gateway['State']['Status'], 'exited')
+        self.assertEqual(sidecar['State']['Status'], 'exited')
+        self.assertIn(('POST', f'/containers/{sidecar_id}/start'), calls)
+        self.assertIn(('POST', f'/containers/{sidecar_id}/stop?t=10'), calls)
+        self.assertIn(('POST', f'/containers/{gateway_id}/stop?t=10'), calls)
+
+    def test_proxy_start_runs_live_checks_after_both_containers_start(self):
+        engine = DockerEngine('sha256:' + 'a' * 64,
+                              agent_network_pool='10.244.0.0/24',
+                              frontend_network_pool='10.245.0.0/24')
+        instance_id = 'c' * 32
+        gateway_id, sidecar_id = 'd' * 64, 'e' * 64
+        limits = AgentLimits(ram_bytes=2**30, cpu_millicores=1000,
+                             pids_limit=256, disk_bytes=10 * 1024**3)
+        plan = engine._proxy_network_plan(
+            instance_id, agent_network_pool=engine.agent_network_pool,
+            frontend_network_pool=engine.frontend_network_pool)
+        spec = engine._spec('/srv/agent-data/' + instance_id, limits, version=3,
+                            instance_id=instance_id, proxy_network=plan['agent'],
+                            owner_id='owner-c',
+                            control_ui_origin=f'https://{instance_id}.agents.example.test')
+        gateway = {'Id': gateway_id, 'Config': {'Labels': {
+            **engine._labels(instance_id), engine.SPEC_LABEL: engine._json(spec)}},
+            'State': {'Status': 'created', 'Health': {'Status': 'starting'}}}
+        sidecar = {'Id': sidecar_id,
+                   'State': {'Status': 'created', 'Health': {'Status': 'starting'}}}
+        engine._find = lambda instance_id: gateway
+        engine._find_proxy_sidecar = lambda instance_id: sidecar
+        engine._verify = lambda instance_id, observed, expected_spec=None, expected_token=None: gateway_id
+        events = []
+        def ready(instance_id, gateway_spec):
+            events.append(('live-check', gateway['State']['Status'], sidecar['State']['Status']))
+            return True
+        engine._proxy_firewall_ready = ready
+        def action(instance_id, action):
+            events.append(('gateway-start', action))
+            gateway['State']['Status'] = 'running'
+            return {'state': 'running', 'container_id': gateway_id}
+        engine._action = action
+        def request(method, path, payload=None, *, ok=(200,)):
+            events.append(('docker', method, path))
+            if path == f'/containers/{sidecar_id}/start':
+                sidecar['State']['Status'] = 'running'
+                return None
+            raise AssertionError((method, path))
+        engine._request = request
+        def inspect(instance_id):
+            events.append(('inspect', gateway['State']['Status'], sidecar['State']['Status']))
+            return {'state': 'running', 'container_id': gateway_id, 'proxy_state': 'not_ready'}
+        engine.inspect = inspect
+        result = engine.start(instance_id)
+        self.assertEqual(result['proxy_state'], 'not_ready')
+        checks = [event for event in events if event[0] == 'live-check']
+        self.assertEqual(checks, [
+            ('live-check', 'created', 'created'),
+            ('live-check', 'running', 'running'),
+            ('live-check', 'running', 'running'),
+        ])
+        self.assertLess(events.index(('gateway-start', 'start')),
+                        next(i for i, event in enumerate(events)
+                             if event[:2] == ('docker', 'POST')))
+        self.assertEqual(events[events.index(('inspect', 'running', 'running'))],
+                         ('inspect', 'running', 'running'))
+        self.assertFalse(any(event[0] == 'docker' and 'stop' in event[2]
+                             for event in events))
+
+    def test_inspect_stops_proxy_containers_when_live_isolation_drift_is_detected(self):
+        engine = DockerEngine('sha256:' + 'a' * 64,
+                              agent_network_pool='10.244.0.0/24',
+                              frontend_network_pool='10.245.0.0/24')
+        instance_id = 'c' * 32
+        gateway_id, sidecar_id = 'd' * 64, 'e' * 64
+        limits = AgentLimits(ram_bytes=2**30, cpu_millicores=1000,
+                             pids_limit=256, disk_bytes=10 * 1024**3)
+        plan = engine._proxy_network_plan(
+            instance_id, agent_network_pool=engine.agent_network_pool,
+            frontend_network_pool=engine.frontend_network_pool)
+        spec = engine._spec('/srv/agent-data/' + instance_id, limits, version=3,
+                            instance_id=instance_id, proxy_network=plan['agent'],
+                            owner_id='owner-c',
+                            control_ui_origin=f'https://{instance_id}.agents.example.test')
+        gateway = {'Id': gateway_id, 'Config': {'Labels': {
+            **engine._labels(instance_id), engine.SPEC_LABEL: engine._json(spec)}},
+            'State': {'Status': 'running', 'Health': {'Status': 'healthy'}}}
+        sidecar = {'Id': sidecar_id,
+                   'State': {'Status': 'running', 'Health': {'Status': 'healthy'}}}
+        engine._find = lambda instance_id: gateway
+        engine._find_proxy_sidecar = lambda instance_id: sidecar
+        engine._verify = lambda instance_id, observed, expected_spec=None, expected_token=None: gateway_id
+        engine.control_ui_target = lambda instance_id, owner_id: None
+        engine._proxy_firewall_ready = lambda instance_id, gateway_spec: False
+        calls = []
+        def request(method, path, payload=None, *, ok=(200,)):
+            calls.append(path)
+            if path == f'/containers/{sidecar_id}/stop?t=10':
+                sidecar['State']['Status'] = 'exited'
+            elif path == f'/containers/{gateway_id}/stop?t=10':
+                gateway['State'].update({'Status': 'exited', 'ExitCode': 0, 'OOMKilled': False})
+            else:
+                raise AssertionError((method, path))
+            return None
+        engine._request = request
+        result = engine.inspect(instance_id)
+        self.assertEqual(result['state'], 'stopped')
+        self.assertEqual(result['proxy_state'], 'not_ready')
+        self.assertIn(f'/containers/{sidecar_id}/stop?t=10', calls)
+        self.assertIn(f'/containers/{gateway_id}/stop?t=10', calls)
 
     def test_proxy_remove_retains_ipam_unless_purge_is_requested(self):
         instance_id = '7' * 32

@@ -4,11 +4,32 @@
 
 Кабинет передаёт проверенную Open WebUI identity через приватный Unix socket. Только host-supervisor обращается к Docker и XFS. Веб и агенты не получают Docker socket. Пользовательский отчёт для `2afe2b5` подтверждает отдельный реальный purge/XFS сценарий на disposable dataset. Restore и workspace browser реализованы локально, но не прошли VM/browser приёмку.
 
-Локально реализованы BEZR-кнопка, one-time ticket/session handoff, HTTP/WS Access Proxy, relay, Open WebUI host middleware, per-instance agent/frontend-сети, Sidecar lifecycle, `trusted-proxy` config, Supervisor target/readiness, ограниченные HTTP/WebSocket scopes и owner-scoped ручной pairing в существующем `/agent`. Admin HTTP RPC list/approve доступен только внутреннему Sidecar handler; публичный Access Proxy блокирует оба служебных пути. Обычный create остаётся на legacy `NetworkMode=none`; `agent_proxy_v1` остаётся fail-closed, потому что `NFTABLES_SEMANTICS_VALIDATED=false` и не пройдены Linux/Docker/browser acceptance. Sidecar query передаётся через `raw_path_qs`; Access Proxy требует HTTPS/WSS ASGI scope и сверяет канонический `X-Forwarded-For` с ASGI client и `X-Forwarded-Proto`. Фактический peer/scope за Docker TLS edge ещё не проверен. Лимиты Sidecar 128 MiB / 100m / 32 PIDs учитываются в локальном runtime accounting. Это не готовая production-функция; не развёртывать на ВМ до отдельной приёмки.
+Локально реализованы BEZR-кнопка, one-time ticket/session handoff, HTTP/WS Access Proxy, relay, Open WebUI host middleware, per-instance agent/frontend-сети, Sidecar lifecycle, `trusted-proxy` config, Supervisor target/readiness, ограниченные HTTP/WebSocket scopes и owner-scoped ручной pairing в существующем `/agent`. Admin HTTP RPC list/approve доступен только внутреннему Sidecar handler; публичный Access Proxy блокирует оба служебных пути. Обычный create остаётся на legacy `NetworkMode=none`; исходный `NFTABLES_SEMANTICS_VALIDATED` остаётся `False`, а runtime firewall может быть разрешён только при валидном root-owned `firewall-acceptance.json`, созданном после Linux/nftables и Docker isolation acceptance и совпадающем с machine-id hash, policy version и обоими pools. Такой receipt в текущей среде не создан; Linux/Docker/browser acceptance не пройдена. `network_profile_default` по-прежнему `legacy_none`, пока оператор явно не задаст `agent_proxy_v1` после receipt. Sidecar query передаётся через `raw_path_qs`; Access Proxy требует HTTPS/WSS ASGI scope и сверяет канонический `X-Forwarded-For` с ASGI client и `X-Forwarded-Proto`. Фактический peer/scope за Docker TLS edge ещё не проверен. Лимиты Sidecar 128 MiB / 100m / 32 PIDs учитываются в локальном runtime accounting. Это не готовая production-функция; не развёртывать на ВМ до отдельной приёмки.
 
 ## Подготовка на Linux-ВМ
 
 Доставьте код обычным Git-путём. Уже принятые настройки XFS и локальный deployment-профиль менять не нужно. Используется ранее собранный локальный образ OpenClaw; он фиксируется по image ID, автоматического pull нет. Новых Python-пакетов не требуется. Из утилит нужны уже используемые Docker и xfsprogs, включая xfs_io.
+
+### Host-bound acceptance receipt for `agent_proxy_v1`
+
+Для нового disposable Linux/Docker-хоста сначала после отдельного согласия оператора выполнить оркестратор (A и B ниже по runbook выполняются последовательно внутри него):
+
+```bash
+sudo python3 scripts/activate_agent_proxy.py --agent-pool <EXPLICIT_RFC1918_AGENT_TEST_POOL> --frontend-pool <EXPLICIT_RFC1918_FRONTEND_TEST_POOL> --probe-image sha256:<64_HEX_LOCAL_PYTHON3_IMAGE_ID> --state-dir /var/lib/personal-agent-supervisor --execute --confirm-disposable-host
+```
+
+Оркестратор требует Linux, root, уже установленный `ip`/`nft`/`unshare`/Docker и уже локальный immutable probe image; ничего не устанавливает и не скачивает. Если любой из двух проверочных этапов завершается ошибкой, новый receipt не записывается. После двух `PASS` он атомарно создаёт/обновляет `firewall-acceptance.json` с владельцем `root:root`, mode `0600`, внутри root-owned каталога `0700`. Receipt содержит только SHA256 от `/etc/machine-id` (не исходный ID), версию firewall policy, оба точных test pools и имена пройденных этапов. Копия на другой host, изменение pools или policy version закрывают gate. Это локальная root-admin attestation, а не подпись от недоверенного root.
+
+Команда не запускает BEZR/Supervisor и не выбирает network profile. Затем конфигурирование `agent_proxy_v1` требует те же pools, Control UI domain и валидный receipt; `legacy_none` остаётся default:
+
+```text
+--network-profile-default agent_proxy_v1
+--control-ui-domain <EXACT_TEST_DOMAIN_SUFFIX>
+--agent-network-pool <SAME_AGENT_POOL>
+--frontend-network-pool <SAME_FRONTEND_POOL>
+```
+
+Эти аргументы добавляются к обычному `configure_supervisor.py --prepare-host-config`. При старте Supervisor receipt проверяется снова; отсутствие/ошибка/несовпадение означает `semantics_validated=False` и fail-closed. При изменении семантики firewall увеличивать `FIREWALL_POLICY_VERSION` и проходить acceptance заново. В этой локальной Windows-среде orchestrator/live acceptance и запись receipt не выполнялись.
 
 Оператор выбирает **общие** бюджеты RAM/CPU/disk для всех экземпляров, оставляя ресурсы ОС, вебу и будущей модели. Это не остаток после вычитания существующих экземпляров. Ёмкости, пути и UUID другой машины определяются заново. Значения в переносимом runtime.example.json намеренно не заполнены.
 

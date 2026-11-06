@@ -4,6 +4,7 @@
 This intentionally uses a synthetic Docker API fixture: it validates Linux
 route output plus BEZR's Docker-identity checks, not a live Docker daemon.
 """
+import argparse
 from pathlib import Path
 import ipaddress
 import json
@@ -20,12 +21,11 @@ from supervisor.docker_engine import DockerEngine, DockerEngineError
 from supervisor.firewall import (
     NFTABLES_SEMANTICS_VALIDATED, NftablesAdapter, expected_ruleset,
 )
+from supervisor.firewall_acceptance import validate_firewall_network_pools
 from supervisor.network_routes import read_host_ipv4_networks
 from supervisor.probes import run_command
 
 INSTANCE_ID = '5' * 32
-AGENT_POOL = '10.246.0.0/24'
-FRONTEND_POOL = '10.247.0.0/24'
 PARENT_NETNS_ENV = 'BEZR_ISOLATED_PARENT_NETNS_INODE'
 
 
@@ -60,7 +60,7 @@ def _json_prefix_values(document):
     return matches
 
 
-def _new_network_namespace():
+def _new_network_namespace(agent_pool, frontend_pool):
     if sys.platform != 'linux':
         raise RuntimeError('This acceptance check requires Linux')
     missing = [name for name in ('unshare', 'ip', 'nft') if shutil.which(name) is None]
@@ -70,7 +70,8 @@ def _new_network_namespace():
     environment = dict(os.environ)
     environment[PARENT_NETNS_ENV] = parent_inode
     argv = ['unshare', '--net', '--fork', sys.executable, str(Path(__file__).resolve()),
-            '--inside-netns']
+            '--inside-netns', '--agent-pool', agent_pool,
+            '--frontend-pool', frontend_pool]
     process = subprocess.Popen(
         argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL, shell=False, env=environment, start_new_session=True)
@@ -91,7 +92,7 @@ def _new_network_namespace():
     return text
 
 
-def _inside_namespace():
+def _inside_namespace(agent_pool, frontend_pool):
     if sys.platform != 'linux':
         raise RuntimeError('This acceptance check requires Linux')
     parent_inode = os.environ.get(PARENT_NETNS_ENV)
@@ -101,12 +102,12 @@ def _inside_namespace():
 
     engine = DockerEngine(
         'sha256:' + 'a' * 64,
-        agent_network_pool=AGENT_POOL,
-        frontend_network_pool=FRONTEND_POOL,
+        agent_network_pool=agent_pool,
+        frontend_network_pool=frontend_pool,
         host_route_provider=read_host_ipv4_networks)
     plan = engine._proxy_network_plan(
-        INSTANCE_ID, agent_network_pool=AGENT_POOL,
-        frontend_network_pool=FRONTEND_POOL)
+        INSTANCE_ID, agent_network_pool=agent_pool,
+        frontend_network_pool=frontend_pool)
 
     state = {}
     for role, network_id in (('agent', 'a' * 64), ('frontend', 'b' * 64)):
@@ -161,11 +162,11 @@ def _inside_namespace():
 
     engine.__dict__['_request'] = docker_fixture
     first = engine.ensure_proxy_networks(
-        INSTANCE_ID, agent_network_pool=AGENT_POOL,
-        frontend_network_pool=FRONTEND_POOL)
+        INSTANCE_ID, agent_network_pool=agent_pool,
+        frontend_network_pool=frontend_pool)
     second = engine.ensure_proxy_networks(
-        INSTANCE_ID, agent_network_pool=AGENT_POOL,
-        frontend_network_pool=FRONTEND_POOL)
+        INSTANCE_ID, agent_network_pool=agent_pool,
+        frontend_network_pool=frontend_pool)
     if first != plan or second != plan or creates:
         raise RuntimeError('Retained-network route revalidation failed')
 
@@ -174,8 +175,8 @@ def _inside_namespace():
     from supervisor.service import RuntimeService
     def prepare_restore(instance_id, owner_id, domain, host_path):
         restored = engine.ensure_proxy_networks(
-            instance_id, agent_network_pool=AGENT_POOL,
-            frontend_network_pool=FRONTEND_POOL)
+            instance_id, agent_network_pool=agent_pool,
+            frontend_network_pool=frontend_pool)
         return {
             'sidecar_ip': restored['agent']['sidecar_ip'],
             'agent_subnet': restored['agent']['subnet'],
@@ -185,7 +186,7 @@ def _inside_namespace():
     service = RuntimeService.__new__(RuntimeService)
     service.engine = engine
     service.control_ui_domain = 'agents.example.test'
-    service.agent_network_pool = AGENT_POOL
+    service.agent_network_pool = agent_pool
     prepared = service._prepare_control_ui_instance({
         'id': INSTANCE_ID, 'actor': 'isolated-owner',
         'gateway_token': 'synthetic-only', 'network_profile': 'agent_proxy_v1',
@@ -204,8 +205,8 @@ def _inside_namespace():
     try:
         try:
             engine.ensure_proxy_networks(
-                INSTANCE_ID, agent_network_pool=AGENT_POOL,
-                frontend_network_pool=FRONTEND_POOL)
+                INSTANCE_ID, agent_network_pool=agent_pool,
+                frontend_network_pool=frontend_pool)
         except DockerEngineError:
             pass
         else:
@@ -241,22 +242,30 @@ def _inside_namespace():
         if type(table) is not dict or type(table.get('handle')) is not int or table['handle'] <= 0:
             raise RuntimeError('nftables did not return a positive table handle')
     if NFTABLES_SEMANTICS_VALIDATED is not False:
-        raise RuntimeError('The production firewall semantics gate must remain disabled')
+        raise RuntimeError('The source-level firewall default must remain fail-closed')
     return ('PASS: current netns route data including broadcast routes, repeat preparation, '
             'restore preparation, foreign-route rejection, nft -a -j handles and exact '
-            'ruleset read-back. No Docker daemon or user data used; agent_proxy_v1 remains disabled.')
+            'ruleset read-back. No Docker daemon or user data used; no acceptance receipt is written.')
 
 
 def main(argv=None):
-    argv = sys.argv[1:] if argv is None else argv
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--agent-pool', required=True,
+                        help='Explicit RFC1918 IPv4 pool for this isolated route check')
+    parser.add_argument('--frontend-pool', required=True,
+                        help='Second explicit, disjoint RFC1918 IPv4 pool')
+    parser.add_argument('--inside-netns', action='store_true', help=argparse.SUPPRESS)
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     try:
-        if argv == ['--inside-netns']:
-            print(_inside_namespace())
-            return 0
-        if argv:
-            print('Usage: python scripts/linux_proxy_isolated_check.py')
-            return 2
-        print(_new_network_namespace())
+        agent_pool, frontend_pool = validate_firewall_network_pools(
+            args.agent_pool, args.frontend_pool)
+    except ValueError as exc:
+        parser.error(str(exc))
+    try:
+        if args.inside_netns:
+            print(_inside_namespace(agent_pool, frontend_pool))
+        else:
+            print(_new_network_namespace(agent_pool, frontend_pool))
         return 0
     except Exception as exc:
         message = str(exc)

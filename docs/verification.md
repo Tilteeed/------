@@ -2,12 +2,12 @@
 
 ## Локальная проверка текущих изменений
 
-- `python -m unittest discover -s tests -v`: **74 теста, OK**. Pairing, owner-scoping, HTTPS-проверки и запреты прямых маршрутов проверялись тестовыми клиентами/fake Gateway RPC; это не live-проверка OpenClaw.
-- `python -m unittest discover -s supervisor/tests -v`: **165 тестов, OK**. Включает retained `/29` регрессию для обоих адресов — network и broadcast.
-- `python -m compileall -q supervisor control_plane scripts tests`, `node --check web/agent/app.js`, `node --test tests/ui-state.test.mjs` (**6 тестов, OK**) и `git diff --check`: OK. Node-тесты не являются browser E2E.
-- `python scripts/linux_docker_proxy_acceptance.py --help` и `python scripts/control_ui_two_user_acceptance.py --help`: CLI разбирает параметры; запускался только help, не live-приёмка.
-- `scripts/linux_proxy_isolated_check.py` на Linux не запускался; предыдущий вызов на Windows остановился на platform guard (`This acceptance check requires Linux`) до сетевых действий. Namespace/nft/Docker-проверки не было.
-- Linux/Docker/реальный OpenClaw Gateway, TLS/WSS/browser pairing и live two-user приёмка не выполнялись. `NFTABLES_SEMANTICS_VALIDATED` остаётся `False`; `agent_proxy_v1` остаётся fail-closed и не является default. Подготовленные скрипты требуют отдельно согласованной disposable-среды.
+- `python -m unittest discover -s tests -v`: **75 тестов, OK**. Pairing, owner-scoping, HTTPS-проверки и запреты прямых маршрутов проверялись тестовыми клиентами/fake Gateway RPC; это не live-проверка OpenClaw.
+- `python -m unittest discover -s supervisor/tests -v`: **193 теста, OK**. Включает explicit false/true FirewallManager semantics, receipt workflow, exact pool propagation to both acceptance checks, fail-closed production wiring и retained `/29` regressions.
+- `python -m compileall -q supervisor control_plane scripts tests` и `git diff --check`: OK в текущем increment. UI JS не менялся; `node --check` и `node --test` повторно не запускались, ранее записан результат 6 тестов OK; это не browser E2E.
+- `python scripts/activate_agent_proxy.py --help`, `python scripts/configure_supervisor.py --help`, `python scripts/linux_docker_proxy_acceptance.py --help` и `python scripts/control_ui_two_user_acceptance.py --help`: CLI разбирают параметры; запускался только help, не live-приёмка.
+- Нынешний `scripts/linux_proxy_isolated_check.py` требует явные agent/frontend pools; на Linux его не запускали. Ранее, до появления CLI-параметров pools, вызов на Windows останавливался на platform guard (`This acceptance check requires Linux`) до сетевых действий. Namespace/nft/Docker-проверки не было.
+- Linux/Docker/реальный OpenClaw Gateway, TLS/WSS/browser pairing и live two-user приёмка не выполнялись. Исходный `NFTABLES_SEMANTICS_VALIDATED` остаётся `False`; runtime firewall разрешается только с host-bound root-owned receipt (machine-id hash, policy version, exact pools), которого в текущей среде нет. `agent_proxy_v1` поэтому остаётся fail-closed и не является default. Подготовленный orchestrator/receipt workflow на Linux не запускался.
 
 ## Успешные локальные проверки (исторический базис первой части)
 

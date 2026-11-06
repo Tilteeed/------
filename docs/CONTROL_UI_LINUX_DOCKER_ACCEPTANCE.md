@@ -2,9 +2,11 @@
 
 ## Статус и границы
 
-Runbook и скрипты подготовлены локально. Они **не запускались** на Linux, Docker, nftables или ВМ; текущая среда — Windows. ВМ не создавалась, подключений не было. `NFTABLES_SEMANTICS_VALIDATED` остаётся `False`, production-профиль `agent_proxy_v1` остаётся fail-closed. Обычный `create` остаётся на `legacy_none`.
+Runbook и скрипты подготовлены локально. Они **не запускались** на Linux, Docker, nftables или ВМ; текущая среда — Windows. ВМ не создавалась, подключений не было. Исходный `NFTABLES_SEMANTICS_VALIDATED` остаётся `False`; runtime gate может открыться только по валидному root-owned receipt после A+B. Receipt в текущей среде отсутствует, поэтому `agent_proxy_v1` здесь остаётся fail-closed. Обычный `create` остаётся на `legacy_none`.
 
 Скрипты предназначены только для новой disposable Linux/Docker-ВМ с синтетическими пользователями и данными. Не запускать их на действующей ВМ: они меняют firewall-таблицы и временно создают Docker networks/containers. Они не запускают `docker pull`, не создают volumes и не обращаются к проектной SQLite/XFS. До отдельного согласования тестового target и доступа ничего здесь не исполнять.
+
+В runtime Docker lifecycle разделён: `created` проверяется по точному набору сетей и `IPAMConfig.IPv4Address`; пустые `NetworkID`/`IPAddress` допустимы только на этом этапе и не означают готовность. Для `running` обязательны фактические IDs/IP и membership. `paused`/`restarting` не принимаются как config-only состояния и требуют фактических endpoint-параметров; они не считаются готовыми. Перед стартом проверяется nftables policy, после запуска Gateway и Sidecar live-проверки выполняются повторно; Control UI не открывается без успешных проверок и здоровых контейнеров. Регрессионные тесты содержат shape ответа Docker 29.5.3, сообщённый для стадии `created`; это не заменяет проверку на реальном Docker Engine.
 
 ## Скрипты
 
@@ -17,6 +19,8 @@ Runbook и скрипты подготовлены локально. Они **н
 Gateway-интеграция закреплена на OpenClaw commit `7c12438929e5d198616fe8f602d896e011647d39`. Sidecar использует Admin HTTP RPC `POST /api/v1/admin/rpc` с envelope этой версии (`ok` и `payload`) только для методов `device.pair.list` и `device.pair.approve`. Browser relay запрещает Gateway RPC path и private Sidecar pairing path; BEZR API получает owner/instance только из проверенной сессии и текущего runtime, а не из переданных браузером target fields. Перед approve перечитывается текущее pending request, затем сравниваются request/device/role/scopes с тем, что увидел владелец; допускаются только штатный Control UI, точный instance origin и allowlisted non-admin scopes. После approve повторно читается список устройств. Это локально проверенный контракт, но не доказательство того, что закреплённый Gateway уже принял его в runtime.
 
 Ни один из этих тестов не заменяет ручную проверку штатного Control UI в двух отдельных браузерных профилях и его реального WSS handshake/reconnect.
+
+`scripts/activate_agent_proxy.py` — receipt-producing orchestrator: повторно запускает A и B на одном disposable host и только после обоих `PASS` пишет root-owned receipt в `state_dir/firewall-acceptance.json`. Запуск одного A/B отдельно receipt не создаёт. Receipt открывает только host-scoped firewall semantics gate; он не подтверждает HTTPS/WSS, pairing или готовность production UI.
 
 ## Условия до запуска
 
@@ -34,7 +38,7 @@ Gateway-интеграция закреплена на OpenClaw commit `7c124389
 В disposable VM, с правами, необходимыми для `unshare`:
 
 ```bash
-python3 scripts/linux_proxy_isolated_check.py
+python3 scripts/linux_proxy_isolated_check.py --agent-pool <EXPLICIT_RFC1918_AGENT_TEST_POOL> --frontend-pool <EXPLICIT_RFC1918_FRONTEND_TEST_POOL>
 ```
 
 Ожидать явный `PASS`; скрипт сам сообщает, что Docker API в этой фазе synthetic и production gate остаётся закрыт. При несовпадении сохранить ограниченный вывод/наблюдаемые prefix objects и фактический `nft -a -j` результат. Не менять `_normalise_table()` и не ослаблять сравнение до подтверждения формата по фактическому JSON.
@@ -52,6 +56,14 @@ sudo python3 scripts/linux_docker_proxy_acceptance.py \
 ```
 
 Скрипт требует root и проверяет, что dedicated `inet`/`bridge` `agent_proxy_v1` tables отсутствуют. Временная политика содержит только два synthetic instance endpoint pairs; её readback сверяется полностью. Проверяются WebUI-probe → оба Sidecar-probe, каждый Sidecar-probe → свой Gateway-probe, отрицательные cross-owner/host/routed probes и host-to-container/ container-to-host probes. После завершения удаляются только созданные им container/network IDs и его dedicated tables. Нет `docker system prune`, удаления volumes, SQLite или каталогов данных.
+
+Отдельный запуск A и B — диагностика и не записывает activation receipt. Для него выполнить оркестратор, который повторяет оба теста на том же disposable host и создаёт receipt только при двух `PASS`:
+
+```bash
+sudo python3 scripts/activate_agent_proxy.py --agent-pool <SAME_AGENT_POOL> --frontend-pool <SAME_FRONTEND_POOL> --probe-image sha256:<64_HEX_LOCAL_IMAGE_ID> --state-dir /var/lib/personal-agent-supervisor --execute --confirm-disposable-host
+```
+
+Если любой этап завершается ошибкой, новая запись не создаётся. Receipt привязан к SHA256 machine-id, policy version и точным pools; после него `configure_supervisor.py` может принять `--network-profile-default agent_proxy_v1`, но только с теми же pools и явным Control UI domain. Это открывает только firewall semantics gate, не завершает C/D и не подтверждает production UI.
 
 Если скрипт прерван аварийно или сообщает `CLEANUP INCOMPLETE`, не запускать его повторно и не применять global flush/prune. Остановиться, зафиксировать точный run ID и выполнить только согласованное read-only расследование состояния выделенной ВМ.
 

@@ -16,6 +16,10 @@ import sys
 # Permit execution from the project root without installing this project.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from supervisor.config import load_profile
+from supervisor.firewall_acceptance import (
+    build_firewall_acceptance_receipt, load_firewall_acceptance_receipt,
+)
+from supervisor.runtime_store import RuntimeStore
 from supervisor.probes import ProbeFailure, run_command
 
 
@@ -24,6 +28,24 @@ def amount(value):
     if not 0 <= number <= 2**63 - 1:
         raise argparse.ArgumentTypeError('Expected non-negative int64')
     return number
+
+
+def validate_network_activation(profile, domain, agent_pool, frontend_pool, state_dir):
+    if profile not in RuntimeStore.NETWORK_PROFILES:
+        raise ValueError('Invalid default network profile')
+    if (agent_pool is None) != (frontend_pool is None):
+        raise ValueError('Both agent and frontend network pools are required together')
+    if agent_pool is not None:
+        try:
+            build_firewall_acceptance_receipt(
+                '0' * 64, agent_pool, frontend_pool, accepted_at_unix=1)
+        except ValueError:
+            raise ValueError('Explicit disjoint RFC1918 agent and frontend network pools required') from None
+    if profile == RuntimeStore.NETWORK_PROFILE_PROXY:
+        if domain is None or agent_pool is None:
+            raise ValueError('agent_proxy_v1 requires a Control UI domain and both explicit pools')
+        if not load_firewall_acceptance_receipt(state_dir, agent_pool, frontend_pool):
+            raise ValueError('A matching host-bound Linux/Docker acceptance receipt is required')
 
 
 def main(argv=None):
@@ -36,6 +58,10 @@ def main(argv=None):
     parser.add_argument('--disk-floor-bytes', type=amount, required=True)
     parser.add_argument('--control-ui-domain', default=None,
                         help='Trusted wildcard subdomain suffix for isolated Control UI origins')
+    parser.add_argument('--network-profile-default', choices=sorted(RuntimeStore.NETWORK_PROFILES),
+                        default=RuntimeStore.NETWORK_PROFILE_LEGACY)
+    parser.add_argument('--agent-network-pool', default=None)
+    parser.add_argument('--frontend-network-pool', default=None)
     parser.add_argument('--state-dir', default='/var/lib/personal-agent-supervisor')
     parser.add_argument('--socket-path', default='/run/personal-agent-supervisor/control.sock')
     parser.add_argument('--prepare-host-config', action='store_true')
@@ -48,6 +74,12 @@ def main(argv=None):
         if (len(args.control_ui_domain) > 253 or len(labels) < 2
                 or any(label_re.fullmatch(label) is None for label in labels)):
             parser.error('Control UI domain must be an exact lowercase DNS suffix without wildcards')
+    try:
+        validate_network_activation(
+            args.network_profile_default, args.control_ui_domain,
+            args.agent_network_pool, args.frontend_network_pool, args.state_dir)
+    except ValueError as error:
+        parser.error(str(error))
     if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,255}', args.image) is None:
         parser.error('Explicit local image name or immutable ID required')
     try:
@@ -117,10 +149,10 @@ def main(argv=None):
             'image': image, 'capacity_ram_bytes': args.capacity_ram_bytes,
             'capacity_cpu_millicores': args.capacity_cpu_millicores,
             'capacity_disk_bytes': args.capacity_disk_bytes, 'disk_floor_bytes': args.disk_floor_bytes,
-            'network_profile_default': 'legacy_none',
+            'network_profile_default': args.network_profile_default,
             'control_ui_domain': args.control_ui_domain,
-            'agent_network_pool': None,
-            'frontend_network_pool': None,
+            'agent_network_pool': args.agent_network_pool,
+            'frontend_network_pool': args.frontend_network_pool,
         }
         descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(descriptor, 'w', encoding='utf-8') as target:

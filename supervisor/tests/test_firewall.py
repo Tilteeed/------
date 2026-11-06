@@ -306,20 +306,28 @@ class FirewallPolicyTests(unittest.TestCase):
                 agent_pair=EndpointPair('10.240.0.2', '10.240.0.4'),
                 frontend_pair=EndpointPair('10.248.0.2', '10.248.0.3'))
 
-    def test_readiness_fails_closed_until_enabled_and_exact_table_present(self):
+    def test_unvalidated_manager_fails_closed_before_apply(self):
+        n = network()
+        adapter = FakeAdapter(expected_ruleset((n,)))
+        manager = FirewallManager(adapter, semantics_validated=False)
+        self.assertFalse(manager.ready((n,)))
+        with self.assertRaises(FirewallError):
+            manager.apply((n,))
+        self.assertEqual(adapter.writes, [])
+
+    def test_explicitly_validated_manager_applies_exact_policy_and_rejects_drift(self):
         n = network()
         expected = expected_ruleset((n,))
-        adapter = FakeAdapter(expected)
-        self.assertFalse(FirewallManager(adapter).ready((n,)))
+        adapter = FakeAdapter()
         manager = FirewallManager(adapter, semantics_validated=True)
+        result = manager.apply((n,))
+        self.assertEqual(result, expected)
+        self.assertEqual(adapter.read(), expected)
         self.assertTrue(manager.ready((n,)))
         if adapter.state is None:
             self.fail('Fake adapter state unexpectedly absent')
-        drop_rule = next(rule for rule in adapter.state['tables']['inet']['rules']
-                         if rule['expr'][-1] == {'drop': None})
-        drop_rule['expr'][-1] = {'accept': None}
+        adapter.state['tables']['inet']['rules'][0]['comment'] += ' drift'
         self.assertFalse(manager.ready((n,)))
-        self.assertFalse(manager.ready(()))
 
     def test_drift_in_table_chain_or_pair_never_reports_ready(self):
         n = network()

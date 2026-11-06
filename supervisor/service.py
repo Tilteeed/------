@@ -807,6 +807,16 @@ class RuntimeService:
                 self.store.observe(instance['id'], state, info.get('container_id'))
 
 
+def _runtime_firewall(config):
+    """Build the production firewall manager from the host-local acceptance receipt."""
+    from .firewall import FirewallManager, NftablesAdapter
+    from .firewall_acceptance import load_firewall_acceptance_receipt
+    accepted = load_firewall_acceptance_receipt(
+        config['state_dir'], config.get('agent_network_pool'),
+        config.get('frontend_network_pool'))
+    return FirewallManager(NftablesAdapter(), semantics_validated=accepted)
+
+
 class RuntimeApplication(RuntimeService):
     """DI entry point. Inject all adapters plus initialize for non-Linux smoke.
 
@@ -825,7 +835,8 @@ class RuntimeApplication(RuntimeService):
             from .docker_engine import DockerEngine
             engine = DockerEngine(
                 config['image'], agent_network_pool=config.get('agent_network_pool'),
-                frontend_network_pool=config.get('frontend_network_pool'))
+                frontend_network_pool=config.get('frontend_network_pool'),
+                firewall=_runtime_firewall(config))
         if metrics is None:
             metrics = HostMetrics(profile.storage.mountpoint, clock=clock)
         super().__init__(profile, store, volumes, engine, metrics,

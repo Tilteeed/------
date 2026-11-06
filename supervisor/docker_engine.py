@@ -1,9 +1,9 @@
 """Fail-closed Linux Docker Engine v1.45 client (stdlib only).
 
 No Docker SDK, image pulls, agent-visible Docker socket or published agent ports.
-Proxy IPAM uses bounded, read-only iproute2 probes. The dedicated nft adapter is
-injected but remains code-gated until Linux/Docker semantics are validated.
-Legacy spec v1 remains the default and keeps NetworkMode=none.
+Proxy IPAM uses bounded, read-only iproute2 probes. Production firewall activation is
+injected from a host-bound acceptance receipt; direct/default construction stays
+fail-closed. Legacy spec v1 remains the default and keeps NetworkMode=none.
 """
 from dataclasses import asdict
 import hashlib
@@ -22,8 +22,7 @@ from urllib.parse import quote, urlencode, urlsplit
 
 from .config import AgentLimits
 from .firewall import (
-    EndpointPair, FirewallManager, NftablesAdapter, NetworkPolicy,
-    NFTABLES_SEMANTICS_VALIDATED, validate_networks,
+    EndpointPair, FirewallManager, NftablesAdapter, NetworkPolicy, validate_networks,
 )
 from .network_routes import HostIPv4Inventory, read_host_ipv4_networks
 
@@ -93,6 +92,8 @@ class DockerEngine:
     PROXY_TOKEN_FILE_CONTAINER = '/run/secrets/bezr-proxy-token'
     _SIDECAR_TOKEN = re.compile(r'[A-Za-z0-9_-]{40,64}\Z')
 
+    _CONFIG_ONLY_CONTAINER_STATES = frozenset({'created', 'exited', 'dead'})
+    _LIVE_NOT_READY_CONTAINER_STATES = frozenset({'paused', 'restarting'})
     _INSTANCE = re.compile(r'[0-9a-f]{32}\Z')
     _OBJECT = re.compile(r'[0-9a-f]{64}\Z')
     _IMAGE = re.compile(r'(?:sha256:[0-9a-f]{64}|[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64})\Z')
@@ -136,7 +137,7 @@ class DockerEngine:
             self.agent_network_pool = None
             self.frontend_network_pool = None
         self.firewall = (firewall if firewall is not None else FirewallManager(
-            NftablesAdapter(), semantics_validated=NFTABLES_SEMANTICS_VALIDATED))
+            NftablesAdapter(), semantics_validated=False))
         if host_route_provider is not None and not callable(host_route_provider):
             raise ValueError('Host route provider must be callable')
         self.host_route_provider = host_route_provider or read_host_ipv4_networks
@@ -170,6 +171,38 @@ class DockerEngine:
         if not isinstance(object_id, str) or not cls._OBJECT.fullmatch(object_id):
             raise DockerEngineError('Docker Engine returned an invalid object identity')
         return object_id
+
+    @staticmethod
+    def _container_status(observed):
+        state = observed.get('State') if type(observed) is dict else None
+        status = state.get('Status') if type(state) is dict else None
+        if type(status) is not str or not status:
+            raise ValueError('Docker container lifecycle state is unavailable')
+        return status
+
+    def _verify_proxy_endpoint(self, observed, network_name, network_id, ipv4):
+        status = self._container_status(observed)
+        settings = observed.get('NetworkSettings')
+        networks = settings.get('Networks') if type(settings) is dict else None
+        attached = networks.get(network_name) if type(networks) is dict else None
+        if type(attached) is not dict:
+            raise ValueError('Expected Docker network endpoint is unavailable')
+        ipam = attached.get('IPAMConfig')
+        configured_ip = ipam.get('IPv4Address') if type(ipam) is dict else None
+        observed_network_id = attached.get('NetworkID')
+        observed_ip = attached.get('IPAddress')
+        if status == 'running' or status in self._LIVE_NOT_READY_CONTAINER_STATES:
+            if (type(ipam) is not dict or configured_ip != ipv4
+                    or observed_network_id != network_id or observed_ip != ipv4):
+                raise ValueError('Live Docker network endpoint does not match policy')
+        elif status in self._CONFIG_ONLY_CONTAINER_STATES:
+            if (configured_ip != ipv4
+                    or observed_network_id not in (None, '', network_id)
+                    or observed_ip not in (None, '', ipv4)):
+                raise ValueError('Created Docker network configuration does not match policy')
+        else:
+            raise ValueError('Docker container lifecycle state is not safe to verify')
+        return status
 
     def _request(self, method, path, payload=None, *, ok=(200,)):
         """One bounded request. Deliberately no API negotiation or automatic pull."""
@@ -922,12 +955,25 @@ class DockerEngine:
             raise DockerEngineError('Firewall policy cleanup could not be verified') from None
 
     def _verify_proxy_network_membership(self, instance_id, role, network_id,
-                                         expected_plan, expected_container_ids):
+                                         expected_plan, expected_container_ids, *,
+                                         expected_ips, allow_unstarted=False):
         instance_id = self._instance(instance_id)
         network_id = self._object(network_id)
-        if role not in {'agent', 'frontend'} or type(expected_container_ids) is not set:
+        if (role not in {'agent', 'frontend'} or type(expected_container_ids) is not set
+                or type(expected_ips) is not dict or type(allow_unstarted) is not bool):
             raise ValueError('Invalid proxy network membership request')
         expected_ids = {self._object(item) for item in expected_container_ids}
+        if set(expected_ips) != expected_ids:
+            raise ValueError('Proxy network endpoint identities are incomplete')
+        for address in expected_ips.values():
+            if type(address) is not str:
+                raise ValueError('Invalid expected proxy network address')
+            try:
+                canonical = str(ipaddress.IPv4Address(address))
+            except ValueError:
+                raise ValueError('Invalid expected proxy network address') from None
+            if canonical != address:
+                raise ValueError('Invalid expected proxy network address')
         pool = self.agent_network_pool if role == 'agent' else self.frontend_network_pool
         if type(pool) is not str:
             raise DockerEngineError('Proxy network pools are unavailable')
@@ -938,9 +984,53 @@ class DockerEngine:
             instance_id, role, observed, self._proxy_pool(pool))
         if actual_plan != expected_plan:
             raise DockerEngineError('Proxy network plan verification failed')
-        containers = observed.get('Containers') or {}
-        if type(containers) is not dict or set(containers) != expected_ids:
+        raw_containers = observed.get('Containers')
+        containers = {} if raw_containers is None else raw_containers
+        if type(containers) is not dict:
             raise DockerEngineError('Proxy network membership verification failed')
+        actual_ids = set(containers)
+        if actual_ids - expected_ids:
+            raise DockerEngineError('Proxy network has an unexpected container participant')
+        if not allow_unstarted and actual_ids != expected_ids:
+            raise DockerEngineError('Proxy network membership verification failed')
+        for container_id in expected_ids:
+            member = containers.get(container_id)
+            container = self._request('GET', '/containers/' + container_id + '/json')
+            if type(container) is not dict or container.get('Id') != container_id:
+                raise DockerEngineError('Proxy network participant identity verification failed')
+            try:
+                status = self._verify_proxy_endpoint(
+                    container, expected_plan['name'], network_id, expected_ips[container_id])
+            except (ValueError, KeyError, TypeError):
+                raise DockerEngineError('Proxy network participant endpoint verification failed') from None
+            if status == 'running' or status in self._LIVE_NOT_READY_CONTAINER_STATES:
+                if container_id not in actual_ids or type(member) is not dict:
+                    raise DockerEngineError('Live proxy participant is absent from its network')
+                member_address = member.get('IPv4Address')
+                if type(member_address) is not str:
+                    raise DockerEngineError('Live proxy participant network address is unavailable')
+                try:
+                    member_ip = str(ipaddress.ip_interface(member_address).ip)
+                except ValueError:
+                    raise DockerEngineError('Live proxy participant network address is invalid') from None
+                if member_ip != expected_ips[container_id]:
+                    raise DockerEngineError('Live proxy participant network address drifted')
+            elif status in self._CONFIG_ONLY_CONTAINER_STATES and allow_unstarted:
+                if container_id in actual_ids:
+                    if type(member) is not dict:
+                        raise DockerEngineError('Proxy participant network metadata is invalid')
+                    member_address = member.get('IPv4Address')
+                    if member_address not in (None, ''):
+                        if type(member_address) is not str:
+                            raise DockerEngineError('Proxy participant network address is invalid')
+                        try:
+                            member_ip = str(ipaddress.ip_interface(member_address).ip)
+                        except ValueError:
+                            raise DockerEngineError('Proxy participant network address is invalid') from None
+                        if member_ip != expected_ips[container_id]:
+                            raise DockerEngineError('Proxy participant network address drifted')
+            else:
+                raise DockerEngineError('Proxy network is not in a safe lifecycle state')
         return observed
 
     def _existing_proxy_network(self, instance_id, role):
@@ -1027,14 +1117,21 @@ class DockerEngine:
             host_path=host_path, plan=plan)
         sidecar_id = self._create_proxy_sidecar(instance_id, payload, plan, network_ids)
         expected_agent_ids = {self._object(sidecar_id)}
+        expected_agent_ips = {self._object(sidecar_id): plan['agent']['sidecar_ip']}
         gateway = self._find(instance_id)
         if gateway is not None:
-            expected_agent_ids.add(self._object(gateway.get('Id')))
+            gateway_id = self._verify(instance_id, gateway)
+            expected_agent_ids.add(gateway_id)
+            expected_agent_ips[gateway_id] = plan['agent']['gateway_ip']
         self._verify_proxy_network_membership(
-            instance_id, 'agent', network_ids['agent'], plan['agent'], expected_agent_ids)
+            instance_id, 'agent', network_ids['agent'], plan['agent'], expected_agent_ids,
+            expected_ips=expected_agent_ips, allow_unstarted=True)
         self._verify_proxy_network_membership(
             instance_id, 'frontend', network_ids['frontend'], plan['frontend'],
-            {web['container_id'], sidecar_id})
+            {web['container_id'], sidecar_id},
+            expected_ips={web['container_id']: plan['frontend']['web_ip'],
+                          sidecar_id: plan['frontend']['sidecar_ip']},
+            allow_unstarted=True)
         return {'sidecar_ip': plan['agent']['sidecar_ip'],
                 'agent_subnet': plan['agent']['subnet'],
                 'control_ui_origin': origin}
@@ -1108,11 +1205,9 @@ class DockerEngine:
                 raise ValueError
             for role in ('agent', 'frontend'):
                 name = plan[role]['name']
-                attached = networks[name]
                 expected_ip = plan[role]['sidecar_ip']
-                if (type(attached) is not dict or attached.get('NetworkID') != network_ids[role]
-                        or attached.get('IPAddress') != expected_ip):
-                    raise ValueError
+                self._verify_proxy_endpoint(
+                    observed, name, network_ids[role], expected_ip)
             if any((settings.get('Ports') or {}).values()):
                 raise ValueError
             return container_id
@@ -1177,12 +1272,15 @@ class DockerEngine:
                 'EndpointConfig': {'IPAMConfig': {'IPv4Address': ipv4}},
             }, ok=(200,))
             observed = self._request('GET', '/containers/' + container_id + '/json')
-            settings = observed.get('NetworkSettings') if type(observed) is dict else None
+            if type(observed) is not dict or observed.get('Id') != container_id:
+                raise DockerEngineError('Container identity verification failed after network connect')
+            settings = observed.get('NetworkSettings')
             networks = settings.get('Networks') if type(settings) is dict else None
             attached = networks.get(network_name) if type(networks) is dict else None
-        if (type(attached) is not dict or attached.get('NetworkID') != network_id
-                or attached.get('IPAddress') != ipv4):
-            raise DockerEngineError('Static container network endpoint verification failed')
+        try:
+            self._verify_proxy_endpoint(observed, network_name, network_id, ipv4)
+        except ValueError:
+            raise DockerEngineError('Static container network endpoint verification failed') from None
         return observed
 
     def _find_proxy_sidecar(self, instance_id):
@@ -1508,16 +1606,20 @@ class DockerEngine:
                     raise ValueError
                 network_id = self._proxy_network_id(
                     instance_id, 'agent', proxy_network)
-                if (attached.get('NetworkID') != network_id
-                        or attached.get('IPAddress') != proxy_network['gateway_ip']):
-                    raise ValueError
+                self._verify_proxy_endpoint(
+                    observed, network_name, network_id, proxy_network['gateway_ip'])
                 sidecar = self._find_proxy_sidecar(instance_id)
                 if sidecar is None:
                     raise ValueError
                 sidecar_id = self._object(sidecar['Id'])
+                if sidecar_id == container_id:
+                    raise ValueError
                 self._verify_proxy_network_membership(
                     instance_id, 'agent', network_id, proxy_network,
-                    {container_id, sidecar_id})
+                    {container_id, sidecar_id},
+                    expected_ips={container_id: proxy_network['gateway_ip'],
+                                  sidecar_id: proxy_network['sidecar_ip']},
+                    allow_unstarted=True)
             return container_id
         except (ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError):
             raise DockerEngineError('Managed container configuration verification failed') from None
@@ -1645,6 +1747,11 @@ class DockerEngine:
                 plan=plan)
             sidecar_id = self._verify_proxy_sidecar(
                 instance_id, sidecar, expected_sidecar, plan, network_ids)
+            self._verify_proxy_endpoint(
+                {'State': {'Status': 'running'},
+                 'NetworkSettings': {'Networks': web['networks']}},
+                plan['frontend']['name'], network_ids['frontend'],
+                plan['frontend']['web_ip'])
             gateway_state = gateway.get('State') or {}
             sidecar_state = sidecar.get('State') or {}
             if (gateway_state.get('Status') != 'running'
@@ -1654,10 +1761,14 @@ class DockerEngine:
                 return None
             self._verify_proxy_network_membership(
                 instance_id, 'agent', network_ids['agent'], plan['agent'],
-                {gateway_id, sidecar_id})
+                {gateway_id, sidecar_id},
+                expected_ips={gateway_id: plan['agent']['gateway_ip'],
+                              sidecar_id: plan['agent']['sidecar_ip']})
             self._verify_proxy_network_membership(
                 instance_id, 'frontend', network_ids['frontend'], plan['frontend'],
-                {web['container_id'], sidecar_id})
+                {web['container_id'], sidecar_id},
+                expected_ips={web['container_id']: plan['frontend']['web_ip'],
+                              sidecar_id: plan['frontend']['sidecar_ip']})
             firewall_ready = getattr(self.firewall, 'ready', None)
             policy = self._proxy_firewall_policy(instance_id, plan)
             policies = self.proxy_network_policies()
@@ -1677,16 +1788,25 @@ class DockerEngine:
                     or latest_web['container_id'] != web['container_id']
                     or latest_web['image_id'] != web['image_id']):
                 return None
+            self._verify_proxy_endpoint(
+                {'State': {'Status': 'running'},
+                 'NetworkSettings': {'Networks': latest_web['networks']}},
+                plan['frontend']['name'], network_ids['frontend'],
+                plan['frontend']['web_ip'])
             for latest in (latest_gateway, latest_sidecar):
                 state = latest.get('State') or {}
                 if state.get('Status') != 'running' or (state.get('Health') or {}).get('Status') != 'healthy':
                     return None
             self._verify_proxy_network_membership(
                 instance_id, 'agent', network_ids['agent'], plan['agent'],
-                {latest_gateway_id, latest_sidecar_id})
+                {latest_gateway_id, latest_sidecar_id},
+                expected_ips={latest_gateway_id: plan['agent']['gateway_ip'],
+                              latest_sidecar_id: plan['agent']['sidecar_ip']})
             self._verify_proxy_network_membership(
                 instance_id, 'frontend', network_ids['frontend'], plan['frontend'],
-                {latest_web['container_id'], latest_sidecar_id})
+                {latest_web['container_id'], latest_sidecar_id},
+                expected_ips={latest_web['container_id']: plan['frontend']['web_ip'],
+                              latest_sidecar_id: plan['frontend']['sidecar_ip']})
             policies = self.proxy_network_policies()
             if policy not in policies or firewall_ready(policies) is not True:
                 return None
@@ -1706,7 +1826,22 @@ class DockerEngine:
         observed = self._find(instance_id)
         if observed is None:
             return {'state': 'absent', 'gateway': 'unknown', 'container_id': None}
-        container_id = self._verify(instance_id, observed)
+        try:
+            container_id = self._verify(instance_id, observed)
+        except Exception:
+            try:
+                failed_spec = json.loads(observed.get('Config', {}).get('Labels', {}).get(
+                    self.SPEC_LABEL, '{}'))
+                docker_status = (observed.get('State') or {}).get('Status')
+                is_live_proxy = (type(failed_spec) is dict
+                                 and failed_spec.get('version') == 3
+                                 and docker_status in {'running', 'paused', 'restarting'})
+            except Exception:
+                is_live_proxy = False
+            if is_live_proxy and not self._stop_proxy_containers(instance_id):
+                raise DockerEngineError(
+                    'Proxy verification failed and container stop could not be verified') from None
+            raise
         status = observed.get('State') or {}
         docker_state = status.get('Status')
         if docker_state == 'running':
@@ -1732,6 +1867,26 @@ class DockerEngine:
         if spec_version == 3:
             spec = json.loads(observed['Config']['Labels'][self.SPEC_LABEL])
             target = self.control_ui_target(instance_id, spec['owner_id'])
+            if target is None and state == 'running' and not self._proxy_firewall_ready(instance_id, spec):
+                if not self._stop_proxy_containers(instance_id):
+                    raise DockerEngineError(
+                        'Proxy isolation drift detected and container stop could not be verified')
+                latest = self._find(instance_id)
+                if latest is None:
+                    result.update({'state': 'absent', 'gateway': 'unknown', 'container_id': None})
+                else:
+                    latest_state = latest.get('State') or {}
+                    latest_status = latest_state.get('Status') if type(latest_state) is dict else None
+                    if latest_status == 'created':
+                        result['state'] = 'created'
+                    elif (latest_status == 'exited' and latest_state.get('ExitCode') == 0
+                          and not latest_state.get('OOMKilled')):
+                        result['state'] = 'stopped'
+                    elif latest_status in {'exited', 'dead'}:
+                        result['state'] = 'failed'
+                    else:
+                        raise DockerEngineError('Proxy containers remained live after stop')
+                    result['gateway'] = 'not_ready'
             result['proxy_state'] = 'ready' if target is not None else 'not_ready'
             result['proxy_identity'] = target['identity'] if target is not None else None
         return result
@@ -1813,12 +1968,23 @@ class DockerEngine:
             sidecar_id = self._verify_proxy_sidecar(
                 instance_id, sidecar, expected_sidecar, plan, network_ids)
             gateway_id = self._object(gateway.get('Id'))
+            self._verify_proxy_endpoint(
+                {'State': {'Status': 'running'},
+                 'NetworkSettings': {'Networks': web['networks']}},
+                plan['frontend']['name'], network_ids['frontend'],
+                plan['frontend']['web_ip'])
             self._verify_proxy_network_membership(
                 instance_id, 'agent', network_ids['agent'], plan['agent'],
-                {gateway_id, sidecar_id})
+                {gateway_id, sidecar_id},
+                expected_ips={gateway_id: plan['agent']['gateway_ip'],
+                              sidecar_id: plan['agent']['sidecar_ip']},
+                allow_unstarted=True)
             self._verify_proxy_network_membership(
                 instance_id, 'frontend', network_ids['frontend'], plan['frontend'],
-                {web['container_id'], sidecar_id})
+                {web['container_id'], sidecar_id},
+                expected_ips={web['container_id']: plan['frontend']['web_ip'],
+                              sidecar_id: plan['frontend']['sidecar_ip']},
+                allow_unstarted=True)
             policy = self._proxy_firewall_policy(instance_id, plan)
             policies = self.proxy_network_policies()
             return policy in policies and ready(policies) is True
@@ -1881,6 +2047,32 @@ class DockerEngine:
         """Remove partial proxy containers and web attachment, retaining IPAM/data."""
         return self._remove_proxy_resources(instance_id, retain_networks=True)
 
+    def _stop_proxy_containers(self, instance_id):
+        """Best-effort rollback; return true only after both live containers are stopped."""
+        instance_id = self._instance(instance_id)
+        clean = True
+        for finder in (self._find_proxy_sidecar, self._find):
+            try:
+                observed = finder(instance_id)
+                if observed is None:
+                    continue
+                container_id = self._object(observed.get('Id'))
+                state = observed.get('State') or {}
+                status = state.get('Status') if type(state) is dict else None
+                if status not in {'created', 'exited', 'dead'}:
+                    if status == 'paused':
+                        self._request('POST', f'/containers/{container_id}/unpause', ok=(204,))
+                    self._request('POST', f'/containers/{container_id}/stop?t=10', ok=(204, 304))
+                latest = finder(instance_id)
+                if latest is not None:
+                    latest_state = latest.get('State') or {}
+                    if (type(latest_state) is not dict
+                            or latest_state.get('Status') not in {'created', 'exited', 'dead'}):
+                        clean = False
+            except Exception:
+                clean = False
+        return clean
+
     def start(self, instance_id):
         instance_id = self._instance(instance_id)
         observed = self._find(instance_id)
@@ -1893,27 +2085,57 @@ class DockerEngine:
             raise DockerEngineError('Managed container configuration verification failed') from None
         if type(spec) is not dict or spec.get('version') != 3:
             return self._action(instance_id, 'start')
-        gateway_id = self._verify(instance_id, observed)
+        try:
+            gateway_id = self._verify(instance_id, observed)
+        except Exception:
+            if not self._stop_proxy_containers(instance_id):
+                raise DockerEngineError(
+                    'Gateway verification failed and proxy stop could not be verified') from None
+            raise
         if not self._proxy_firewall_ready(instance_id, spec):
+            if not self._stop_proxy_containers(instance_id):
+                raise DockerEngineError(
+                    'Per-agent firewall policy is not ready and proxy stop could not be verified')
             raise DockerEngineError('Per-agent firewall policy is not ready')
-        gateway_state = observed.get('State') or {}
-        if gateway_state.get('Status') != 'running':
-            self._action(instance_id, 'start')
-        sidecar = self._find_proxy_sidecar(instance_id)
-        if sidecar is None:
-            raise DockerEngineError('Proxy sidecar is absent')
-        sidecar_id = self._object(sidecar.get('Id'))
-        if (sidecar.get('State') or {}).get('Status') != 'running':
-            self._request('POST', f'/containers/{sidecar_id}/start', ok=(204, 304))
-            verified = self._find_proxy_sidecar(instance_id)
-            if (verified is None or verified.get('Id') != sidecar_id
-                    or (verified.get('State') or {}).get('Status') != 'running'):
-                try:
-                    self._request('POST', f'/containers/{gateway_id}/stop?t=10', ok=(204, 304))
-                except Exception:
-                    pass
-                raise DockerEngineError('Proxy sidecar start could not be verified')
-        return self.inspect(instance_id)
+        try:
+            gateway_state = observed.get('State') or {}
+            if gateway_state.get('Status') != 'running':
+                self._action(instance_id, 'start')
+            sidecar = self._find_proxy_sidecar(instance_id)
+            if sidecar is None:
+                raise DockerEngineError('Proxy sidecar is absent')
+            sidecar_id = self._object(sidecar.get('Id'))
+            if (sidecar.get('State') or {}).get('Status') != 'running':
+                self._request('POST', f'/containers/{sidecar_id}/start', ok=(204, 304))
+            latest_gateway = self._find(instance_id)
+            latest_sidecar = self._find_proxy_sidecar(instance_id)
+            if (latest_gateway is None or latest_gateway.get('Id') != gateway_id
+                    or (latest_gateway.get('State') or {}).get('Status') != 'running'
+                    or latest_sidecar is None or latest_sidecar.get('Id') != sidecar_id
+                    or (latest_sidecar.get('State') or {}).get('Status') != 'running'
+                    or not self._proxy_firewall_ready(instance_id, spec)):
+                raise DockerEngineError('Post-start proxy isolation verification failed')
+            result = self.inspect(instance_id)
+            if result.get('container_id') != gateway_id or result.get('state') != 'running':
+                raise DockerEngineError('Post-start Gateway verification failed')
+            if result.get('proxy_state') != 'ready':
+                # Health can still be starting immediately after Docker start. Keep
+                # the UI closed, but repeat the strict live network/firewall checks.
+                if not self._proxy_firewall_ready(instance_id, spec):
+                    raise DockerEngineError('Post-start proxy isolation verification failed')
+                latest_gateway = self._find(instance_id)
+                latest_sidecar = self._find_proxy_sidecar(instance_id)
+                gateway_health = ((latest_gateway or {}).get('State') or {}).get('Health') or {}
+                sidecar_health = ((latest_sidecar or {}).get('State') or {}).get('Health') or {}
+                if (gateway_health.get('Status') == 'healthy'
+                        and sidecar_health.get('Status') == 'healthy'):
+                    raise DockerEngineError('Control UI target failed after healthy startup')
+            return result
+        except Exception:
+            if not self._stop_proxy_containers(instance_id):
+                raise DockerEngineError(
+                    'Proxy start failed and container stop could not be verified') from None
+            raise
 
     def stop(self, instance_id):
         instance_id = self._instance(instance_id)
@@ -1933,7 +2155,7 @@ class DockerEngine:
             errors.append('sidecar_absent')
         else:
             sidecar_id = self._object(sidecar.get('Id'))
-            if (sidecar.get('State') or {}).get('Status') not in {'created', 'exited'}:
+            if (sidecar.get('State') or {}).get('Status') not in {'created', 'exited', 'dead'}:
                 try:
                     self._request('POST', f'/containers/{sidecar_id}/stop?t=10', ok=(204, 304))
                     verified = self._find_proxy_sidecar(instance_id)

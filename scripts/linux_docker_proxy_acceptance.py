@@ -481,7 +481,7 @@ def main():
             raise failure
         print('PASS: live Docker IPAM/membership and allowed/denied packet probes matched the two-owner policy.')
         print('PASS: nft -a -j read-back matched; temporary containers, networks, and firewall tables are cleaned up.')
-        print('NOTE: the Supervisor source gate remains false; this test-only manager override is not production readiness.')
+        print('NOTE: the production source default remains false; this test-only manager writes no host acceptance receipt.')
         return 0
     except Exception as error:
         message = str(error).replace('\n', ' ')[:240]

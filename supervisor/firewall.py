@@ -2,8 +2,8 @@
 
 This module never invokes nft or changes host state. A deployment must supply
 site-specific, non-overlapping /29 pools and an adapter implementing the
-read/replace/read-back contract below. Until nft JSON semantics are validated
-on the target, readiness deliberately remains false.
+read/replace/read-back contract below. The source-level default remains
+fail-closed; production activation is host-scoped through an acceptance receipt.
 """
 from dataclasses import dataclass
 import ipaddress
@@ -18,6 +18,8 @@ from .probes import run_command
 TABLE_NAME = 'agent_proxy_v1'
 PROFILE = 'agent_proxy_v1'
 TABLE_COMMENT = 'BEZR managed firewall agent_proxy_v1 v1'
+FIREWALL_POLICY_VERSION = 1
+# Keep the source default false. Runtime activation requires a host-bound receipt.
 NFTABLES_SEMANTICS_VALIDATED = False
 INET_PRIORITY = -10
 BRIDGE_PRIORITY = -210
