@@ -92,10 +92,15 @@ def _network_create(payload, resources):
     ipam = payload['IPAM']['Config'][0]
     labels = dict(payload['Labels'])
     name = payload['Name']
-    argv = ['docker', 'network', 'create', '--driver', 'bridge', '--internal',
-            '--subnet', ipam['Subnet'], '--gateway', ipam['Gateway'],
-            '--opt', 'com.docker.network.bridge.name=' +
-            payload['Options']['com.docker.network.bridge.name']]
+    argv = [
+        'docker', 'network', 'create',
+        '--driver', 'bridge',
+        '--internal',
+        '--subnet', ipam['Subnet'],
+        '--gateway', ipam['Gateway'],
+    ]
+    for key, value in sorted(payload['Options'].items()):
+        argv.extend(['--opt', f'{key}={value}'])
     for key, value in sorted(labels.items()):
         argv.extend(['--label', key + '=' + value])
     argv.append(name)
