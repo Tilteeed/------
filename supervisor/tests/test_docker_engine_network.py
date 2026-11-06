@@ -173,8 +173,8 @@ class DockerEngineNetworkTests(unittest.TestCase):
             raise AssertionError((name, flags, dir_fd))
         def fake_fstat(fd):
             if fd == 10:
-                return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=1000,
-                                       st_gid=1000, st_nlink=2, st_size=0)
+                return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=0,
+                                       st_gid=0, st_nlink=2, st_size=0)
             return SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=1000,
                                    st_gid=1000, st_nlink=1, st_size=len(state['content']))
         with ExitStack() as stack:
@@ -205,8 +205,8 @@ class DockerEngineNetworkTests(unittest.TestCase):
             opened.append((name, flags, dir_fd))
             return 10 if dir_fd is None else 11
         def fake_fstat(fd):
-            return (SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=1000,
-                                    st_gid=1000, st_nlink=2, st_size=0) if fd == 10 else
+            return (SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=0,
+                                    st_gid=0, st_nlink=2, st_size=0) if fd == 10 else
                     SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=1000,
                                     st_gid=1000, st_nlink=1, st_size=43))
         with ExitStack() as stack:
@@ -222,6 +222,35 @@ class DockerEngineNetworkTests(unittest.TestCase):
         self.assertTrue(file_flags & 0x20000)
         self.assertFalse(file_flags & os.O_CREAT)
         self.assertFalse(file_flags & os.O_RDWR)
+
+    def test_sidecar_secret_helpers_reject_nonroot_parent_directory_owner(self):
+        from types import SimpleNamespace
+        engine = DockerEngine('sha256:' + 'a' * 64)
+        path = '/srv/agent-data/' + '2' * 32
+        opened = []
+
+        def fake_open(name, flags, mode=0o777, *, dir_fd=None):
+            opened.append((name, dir_fd))
+            if name == path and dir_fd is None:
+                return 10
+            raise PermissionError('mock child open')
+
+        def fake_fstat(_fd):
+            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=1000,
+                                   st_gid=1000, st_nlink=2, st_size=0)
+
+        for helper_name in ('_read_existing_proxy_token_file', '_ensure_proxy_token_file'):
+            with self.subTest(helper=helper_name):
+                opened.clear()
+                with ExitStack() as stack:
+                    stack.enter_context(patch.object(os, 'O_NOFOLLOW', 0x20000, create=True))
+                    stack.enter_context(patch.object(os, 'O_DIRECTORY', 0x40000, create=True))
+                    stack.enter_context(patch.object(os, 'open', side_effect=fake_open))
+                    stack.enter_context(patch.object(os, 'fstat', side_effect=fake_fstat))
+                    stack.enter_context(patch.object(os, 'close'))
+                    with self.assertRaises(DockerEngineError):
+                        getattr(engine, helper_name)(path)
+                self.assertEqual(opened, [(path, None)])
 
     def test_proxy_firewall_policy_maps_both_networks_and_static_endpoint_pairs(self):
         engine = DockerEngine('sha256:' + 'a' * 64)
