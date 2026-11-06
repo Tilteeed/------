@@ -13,6 +13,7 @@ FROM ghcr.io/open-webui/open-webui:v0.12.5-slim@sha256:9a4db3e6c8d6174d4ed895230
 WORKDIR /app/backend
 COPY control_plane/ ./control_plane/
 COPY scripts/ ./scripts/
+COPY supervisor/ ./supervisor/
 COPY tests/ ./platform_tests/
 RUN python -m unittest discover -s platform_tests -v
 
