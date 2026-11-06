@@ -18,6 +18,10 @@ from supervisor.network_routes import HostIPv4Inventory, parse_ipv4_networks
 
 
 class DockerEngineNetworkTests(unittest.TestCase):
+    @staticmethod
+    def _sidecar_image_info(image_id, env=()):
+        return {'Id': image_id, 'Config': {'Env': list(env)}}
+
     def test_proxy_network_engine_requires_both_nonoverlapping_admin_pools(self):
         image = 'sha256:' + 'a' * 64
         with self.assertRaises(ValueError):
@@ -364,16 +368,24 @@ class DockerEngineNetworkTests(unittest.TestCase):
         plan = engine._proxy_network_plan(
             instance_id, agent_network_pool='10.252.0.0/24',
             frontend_network_pool='10.253.0.0/24')
+        image_id = 'sha256:' + 'b' * 64
+        image_info = self._sidecar_image_info(image_id, [
+            'PATH=/usr/bin', 'HOME=/home/app',
+            'WEBUI_SECRET_KEY=xxx',
+            'OPENAI_API_KEY=yyy', 'PORT=18790',
+        ])
         payload = engine._proxy_sidecar_payload(
             instance_id, owner_id='owner-f',
             control_ui_origin='https://' + instance_id + '.agents.example.test',
             gateway_ip=plan['agent']['gateway_ip'], listen_ip=plan['frontend']['sidecar_ip'],
-            image_id='sha256:' + 'b' * 64,
-            host_path='/srv/agent-data/' + instance_id, plan=plan)
+            image_id=image_id,
+            host_path='/srv/agent-data/' + instance_id, plan=plan, image_info=image_info)
         container_id, agent_id, frontend_id = 'a' * 64, 'c' * 64, 'd' * 64
         config = {key: copy.deepcopy(payload.get(key)) for key in (
             'Image', 'User', 'Entrypoint', 'Cmd', 'WorkingDir', 'Env',
             'Healthcheck', 'StopTimeout', 'Labels')}
+        config['Env'] = ['PATH=/usr/bin', 'HOME=/home/app'] + [
+            item for item in payload['Env'] if '=' in item]
         mount = payload['HostConfig']['Mounts'][0]
         observed = {
             'Id': container_id, 'Image': payload['Image'], 'Config': config,
@@ -393,6 +405,14 @@ class DockerEngineNetworkTests(unittest.TestCase):
         network_ids = {'agent': agent_id, 'frontend': frontend_id}
         self.assertEqual(engine._verify_proxy_sidecar(
             instance_id, observed, payload, plan, network_ids), container_id)
+        config['Env'].append('WEBUI_SECRET_KEY=bad')
+        with self.assertRaises(DockerEngineError):
+            engine._verify_proxy_sidecar(instance_id, observed, payload, plan, network_ids)
+        config['Env'].pop()
+        config['Env'].append('OPENAI_API_KEY=bad')
+        with self.assertRaises(DockerEngineError):
+            engine._verify_proxy_sidecar(instance_id, observed, payload, plan, network_ids)
+        config['Env'].pop()
         observed['NetworkSettings']['Networks']['rogue'] = {}
         with self.assertRaises(DockerEngineError):
             engine._verify_proxy_sidecar(instance_id, observed, payload, plan, network_ids)
@@ -420,12 +440,17 @@ class DockerEngineNetworkTests(unittest.TestCase):
         plan = engine._proxy_network_plan(
             instance_id, agent_network_pool='10.250.0.0/24',
             frontend_network_pool='10.251.0.0/24')
+        image_id = 'sha256:' + 'b' * 64
+        image_env = [
+            'PATH=/usr/bin', 'WEBUI_SECRET_KEY=xxx',
+            'OPENAI_API_KEY=yyy',
+        ]
         payload = engine._proxy_sidecar_payload(
             instance_id, owner_id='owner-9',
             control_ui_origin='https://' + instance_id + '.agents.example.test',
             gateway_ip=plan['agent']['gateway_ip'], listen_ip=plan['frontend']['sidecar_ip'],
-            image_id='sha256:' + 'b' * 64, host_path='/srv/agent-data/' + instance_id,
-            plan=plan)
+            image_id=image_id, host_path='/srv/agent-data/' + instance_id,
+            plan=plan, image_info=self._sidecar_image_info(image_id, image_env))
         sidecar_id, agent_network_id, frontend_network_id = 'a' * 64, 'c' * 64, 'd' * 64
         state = {'payload': None, 'agent_connected': False}
         calls = []
@@ -438,11 +463,13 @@ class DockerEngineNetworkTests(unittest.TestCase):
                     'NetworkID': '', 'IPAddress': '',
                     'IPAMConfig': {'IPv4Address': plan['agent']['sidecar_ip']}}
             mount = payload['HostConfig']['Mounts'][0]
+            config = {key: copy.deepcopy(payload.get(key)) for key in (
+                'Image', 'User', 'Entrypoint', 'Cmd', 'WorkingDir', 'Env',
+                'Healthcheck', 'StopTimeout', 'Labels')}
+            config['Env'] = ['PATH=/usr/bin'] + [
+                item for item in payload['Env'] if '=' in item]
             return {
-                'Id': sidecar_id, 'Image': payload['Image'],
-                'Config': {key: copy.deepcopy(payload.get(key)) for key in (
-                    'Image', 'User', 'Entrypoint', 'Cmd', 'WorkingDir', 'Env',
-                    'Healthcheck', 'StopTimeout', 'Labels')},
+                'Id': sidecar_id, 'Image': payload['Image'], 'Config': config,
                 'HostConfig': copy.deepcopy(payload['HostConfig']),
                 'Mounts': [{'Type': 'bind', 'Source': mount['Source'],
                             'Destination': mount['Target'], 'RW': False}],
@@ -471,6 +498,11 @@ class DockerEngineNetworkTests(unittest.TestCase):
         self.assertEqual(engine._create_proxy_sidecar(instance_id, payload, plan, {
             'agent': agent_network_id, 'frontend': frontend_network_id}), sidecar_id)
         self.assertTrue(state['agent_connected'])
+        self.assertEqual(
+            [item for item in state['payload']['Env'] if '=' not in item],
+            ['OPENAI_API_KEY', 'WEBUI_SECRET_KEY'])
+        self.assertNotIn('WEBUI_SECRET_KEY=xxx', json.dumps(state['payload']))
+        self.assertNotIn('OPENAI_API_KEY=yyy', json.dumps(state['payload']))
         self.assertEqual(sum(method == 'POST' and path.startswith('/containers/create?')
                              for method, path, _ in calls), 1)
         self.assertEqual(sum(method == 'POST' and path == f'/networks/{agent_network_id}/connect'
@@ -498,8 +530,9 @@ class DockerEngineNetworkTests(unittest.TestCase):
         engine.ensure_proxy_networks = lambda *_args, **_kwargs: plan
         engine.proxy_network_policies = lambda: (engine._proxy_firewall_policy(instance_id, plan),)
         engine._ensure_proxy_token_file = lambda _path: 'S' * 43
-        engine._find_control_plane_web = lambda _domain: {
-            'container_id': web_id, 'image_id': image_id, 'networks': {'web': {}}}
+        engine._find_control_plane_web = lambda control_ui_domain: {
+            'container_id': web_id, 'image_id': image_id,
+            'image_info': self._sidecar_image_info(image_id), 'networks': {'web': {}}}
         engine._proxy_network_id = lambda _instance, role, _expected: (
             'c' * 64 if role == 'agent' else 'd' * 64)
         endpoints = []
@@ -807,10 +840,11 @@ class DockerEngineNetworkTests(unittest.TestCase):
         host_path = '/srv/agent-data/' + instance_id
         web_id, gateway_id, sidecar_id = '2' * 64, '3' * 64, '4' * 64
         image_id = 'sha256:' + 'a' * 64
+        image_info = self._sidecar_image_info(image_id)
         payload = engine._proxy_sidecar_payload(
             instance_id, owner_id=owner_id, control_ui_origin=origin,
             gateway_ip=plan['agent']['gateway_ip'], listen_ip=plan['frontend']['sidecar_ip'],
-            image_id=image_id, host_path=host_path, plan=plan)
+            image_id=image_id, host_path=host_path, plan=plan, image_info=image_info)
         gateway_spec = {
             'version': 3, 'image': engine.image, 'host_path': host_path,
             'limits': {'ram_bytes': 2**30, 'cpu_millicores': 1000,
@@ -849,7 +883,7 @@ class DockerEngineNetworkTests(unittest.TestCase):
         engine._find_proxy_sidecar = lambda instance_id: sidecar
         engine._verify_proxy_sidecar = lambda instance_id, observed, expected, plan, network_ids: sidecar_id
         engine._find_control_plane_web = lambda control_ui_domain: {
-            'container_id': web_id, 'image_id': image_id,
+            'container_id': web_id, 'image_id': image_id, 'image_info': image_info,
             'networks': {plan['frontend']['name']: {
                 'NetworkID': '6' * 64, 'IPAddress': plan['frontend']['web_ip'],
                 'IPAMConfig': {'IPv4Address': plan['frontend']['web_ip']}}}}
@@ -890,12 +924,14 @@ class DockerEngineNetworkTests(unittest.TestCase):
                         pids_limit=256, disk_bytes=10 * 1024**3),
             version=3, instance_id=instance_id, proxy_network=plan['agent'],
             owner_id=owner_id, control_ui_origin=origin)
+        image_id = 'sha256:' + 'a' * 64
+        image_info = self._sidecar_image_info(image_id)
         sidecar_payload = engine._proxy_sidecar_payload(
             instance_id, owner_id=owner_id, control_ui_origin=origin,
             gateway_ip=plan['agent']['gateway_ip'],
             listen_ip=plan['frontend']['sidecar_ip'],
-            image_id='sha256:' + 'a' * 64, host_path='/srv/agent-data/' + instance_id,
-            plan=plan)
+            image_id=image_id, host_path='/srv/agent-data/' + instance_id,
+            plan=plan, image_info=image_info)
         gateway_id = '3' * 64
         gateway = {'Id': gateway_id, 'Config': {'Labels': {
             engine.SPEC_LABEL: engine._json(gateway_spec)}}}
@@ -904,7 +940,7 @@ class DockerEngineNetworkTests(unittest.TestCase):
         engine.__dict__['_verify'] = lambda instance_id, observed, expected_spec=None, expected_token=None: gateway_id
         engine.__dict__['_find_proxy_sidecar'] = lambda instance_id: sidecar
         engine.__dict__['_find_control_plane_web'] = lambda control_ui_domain: {
-            'container_id': 'f' * 64, 'image_id': 'sha256:' + 'a' * 64}
+            'container_id': 'f' * 64, 'image_id': image_id, 'image_info': image_info}
         engine.__dict__['_proxy_network_id'] = lambda instance_id, role, expected: '1' * 64
         engine.__dict__['_verify_proxy_sidecar'] = lambda instance_id, observed, expected, plan, network_ids: (_ for _ in ()).throw(
             DockerEngineError('drift'))
@@ -1137,18 +1173,86 @@ class DockerEngineNetworkTests(unittest.TestCase):
         purged_engine._remove_proxy_resources(instance_id, retain_networks=False)
         self.assertEqual(purged_calls, [instance_id])
 
+    def test_proxy_sidecar_payload_unsets_inherited_non_allowlisted_image_environment(self):
+        engine = DockerEngine('sha256:' + 'a' * 64)
+        instance_id = 'c' * 32
+        image_id = 'sha256:' + 'b' * 64
+        plan = engine._proxy_network_plan(
+            instance_id, agent_network_pool='10.248.0.0/24',
+            frontend_network_pool='10.249.0.0/24')
+        inherited = [
+            'PATH=/usr/bin', 'PYTHONPATH=/app/backend', 'HOME=/home/app',
+            'LANG=C.UTF-8', 'WEBUI_SECRET_KEY=xxx',
+            'OPENAI_API_KEY=yyy', 'PORT=18790',
+            'CUSTOM_FLAG=unexpected', 'BEZR_SIDECAR_OWNER_ID=stale-owner',
+        ]
+        image = {'Id': image_id, 'Config': {'Env': inherited}}
+        calls = []
+        def request(method, path, payload=None, *, ok=(200,)):
+            calls.append((method, path))
+            return image
+        engine._request = request
+
+        payload = engine._proxy_sidecar_payload(
+            instance_id, owner_id='owner-c',
+            control_ui_origin='https://' + instance_id + '.agents.example.test',
+            gateway_ip=plan['agent']['gateway_ip'],
+            listen_ip=plan['frontend']['sidecar_ip'], image_id=image_id,
+            host_path='/srv/agent-data/' + instance_id, plan=plan)
+
+        self.assertEqual(calls, [('GET', '/images/' + image_id.replace(':', '%3A') + '/json')])
+        self.assertEqual(
+            [item for item in payload['Env'] if '=' not in item],
+            ['CUSTOM_FLAG', 'OPENAI_API_KEY', 'PORT', 'WEBUI_SECRET_KEY'])
+        self.assertIn('BEZR_SIDECAR_OWNER_ID=owner-c', payload['Env'])
+        self.assertNotIn('PATH', payload['Env'])
+        self.assertNotIn('PYTHONPATH', payload['Env'])
+        self.assertNotIn('HOME', payload['Env'])
+        serialized = json.dumps(payload)
+        self.assertNotIn('WEBUI_SECRET_KEY=xxx', serialized)
+        self.assertNotIn('OPENAI_API_KEY=yyy', serialized)
+
+    def test_proxy_sidecar_payload_rejects_invalid_image_environment_metadata(self):
+        engine = DockerEngine('sha256:' + 'a' * 64)
+        instance_id = 'b' * 32
+        image_id = 'sha256:' + 'c' * 64
+        plan = engine._proxy_network_plan(
+            instance_id, agent_network_pool='10.248.0.0/24',
+            frontend_network_pool='10.249.0.0/24')
+        invalid_images = (
+            [],
+            {'Id': 'sha256:' + 'd' * 64, 'Config': {'Env': []}},
+            {'Id': image_id, 'Config': []},
+            {'Id': image_id, 'Config': {'Env': 'PORT=8080'}},
+            {'Id': image_id, 'Config': {'Env': ['PORT']}},
+            {'Id': image_id, 'Config': {'Env': ['PORT=8080', 'PORT=9090']}},
+            {'Id': image_id, 'Config': {'Env': ['=invalid']}},
+        )
+        for image in invalid_images:
+            with self.subTest(image=image):
+                engine._request = lambda method, path, payload=None, *, ok=(200,): image
+                with self.assertRaises(DockerEngineError):
+                    engine._proxy_sidecar_payload(
+                        instance_id, owner_id='owner-b',
+                        control_ui_origin='https://' + instance_id + '.agents.example.test',
+                        gateway_ip=plan['agent']['gateway_ip'],
+                        listen_ip=plan['frontend']['sidecar_ip'], image_id=image_id,
+                        host_path='/srv/agent-data/' + instance_id, plan=plan)
+
     def test_proxy_sidecar_payload_uses_web_image_static_networks_secret_file_and_limits(self):
         engine = DockerEngine('sha256:' + 'a' * 64)
         instance_id = '6' * 32
         plan = engine._proxy_network_plan(
             instance_id, agent_network_pool='10.248.0.0/24',
             frontend_network_pool='10.249.0.0/24')
+        image_id = 'sha256:' + 'b' * 64
         payload = engine._proxy_sidecar_payload(
             instance_id, owner_id='owner-6',
             control_ui_origin='https://' + instance_id + '.agents.example.test',
             gateway_ip=plan['agent']['gateway_ip'], listen_ip=plan['frontend']['sidecar_ip'],
-            image_id='sha256:' + 'b' * 64,
-            host_path='/srv/agent-data/' + instance_id, plan=plan)
+            image_id=image_id,
+            host_path='/srv/agent-data/' + instance_id, plan=plan,
+            image_info=self._sidecar_image_info(image_id))
         self.assertEqual(payload['Image'], 'sha256:' + 'b' * 64)
         self.assertNotIn(engine.MANAGED_LABEL, payload['Labels'])
         self.assertEqual(payload['Labels'][engine.INSTANCE_LABEL], instance_id)

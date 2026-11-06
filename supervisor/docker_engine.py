@@ -88,6 +88,10 @@ class DockerEngine:
     SIDECAR_CPU_NANO = 100_000_000
     SIDECAR_PIDS_LIMIT = 32
     SIDECAR_PORT = 18790
+    SIDECAR_SAFE_IMAGE_ENV = frozenset({
+        'PATH', 'PYTHONPATH', 'PYTHONUNBUFFERED', 'PYTHONDONTWRITEBYTECODE',
+        'HOME', 'STATIC_DIR', 'LANG',
+    })
     PROXY_TOKEN_FILE_HOST = '.control-ui-proxy-token'
     PROXY_TOKEN_FILE_CONTAINER = '/run/secrets/bezr-proxy-token'
     _SIDECAR_TOKEN = re.compile(r'[A-Za-z0-9_-]{40,64}\Z')
@@ -626,7 +630,8 @@ class DockerEngine:
             EndpointPair(frontend['web_ip'], frontend['sidecar_ip']))
 
     def _proxy_sidecar_payload(self, instance_id, *, owner_id, control_ui_origin,
-                               gateway_ip, listen_ip, image_id, host_path, plan):
+                               gateway_ip, listen_ip, image_id, host_path, plan,
+                               image_info=None):
         instance_id = self._instance(instance_id)
         host_path = self._host_path(host_path)
         if (type(owner_id) is not str or not 1 <= len(owner_id) <= 256
@@ -679,10 +684,30 @@ class DockerEngine:
             'BEZR_SIDECAR_LISTEN_IP': listen_ip,
             'BEZR_SIDECAR_PROXY_TOKEN_FILE': '/run/secrets/bezr-proxy-token',
         }
+        if image_info is None:
+            image_info = self._request(
+                'GET', '/images/' + quote(image_id, safe='') + '/json')
+        image_config = image_info.get('Config') if type(image_info) is dict else None
+        if (type(image_info) is not dict or image_info.get('Id') != image_id
+                or type(image_config) is not dict):
+            raise DockerEngineError('Sidecar image verification failed')
+        inherited = image_config.get('Env')
+        if inherited is None:
+            inherited = []
+        if (type(inherited) is not list
+                or any(type(item) is not str or '=' not in item for item in inherited)):
+            raise DockerEngineError('Invalid sidecar image environment')
+        inherited_keys = [item.split('=', 1)[0] for item in inherited]
+        if (any(not key or any(ord(char) <= 32 or ord(char) == 127 for char in key)
+                for key in inherited_keys)
+                or len(inherited_keys) != len(set(inherited_keys))):
+            raise DockerEngineError('Duplicate or invalid sidecar image environment keys')
+        unset_env = sorted(
+            set(inherited_keys) - self.SIDECAR_SAFE_IMAGE_ENV - set(environment))
         return {
             'Image': image_id, 'User': '1000:1000', 'Entrypoint': ['python'],
             'Cmd': ['-m', 'control_plane.proxy_sidecar'], 'WorkingDir': '/app/backend',
-            'Env': [key + '=' + value for key, value in sorted(environment.items())],
+            'Env': unset_env + [key + '=' + value for key, value in sorted(environment.items())],
             'Healthcheck': {
                 'Test': ['CMD', 'python', '-m', 'control_plane.proxy_sidecar', '--healthcheck'],
                 'Interval': 30_000_000_000, 'Timeout': 5_000_000_000,
@@ -1114,7 +1139,7 @@ class DockerEngine:
             instance_id, owner_id=owner_id, control_ui_origin=origin,
             gateway_ip=plan['agent']['gateway_ip'],
             listen_ip=plan['frontend']['sidecar_ip'], image_id=web['image_id'],
-            host_path=host_path, plan=plan)
+            host_path=host_path, plan=plan, image_info=web['image_info'])
         sidecar_id = self._create_proxy_sidecar(instance_id, payload, plan, network_ids)
         expected_agent_ids = {self._object(sidecar_id)}
         expected_agent_ips = {self._object(sidecar_id): plan['agent']['sidecar_ip']}
@@ -1160,12 +1185,32 @@ class DockerEngine:
                     or len({item.split('=', 1)[0] for item in env_items}) != len(env_items)):
                 raise ValueError
             env = dict(item.split('=', 1) for item in env_items)
-            wanted_env = dict(item.split('=', 1) for item in expected['Env'])
+            expected_env_items = expected.get('Env')
+            if type(expected_env_items) is not list:
+                raise ValueError
+            expected_keys = []
+            expected_assignments = []
+            unset_env = []
+            for item in expected_env_items:
+                if type(item) is not str:
+                    raise ValueError
+                key, separator, value = item.partition('=')
+                if (not key or any(ord(char) <= 32 or ord(char) == 127 for char in key)):
+                    raise ValueError
+                expected_keys.append(key)
+                if separator:
+                    expected_assignments.append((key, value))
+                else:
+                    unset_env.append(key)
+            if (len(expected_keys) != len(set(expected_keys))
+                    or set(unset_env).intersection(self.SIDECAR_SAFE_IMAGE_ENV)):
+                raise ValueError
+            wanted_env = dict(expected_assignments)
             if any(env.get(key) != value for key, value in wanted_env.items()):
                 raise ValueError
-            safe_image_keys = {'PATH', 'PYTHONPATH', 'PYTHONUNBUFFERED',
-                               'PYTHONDONTWRITEBYTECODE', 'HOME', 'STATIC_DIR', 'LANG'}
-            if (set(env) - set(wanted_env) - safe_image_keys
+            if set(env).intersection(unset_env):
+                raise ValueError
+            if (set(env) - set(wanted_env) - self.SIDECAR_SAFE_IMAGE_ENV
                     or 'BEZR_SIDECAR_PROXY_TOKEN' in env
                     or 'WEBUI_SECRET_KEY' in env):
                 raise ValueError
@@ -1744,7 +1789,7 @@ class DockerEngine:
                 gateway_ip=plan['agent']['gateway_ip'],
                 listen_ip=plan['frontend']['sidecar_ip'],
                 image_id=sidecar_spec['image_id'], host_path=sidecar_spec['host_path'],
-                plan=plan)
+                plan=plan, image_info=web['image_info'])
             sidecar_id = self._verify_proxy_sidecar(
                 instance_id, sidecar, expected_sidecar, plan, network_ids)
             self._verify_proxy_endpoint(
@@ -1964,7 +2009,7 @@ class DockerEngine:
                 control_ui_origin=origin, gateway_ip=plan['agent']['gateway_ip'],
                 listen_ip=plan['frontend']['sidecar_ip'],
                 image_id=sidecar_spec['image_id'], host_path=sidecar_spec['host_path'],
-                plan=plan)
+                plan=plan, image_info=web['image_info'])
             sidecar_id = self._verify_proxy_sidecar(
                 instance_id, sidecar, expected_sidecar, plan, network_ids)
             gateway_id = self._object(gateway.get('Id'))
