@@ -109,7 +109,7 @@ docker compose up -d --no-build --no-deps --force-recreate web
 
 Do not use `docker compose down -v`, remove agent networks, or run a manual `docker network connect`; the Supervisor owns those attachments. Re-run the browser-side preflight and open each affected agent through `/agent`.
 
-If a WebUI build changes the immutable image ID, the existing Sidecar image identity check remains strict. The current same-image recreation path does not rotate Sidecars to a new image ID; Control UI remains unavailable for that mismatch rather than accepting a stale Sidecar. The Supervisor can keep the Gateway running only while the old Sidecar image and its exact configuration, networks, and firewall state still verify; otherwise existing fail-closed handling may stop the proxy workloads. Do not count an image-changing update as accepted until a separately reviewed Sidecar migration is available and verified.
+When a WebUI build changes its immutable image ID, the strict image-ID check remains in force. Do not remove/restore agents or manually connect networks. Use the root-only, plan-bound procedure in [`WEBUI_SIDECAR_UPGRADE.md`](WEBUI_SIDECAR_UPGRADE.md). Until its apply operation completes, Control UI access remains unavailable; the Gateway and user data are not recreated by that procedure. A failed sidecar health/identity check restores the saved Sidecar where safe, but the WebUI remains on the new image and access stays fail-closed until the operator performs the documented Compose rollback or resolves the cause.
 
 ## Acceptance boundary
 

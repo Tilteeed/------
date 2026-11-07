@@ -19,6 +19,7 @@ import socket
 import errno
 import socketserver
 import stat
+import struct
 import sys
 import threading
 import time
@@ -77,6 +78,12 @@ MESSAGES = {
     'preview_not_supported': 'File cannot be previewed as UTF-8 text.',
     'file_changed': 'Workspace file changed while it was being read.',
     'workspace_unavailable': 'Retained workspace is unavailable or failed verification.',
+    'maintenance_in_progress': 'Host maintenance is in progress; lifecycle changes are blocked.',
+    'migration_plan_changed': 'Docker state changed after the migration plan; create a new plan.',
+    'migration_preflight_blocked': 'Migration preflight found an unsafe or ambiguous instance.',
+    'migration_in_progress': 'Migration is already in progress; use status or resume.',
+    'migration_not_found': 'No saved migration exists to resume.',
+    'migration_journal_unavailable': 'Migration journal is unavailable or failed integrity checks.',
 }
 
 
@@ -249,6 +256,7 @@ class RuntimeService:
         self.agent_network_pool = agent_network_pool
         self.frontend_network_pool = frontend_network_pool
         self.lock = threading.RLock()
+        self.sidecar_migration: Any = None
 
     def _sample(self):
         try:
@@ -498,7 +506,17 @@ class RuntimeService:
     def action(self, payload):
         payload = validate_action(payload)
         operation = None
+        migration = getattr(self, 'sidecar_migration', None)
         with self.lock:
+            if migration is not None:
+                try:
+                    if migration.status().get('status') in {
+                            'in_progress', 'needs_attention'}:
+                        raise ServiceError('maintenance_in_progress', 503)
+                except ServiceError:
+                    raise
+                except Exception:
+                    raise ServiceError('runtime_unavailable', 503) from None
             try:
                 previous = self.store.lookup(payload)
                 if previous and previous['status'] == 'completed':
@@ -723,6 +741,19 @@ class RuntimeService:
             raise ServiceError('runtime_unavailable', 503) from None
         return enriched
 
+    def manage_control_ui_sidecars(self, payload):
+        """Privileged maintenance RPC; public web handler never exposes this method."""
+        migration = getattr(self, 'sidecar_migration', None)
+        if migration is None:
+            raise ServiceError('runtime_unavailable', 503)
+        from .control_ui_migration import MigrationError
+        try:
+            return migration.handle(payload)
+        except MigrationError as error:
+            raise ServiceError(error.code, error.status) from None
+        except Exception:
+            raise ServiceError('runtime_unavailable', 503) from None
+
     def control_ui_target(self, payload):
         """Return an owner-bound sidecar target only after live Docker verification."""
         if type(payload) is not dict or set(payload) != {'actor_id', 'instance_id'}:
@@ -732,7 +763,14 @@ class RuntimeService:
         if type(instance_id) is not str or _CONTROL_UI_INSTANCE_RE.fullmatch(instance_id) is None:
             raise ServiceError('invalid_request', 400)
         unavailable = {'ready': False, 'target': None}
+        migration = getattr(self, 'sidecar_migration', None)
         with self.lock:
+            if migration is not None:
+                try:
+                    if instance_id in migration.in_progress_instances():
+                        return unavailable
+                except Exception:
+                    return unavailable
             instance = self.store.current(owner_id)
             if type(instance) is not dict or instance.get('id') != instance_id:
                 return unavailable
@@ -792,7 +830,16 @@ class RuntimeService:
         Never create/start queued or failed intents, remove containers, or touch agent data.
         """
         with self.lock:
+            migrating = set()
+            migration = getattr(self, 'sidecar_migration', None)
+            if migration is not None:
+                try:
+                    migrating = migration.in_progress_instances()
+                except Exception:
+                    raise ServiceError('runtime_unavailable', 503) from None
             for instance in self.store.all_instances():
+                if instance['id'] in migrating:
+                    continue
                 info = self._inspect(instance['id'])
                 if not instance['active']:
                     if not self._absent(info):
@@ -1007,9 +1054,25 @@ def _service_token(path):
     return token
 
 
+def _unix_peer_uid(connection):
+    """Return the Linux AF_UNIX peer UID, or None when it cannot be proven."""
+    option = getattr(socket, 'SO_PEERCRED', None)
+    if type(option) is not int or not hasattr(connection, 'getsockopt'):
+        return None
+    try:
+        credentials = connection.getsockopt(socket.SOL_SOCKET, option, struct.calcsize('3i'))
+        pid, uid, gid = struct.unpack('3i', credentials)
+    except (OSError, TypeError, ValueError, struct.error):
+        return None
+    if pid <= 0 or uid < 0 or gid < 0:
+        return None
+    return uid
+
+
 class APIHandler(BaseHTTPRequestHandler):
     server_version = 'Supervisor'
     sys_version = ''
+    admin_only = False
 
     def log_message(self, *_args):
         pass
@@ -1049,8 +1112,14 @@ class APIHandler(BaseHTTPRequestHandler):
             supplied = headers[0].encode('utf-8') if len(headers) == 1 else b''
             if not hmac.compare_digest(supplied, expected):
                 raise ServiceError('unauthorized', 401)
-            if self.path not in ('/v1/me', '/v1/actions', '/v1/replay',
-                                 '/v1/retained/workspace', '/v1/control-ui/target'):
+            if self.admin_only:
+                if _unix_peer_uid(self.request) != 0:
+                    raise ServiceError('unauthorized', 403)
+                allowed_paths = {'/v1/admin/control-ui/sidecars'}
+            else:
+                allowed_paths = {'/v1/me', '/v1/actions', '/v1/replay',
+                                 '/v1/retained/workspace', '/v1/control-ui/target'}
+            if self.path not in allowed_paths:
                 raise ServiceError('not_found', 404)
             lengths = self.headers.get_all('Content-Length', [])
             if (len(lengths) != 1 or re.fullmatch(r'[0-9]{1,10}', lengths[0]) is None
@@ -1067,7 +1136,12 @@ class APIHandler(BaseHTTPRequestHandler):
             controller = self.controller
             dispatch = {'/v1/me': controller.me, '/v1/actions': controller.action,
                         '/v1/replay': controller.replay}
-            if self.path == '/v1/retained/workspace':
+            if self.path == '/v1/admin/control-ui/sidecars':
+                operation = getattr(controller, 'manage_control_ui_sidecars', None)
+                if not callable(operation):
+                    raise ServiceError('runtime_unavailable', 503)
+                self._json(200, operation(payload))
+            elif self.path == '/v1/retained/workspace':
                 result = controller.retained_workspace(payload)
                 if isinstance(result, WorkspaceDownload):
                     self._binary(200, result)
@@ -1092,11 +1166,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
 
 def create_handler(app, token):
-    """Export a handler class for injected test transport; no listener/root checks.
-
-    Production uses AF_UNIX exclusively. A caller may use HTTPServer ONLY for a
-    portable fake-adapter smoke; this factory itself never binds any transport.
-    """
+    """Export the regular handler for tests; production binds AF_UNIX only."""
     secret = token.encode('ascii') if isinstance(token, str) else token
     if type(secret) is not bytes or not secret or len(secret) > 256:
         raise ValueError('Explicit bounded bearer token required')
@@ -1106,6 +1176,20 @@ def create_handler(app, token):
         service_secret = secret
 
     return BoundHandler
+
+
+def create_admin_handler(app, token):
+    """Export a separate root-peer-only handler for the host maintenance socket."""
+    secret = token.encode('ascii') if isinstance(token, str) else token
+    if type(secret) is not bytes or not secret or len(secret) > 256:
+        raise ValueError('Explicit bounded bearer token required')
+
+    class BoundAdminHandler(APIHandler):
+        controller = app
+        service_secret = secret
+        admin_only = True
+
+    return BoundAdminHandler
 
 
 def serve(config):
@@ -1124,6 +1208,7 @@ def serve(config):
         raise ValueError('Unsafe profile file')
     state = Path(config['state_dir'])
     socket_path = Path(config['socket_path'])
+    admin_socket_path = state / 'control-ui-maintenance.sock'
     pool = Path(profile.storage.mountpoint)
     if (state == Path('/') or socket_path.parent == Path('/') or socket_path.name != 'control.sock'
             or Path(config['token_file']) != state / 'service.token'
@@ -1136,7 +1221,7 @@ def serve(config):
             _trusted_directory(directory, mode)
         else:
             _trusted_directory(directory.parent)
-    for target in (Path(config['token_file']), socket_path):
+    for target in (Path(config['token_file']), socket_path, admin_socket_path):
         if target.is_symlink():
             raise ValueError('Unsafe service target')
     engine = DockerEngine(
@@ -1154,8 +1239,9 @@ def serve(config):
     _trusted_directory(state, 0o700, create=True)
     _trusted_directory(socket_path.parent, 0o750, create=True)
     lock_fd = _root_file(state / 'service.lock', 0o600, create=True)
-    store = server = None
-    bound_identity = None
+    store = server = admin_server = None
+    admin_thread = None
+    bound_identity = admin_bound_identity = None
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         secret = _service_token(config['token_file'])
@@ -1173,32 +1259,52 @@ def serve(config):
                                     control_ui_domain=config['control_ui_domain'],
                                     agent_network_pool=config['agent_network_pool'],
                                     frontend_network_pool=config['frontend_network_pool'])
+        if type(config.get('control_ui_domain')) is str:
+            from .control_ui_migration import ControlUiSidecarMigration
+            controller.sidecar_migration = ControlUiSidecarMigration(
+                engine, store, config['control_ui_domain'],
+                state / 'control-ui-sidecar-migration.json', controller.lock,
+                require_root_owned=True)
         controller._sample()  # Reject explicit ceilings above physical totals.
         if any(used > maximum for used, maximum in zip(store.totals(), capacities)):
             raise ValueError('Existing reservations exceed configured ceilings')
         controller.reconcile()
-        if os.path.lexists(socket_path):
-            info = socket_path.lstat()
+        def prepare_socket(path):
+            if not os.path.lexists(path):
+                return
+            info = path.lstat()
             if not stat.S_ISSOCK(info.st_mode) or info.st_uid != 0:
                 raise ValueError('Unsafe socket target')
-            # Never unlink a live listener using another state-directory lock.
+            # Never unlink a live listener from another service instance.
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
                 probe.settimeout(1)
                 try:
-                    probe.connect(str(socket_path))
+                    probe.connect(str(path))
                 except OSError as error:
                     if error.errno != errno.ECONNREFUSED:
                         raise ValueError('Socket target is not safely stale') from None
                 else:
                     raise ValueError('Socket is already serving')
-            if socket_path.lstat() != info:
+            if path.lstat() != info:
                 raise ValueError('Socket target changed')
-            socket_path.unlink()
+            path.unlink()
+
+        prepare_socket(socket_path)
+        prepare_socket(admin_socket_path)
 
         class UnixServer(socketserver.UnixStreamServer):
             def get_request(self):
                 connection, address = super().get_request()
                 connection.settimeout(30)
+                return connection, address
+
+        class ThreadedAdminServer(socketserver.ThreadingMixIn, UnixServer):
+            daemon_threads = True
+            block_on_close = False
+
+            def get_request(self):
+                connection, address = super().get_request()
+                connection.settimeout(21600)
                 return connection, address
 
         server = UnixServer(str(socket_path), create_handler(controller, secret))
@@ -1207,15 +1313,36 @@ def serve(config):
         info = socket_path.lstat()
         bound_identity = (info.st_dev, info.st_ino)
         server.controller, server.service_secret = controller, secret
-        print('Supervisor listening on private Unix socket; CPU window warms for 60 seconds.', flush=True)
+
+        if controller.sidecar_migration is not None:
+            admin_server = ThreadedAdminServer(
+                str(admin_socket_path), create_admin_handler(controller, secret))
+            os.chown(admin_socket_path, 0, 0)
+            os.chmod(admin_socket_path, 0o600)
+            admin_info = admin_socket_path.lstat()
+            admin_bound_identity = (admin_info.st_dev, admin_info.st_ino)
+            admin_server.controller, admin_server.service_secret = controller, secret
+            admin_thread = threading.Thread(
+                target=admin_server.serve_forever, kwargs={'poll_interval': 0.5}, daemon=True)
+            admin_thread.start()
+        print('Supervisor listening on private Unix sockets; CPU window warms for 60 seconds.', flush=True)
         server.serve_forever(poll_interval=0.5)
     finally:
+        if admin_server:
+            if admin_thread is not None and admin_thread.is_alive():
+                admin_server.shutdown()
+                admin_thread.join(timeout=5)
+            admin_server.server_close()
         if server:
             server.server_close()
         if bound_identity and os.path.lexists(socket_path):
             info = socket_path.lstat()
             if (info.st_dev, info.st_ino) == bound_identity:
                 socket_path.unlink()
+        if admin_bound_identity and os.path.lexists(admin_socket_path):
+            info = admin_socket_path.lstat()
+            if (info.st_dev, info.st_ino) == admin_bound_identity:
+                admin_socket_path.unlink()
         if metrics:
             metrics.close()
         if store:

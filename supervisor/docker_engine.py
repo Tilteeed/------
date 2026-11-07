@@ -537,6 +537,7 @@ class DockerEngine:
             raise DockerEngineError('Control Plane network attachment is unavailable')
         return {'container_id': container_id, 'image_id': image_id,
                 'networks': networks, 'image_info': image,
+                'state': state, 'healthcheck': config.get('Healthcheck'),
                 'docker_gateway': docker_gateway,
                 'forwarded_allow_values': tuple(forwarded_values)}
 
@@ -1267,6 +1268,648 @@ class DockerEngine:
                 'agent_subnet': plan['agent']['subnet'],
                 'control_ui_origin': origin}
 
+    def plan_control_ui_sidecar_migration(self, instances, control_ui_domain):
+        """Build a read-only, identity-bound plan for every active proxy instance."""
+        empty = {'version': 1, 'webui': None, 'items': [], 'blockers': [],
+                 'summary': {'discovered': 0, 'needs_migration': 0, 'blocked': 0}}
+        if (type(instances) is not list or len(instances) > 4096
+                or type(control_ui_domain) is not str):
+            raise DockerEngineError('Sidecar migration inventory is invalid')
+        blockers = []
+        prepared = []
+        try:
+            web = self._find_control_plane_web(control_ui_domain)
+            self._verify_control_plane_forwarded_trust(web)
+            if any(type(name) is str and name.startswith('pa-agent-')
+                   for name in web['networks']):
+                raise DockerEngineError('Control Plane is attached to an agent network')
+            state = web.get('state')
+            if type(state) is not dict or state.get('Status') != 'running':
+                raise DockerEngineError('Control Plane is not running')
+            healthcheck = web.get('healthcheck')
+            web_health = state.get('Health')
+            if (type(healthcheck) is dict and healthcheck.get('Test') not in (None, ['NONE'])
+                    and (type(web_health) is not dict or web_health.get('Status') != 'healthy')):
+                raise DockerEngineError('Control Plane healthcheck is not healthy')
+            sidecars = self._list_proxy_sidecars()
+        except Exception:
+            public = {**empty, 'blockers': [{'scope': 'webui', 'code': 'control_plane_preflight_failed'}]}
+            public['summary']['blocked'] = 1
+            return {'public': public, 'prepared': []}
+
+        records = {}
+        for row in instances:
+            if (type(row) is not dict or type(row.get('id')) is not str
+                    or type(row.get('actor')) is not str):
+                blockers.append({'scope': 'instance', 'code': 'runtime_record_invalid'})
+                continue
+            try:
+                instance_id = self._instance(row['id'])
+            except (TypeError, ValueError):
+                blockers.append({'scope': 'instance', 'code': 'runtime_record_invalid'})
+                continue
+            if instance_id in records:
+                blockers.append({'instance_id': instance_id, 'code': 'runtime_record_ambiguous'})
+                continue
+            records[instance_id] = row
+
+        extra_sidecars = sorted(set(sidecars) - set(records))
+        blockers.extend({'instance_id': instance_id, 'code': 'orphan_sidecar'}
+                        for instance_id in extra_sidecars)
+
+        public_items = []
+        for instance_id in sorted(records):
+            row = records[instance_id]
+            try:
+                owner_id = row['actor']
+                if (not 1 <= len(owner_id) <= 256
+                        or any(ord(char) <= 32 or ord(char) == 127 for char in owner_id)):
+                    raise DockerEngineError('Owner identity is invalid')
+                gateway = self._find(instance_id)
+                if gateway is None:
+                    raise DockerEngineError('Managed Gateway is absent')
+                gateway_id = self._verify(instance_id, gateway)
+                if row.get('container_id') != gateway_id:
+                    raise DockerEngineError('RuntimeStore and Gateway identities differ')
+                gateway_labels = gateway['Config']['Labels']
+                gateway_spec = json.loads(gateway_labels[self.SPEC_LABEL])
+                if (type(gateway_spec) is not dict or gateway_spec.get('version') != 3
+                        or gateway_spec.get('owner_id') != owner_id
+                        or gateway_spec.get('control_ui_origin') !=
+                            f'https://{instance_id}.{control_ui_domain}'):
+                    raise DockerEngineError('Gateway owner or Control UI spec differs')
+                storage = row.get('storage')
+                if type(storage) is not str:
+                    raise DockerEngineError('Runtime storage evidence is unavailable')
+                storage_evidence = json.loads(storage)
+                if (type(storage_evidence) is not dict
+                        or storage_evidence.get('host_path') != gateway_spec.get('host_path')):
+                    raise DockerEngineError('Gateway storage identity differs from RuntimeStore')
+                gateway_state = gateway.get('State') or {}
+                if (gateway_state.get('Status') != 'running'
+                        or (gateway_state.get('Health') or {}).get('Status') != 'healthy'):
+                    raise DockerEngineError('Gateway is not healthy')
+
+                sidecar = sidecars.get(instance_id)
+                if sidecar is None:
+                    raise DockerEngineError('Managed Sidecar is absent')
+                sidecar_id = self._object(sidecar.get('Id'))
+                sidecar_labels = sidecar['Config']['Labels']
+                old_spec = json.loads(sidecar_labels[self.SIDECAR_SPEC_LABEL])
+                expected_label_names = {
+                    self.INSTANCE_LABEL, self.SIDECAR_ROLE_LABEL,
+                    self.SIDECAR_SPEC_LABEL, self.SIDECAR_CONFIG_LABEL,
+                }
+                if (set(sidecar_labels) != expected_label_names
+                        or type(old_spec) is not dict
+                        or set(old_spec) != {
+                            'version', 'image_id', 'owner_id', 'control_ui_origin',
+                            'gateway_ip', 'listen_ip', 'host_path', 'agent', 'frontend'}
+                        or old_spec.get('version') != 1
+                        or old_spec.get('owner_id') != owner_id
+                        or old_spec.get('control_ui_origin') != gateway_spec['control_ui_origin']
+                        or old_spec.get('host_path') != gateway_spec['host_path']
+                        or old_spec.get('agent') != gateway_spec.get('proxy_network')
+                        or sidecar.get('Image') != old_spec.get('image_id')
+                        or sidecar_labels.get(self.SIDECAR_CONFIG_LABEL) != self._hash(old_spec)):
+                    raise DockerEngineError('Sidecar spec or image identity differs')
+                plan = {'agent': gateway_spec['proxy_network'], 'frontend': old_spec['frontend']}
+                self._proxy_network_payload(instance_id, plan['agent'], role='agent')
+                self._proxy_network_payload(instance_id, plan['frontend'], role='frontend')
+                network_ids = {
+                    'agent': self._proxy_network_id(instance_id, 'agent', plan['agent']),
+                    'frontend': self._proxy_network_id(instance_id, 'frontend', plan['frontend']),
+                }
+                old_image_info = self._proxy_sidecar_image_info(old_spec['image_id'], web)
+                old_payload = self._proxy_sidecar_payload(
+                    instance_id, owner_id=owner_id,
+                    control_ui_origin=gateway_spec['control_ui_origin'],
+                    gateway_ip=plan['agent']['gateway_ip'],
+                    listen_ip=plan['frontend']['sidecar_ip'],
+                    image_id=old_spec['image_id'], host_path=gateway_spec['host_path'],
+                    plan=plan, image_info=old_image_info)
+                self._verify_proxy_sidecar(instance_id, sidecar, old_payload, plan, network_ids)
+                target_payload = self._proxy_sidecar_payload(
+                    instance_id, owner_id=owner_id,
+                    control_ui_origin=gateway_spec['control_ui_origin'],
+                    gateway_ip=plan['agent']['gateway_ip'],
+                    listen_ip=plan['frontend']['sidecar_ip'],
+                    image_id=web['image_id'], host_path=gateway_spec['host_path'],
+                    plan=plan, image_info=web['image_info'])
+                target_spec = json.loads(target_payload['Labels'][self.SIDECAR_SPEC_LABEL])
+                if target_spec != {**old_spec, 'image_id': web['image_id']}:
+                    raise DockerEngineError('Sidecar migration would change non-image configuration')
+                sidecar_state = sidecar.get('State') or {}
+                if (sidecar_state.get('Status') != 'running'
+                        or (sidecar_state.get('Health') or {}).get('Status') != 'healthy'):
+                    raise DockerEngineError('Sidecar is not healthy')
+                self._verify_proxy_network_membership(
+                    instance_id, 'agent', network_ids['agent'], plan['agent'],
+                    {gateway_id, sidecar_id},
+                    expected_ips={gateway_id: plan['agent']['gateway_ip'],
+                                  sidecar_id: plan['agent']['sidecar_ip']})
+                self._verify_migration_frontend_membership(
+                    instance_id, network_ids['frontend'], plan['frontend'],
+                    web['container_id'], sidecar_id)
+                policy = self._proxy_firewall_policy(instance_id, plan)
+                policies = self.proxy_network_policies()
+                firewall_ready = getattr(self.firewall, 'ready', None)
+                if (policy not in policies or not callable(firewall_ready)
+                        or firewall_ready(policies) is not True):
+                    raise DockerEngineError('Firewall policy is not ready')
+
+                action = 'replace' if old_spec['image_id'] != web['image_id'] else 'already_current'
+                public_item = {
+                    'instance_id': instance_id, 'owner_id': owner_id,
+                    'gateway_id': gateway_id, 'gateway_image_id': gateway.get('Image'),
+                    'old_sidecar_id': sidecar_id, 'old_image_id': old_spec['image_id'],
+                    'target_image_id': web['image_id'],
+                    'agent_network_id': network_ids['agent'],
+                    'frontend_network_id': network_ids['frontend'],
+                    'gateway_ip': plan['agent']['gateway_ip'],
+                    'sidecar_agent_ip': plan['agent']['sidecar_ip'],
+                    'sidecar_frontend_ip': plan['frontend']['sidecar_ip'],
+                    'web_ip': plan['frontend']['web_ip'], 'action': action,
+                }
+                private_item = {
+                    **public_item, 'gateway_spec': gateway_spec,
+                    'gateway_spec_sha256': self._hash(gateway_spec),
+                    'gateway_live_sha256': self._gateway_migration_fingerprint(gateway),
+                    'old_sidecar_spec': old_spec,
+                    'old_sidecar_config_sha256': sidecar_labels[self.SIDECAR_CONFIG_LABEL],
+                    'target_sidecar_spec': target_spec,
+                    'target_sidecar_config_sha256': target_payload['Labels'][self.SIDECAR_CONFIG_LABEL],
+                    'network_plan': plan, 'network_ids': network_ids,
+                    'web_container_id': web['container_id'],
+                    'sidecar_was_running': True,
+                }
+                public_items.append(public_item)
+                prepared.append(private_item)
+            except Exception:
+                blockers.append({'instance_id': instance_id, 'code': 'instance_preflight_failed'})
+
+        public = {
+            'version': 1,
+            'webui': {'container_id': web['container_id'], 'image_id': web['image_id']},
+            'items': public_items,
+            'blockers': blockers,
+            'summary': {
+                'discovered': len(records),
+                'needs_migration': sum(item['action'] == 'replace' for item in public_items),
+                'blocked': len(blockers),
+            },
+        }
+        return {'public': public, 'prepared': prepared}
+
+    def _migration_domain(self, item):
+        instance_id = self._instance(item.get('instance_id'))
+        gateway_spec = item.get('gateway_spec')
+        origin = gateway_spec.get('control_ui_origin') if type(gateway_spec) is dict else None
+        prefix = 'https://' + instance_id + '.'
+        if type(origin) is not str or not origin.startswith(prefix):
+            raise DockerEngineError('Migration Control UI origin is invalid')
+        domain = origin[len(prefix):]
+        if not domain:
+            raise DockerEngineError('Migration Control UI origin is invalid')
+        return domain
+
+    def _migration_payloads(self, item, web):
+        instance_id = self._instance(item.get('instance_id'))
+        owner_id = item.get('owner_id')
+        gateway_spec = item.get('gateway_spec')
+        old_spec = item.get('old_sidecar_spec')
+        target_spec = item.get('target_sidecar_spec')
+        plan = item.get('network_plan')
+        if (type(gateway_spec) is not dict or type(old_spec) is not dict
+                or type(target_spec) is not dict or type(plan) is not dict
+                or gateway_spec.get('owner_id') != owner_id
+                or gateway_spec.get('version') != 3
+                or self._hash(gateway_spec) != item.get('gateway_spec_sha256')
+                or old_spec.get('image_id') != item.get('old_image_id')
+                or target_spec.get('image_id') != item.get('target_image_id')
+                or item.get('target_image_id') != web.get('image_id')
+                or target_spec != {**old_spec, 'image_id': item.get('target_image_id')}):
+            raise DockerEngineError('Saved migration specifications are invalid')
+        if set(plan) != {'agent', 'frontend'}:
+            raise DockerEngineError('Saved migration network plan is invalid')
+        self._proxy_network_payload(instance_id, plan['agent'], role='agent')
+        self._proxy_network_payload(instance_id, plan['frontend'], role='frontend')
+        old_image_info = self._proxy_sidecar_image_info(item['old_image_id'], web)
+        old_payload = self._proxy_sidecar_payload(
+            instance_id, owner_id=owner_id,
+            control_ui_origin=gateway_spec['control_ui_origin'],
+            gateway_ip=plan['agent']['gateway_ip'],
+            listen_ip=plan['frontend']['sidecar_ip'],
+            image_id=item['old_image_id'], host_path=gateway_spec['host_path'],
+            plan=plan, image_info=old_image_info)
+        target_payload = self._proxy_sidecar_payload(
+            instance_id, owner_id=owner_id,
+            control_ui_origin=gateway_spec['control_ui_origin'],
+            gateway_ip=plan['agent']['gateway_ip'],
+            listen_ip=plan['frontend']['sidecar_ip'],
+            image_id=item['target_image_id'], host_path=gateway_spec['host_path'],
+            plan=plan, image_info=web['image_info'])
+        if (json.loads(old_payload['Labels'][self.SIDECAR_SPEC_LABEL]) != old_spec
+                or json.loads(target_payload['Labels'][self.SIDECAR_SPEC_LABEL]) != target_spec
+                or old_payload['Labels'][self.SIDECAR_CONFIG_LABEL]
+                    != item.get('old_sidecar_config_sha256')
+                or target_payload['Labels'][self.SIDECAR_CONFIG_LABEL]
+                    != item.get('target_sidecar_config_sha256')):
+            raise DockerEngineError('Saved migration payload verification failed')
+        return old_payload, target_payload
+
+    def _verify_migration_web(self, item):
+        domain = self._migration_domain(item)
+        web = self._find_control_plane_web(domain)
+        self._verify_control_plane_forwarded_trust(web)
+        if (web.get('container_id') != item.get('web_container_id')
+                or web.get('image_id') != item.get('target_image_id')):
+            raise DockerEngineError('Control Plane identity changed during migration')
+        networks = web.get('networks')
+        if type(networks) is not dict or any(
+                type(name) is str and name.startswith('pa-agent-') for name in networks):
+            raise DockerEngineError('Control Plane network identity changed')
+        state = web.get('state')
+        if type(state) is not dict or state.get('Status') != 'running':
+            raise DockerEngineError('Control Plane stopped during migration')
+        healthcheck = web.get('healthcheck')
+        if (type(healthcheck) is dict and healthcheck.get('Test') not in (None, ['NONE'])
+                and (type(state.get('Health')) is not dict
+                     or state['Health'].get('Status') != 'healthy')):
+            raise DockerEngineError('Control Plane healthcheck failed')
+        return web
+
+    def _gateway_migration_fingerprint(self, observed):
+        if (type(observed) is not dict or type(observed.get('Id')) is not str
+                or type(observed.get('Image')) is not str
+                or type(observed.get('Config')) is not dict
+                or type(observed.get('HostConfig')) is not dict
+                or type(observed.get('Mounts')) is not list):
+            raise DockerEngineError('Gateway snapshot is incomplete for migration')
+        settings = observed.get('NetworkSettings')
+        networks = settings.get('Networks') if type(settings) is dict else None
+        if type(networks) is not dict:
+            raise DockerEngineError('Gateway network snapshot is incomplete for migration')
+        return self._hash({
+            'id': observed['Id'], 'image': observed['Image'],
+            'name': observed.get('Name'), 'config': observed['Config'],
+            'host': observed['HostConfig'], 'mounts': observed['Mounts'],
+            'networks': networks,
+        })
+
+    def _verify_migration_gateway(self, item):
+        instance_id = self._instance(item.get('instance_id'))
+        gateway = self._find(instance_id)
+        if gateway is None or gateway.get('Id') != item.get('gateway_id'):
+            raise DockerEngineError('Gateway container identity changed during migration')
+        gateway_id = self._object(gateway.get('Id'))
+        labels = gateway.get('Config', {}).get('Labels', {})
+        try:
+            spec = json.loads(labels[self.SPEC_LABEL])
+        except (KeyError, TypeError, ValueError):
+            raise DockerEngineError('Gateway specification changed during migration') from None
+        if (gateway_id != item.get('gateway_id')
+                or gateway.get('Image') != item.get('gateway_image_id')
+                or spec != item.get('gateway_spec')
+                or self._hash(spec) != item.get('gateway_spec_sha256')
+                or self._gateway_migration_fingerprint(gateway)
+                    != item.get('gateway_live_sha256')
+                or set(labels) != set(self._labels(instance_id)) | {self.SPEC_LABEL, self.CONFIG_LABEL}):
+            raise DockerEngineError('Gateway identity or labels changed during migration')
+        state = gateway.get('State') or {}
+        if (state.get('Status') != 'running'
+                or (state.get('Health') or {}).get('Status') != 'healthy'):
+            raise DockerEngineError('Gateway is not healthy during migration')
+        return gateway
+
+    def _verify_migration_networks(self, item, *, sidecar_id=None, web_attached=True,
+                                   allow_unstarted=False):
+        instance_id = self._instance(item.get('instance_id'))
+        plan = item.get('network_plan')
+        network_ids = item.get('network_ids')
+        if (type(plan) is not dict or type(network_ids) is not dict
+                or set(network_ids) != {'agent', 'frontend'}):
+            raise DockerEngineError('Saved migration networks are invalid')
+        for role in ('agent', 'frontend'):
+            current = self._proxy_network_id(instance_id, role, plan[role])
+            if current != network_ids[role]:
+                raise DockerEngineError('Docker network identity changed during migration')
+        gateway_id = self._object(item.get('gateway_id'))
+        agent_ids = {gateway_id}
+        agent_ips = {gateway_id: plan['agent']['gateway_ip']}
+        if sidecar_id is not None:
+            sidecar_id = self._object(sidecar_id)
+            agent_ids.add(sidecar_id)
+            agent_ips[sidecar_id] = plan['agent']['sidecar_ip']
+        self._verify_proxy_network_membership(
+            instance_id, 'agent', network_ids['agent'], plan['agent'], agent_ids,
+            expected_ips=agent_ips,
+            allow_unstarted=allow_unstarted or sidecar_id is None)
+        web = self._verify_migration_web(item)
+        attached = self._verify_migration_frontend_membership(
+            instance_id, network_ids['frontend'], plan['frontend'],
+            web['container_id'], sidecar_id)
+        if web_attached and not attached:
+            raise DockerEngineError('Control Plane frontend attachment is missing')
+        if not web_attached and attached:
+            raise DockerEngineError('Unexpected Control Plane frontend attachment')
+        policy = self._proxy_firewall_policy(instance_id, plan)
+        policies = self.proxy_network_policies()
+        ready = getattr(self.firewall, 'ready', None)
+        if policy not in policies or not callable(ready) or ready(policies) is not True:
+            raise DockerEngineError('Firewall policy is not ready during migration')
+
+    def _wait_proxy_sidecar_healthy(self, instance_id, expected, plan, network_ids,
+                                    expected_id, timeout=60):
+        deadline = time.monotonic() + timeout
+        while True:
+            observed = self._find_proxy_sidecar(instance_id)
+            if observed is None or observed.get('Id') != expected_id:
+                raise DockerEngineError('Migrated Sidecar identity is unavailable')
+            self._verify_proxy_sidecar(instance_id, observed, expected, plan, network_ids)
+            state = observed.get('State') or {}
+            status = state.get('Status')
+            health = (state.get('Health') or {}).get('Status')
+            if status == 'running' and health == 'healthy':
+                return observed
+            if status in {'exited', 'dead', 'removing'} or health == 'unhealthy':
+                raise DockerEngineError('Migrated Sidecar failed its healthcheck')
+            if time.monotonic() >= deadline:
+                raise DockerEngineError('Migrated Sidecar healthcheck timed out')
+            time.sleep(1)
+
+    def migrate_control_ui_sidecar(self, item, checkpoint):
+        """Idempotently replace one verified Sidecar; never restart or delete Gateway."""
+        required = {'instance_id', 'owner_id', 'gateway_id', 'gateway_spec',
+                    'gateway_spec_sha256', 'gateway_live_sha256', 'old_sidecar_id', 'old_sidecar_spec',
+                    'old_sidecar_config_sha256', 'target_sidecar_spec',
+                    'target_sidecar_config_sha256', 'old_image_id', 'target_image_id',
+                    'network_plan', 'network_ids', 'web_container_id', 'stage'}
+        if (type(item) is not dict or not required <= set(item)
+                or not callable(checkpoint)):
+            raise DockerEngineError('Saved migration item is invalid')
+        instance_id = self._instance(item['instance_id'])
+        web = self._verify_migration_web(item)
+        old_payload, target_payload = self._migration_payloads(item, web)
+        plan, network_ids = item['network_plan'], item['network_ids']
+        gateway = self._verify_migration_gateway(item)
+        stage = item['stage']
+        allowed_stages = {'planned', 'web_attached', 'stopping_old', 'old_stopped',
+                          'deleting_old', 'old_removed', 'creating_new', 'new_created',
+                          'starting_new', 'new_running', 'complete'}
+        if stage not in allowed_stages:
+            raise DockerEngineError('Migration journal stage is invalid')
+        sidecar = self._find_proxy_sidecar(instance_id)
+        if sidecar is not None:
+            labels = sidecar.get('Config', {}).get('Labels', {})
+            current_spec = json.loads(labels.get(self.SIDECAR_SPEC_LABEL, '{}'))
+            observed_id = sidecar.get('Id')
+            is_old = (observed_id == item['old_sidecar_id']
+                      and current_spec == item['old_sidecar_spec'])
+            if (current_spec == item['target_sidecar_spec']
+                    and observed_id == item['old_sidecar_id'] and not is_old):
+                raise DockerEngineError('Target Sidecar reused the old container identity')
+            is_target = (observed_id != item['old_sidecar_id']
+                         and current_spec == item['target_sidecar_spec'])
+            if (is_target and item.get('new_sidecar_id') is not None
+                    and sidecar.get('Id') != item.get('new_sidecar_id')):
+                raise DockerEngineError('Migrated Sidecar container identity changed')
+            if not (is_old or is_target):
+                raise DockerEngineError('Unexpected Sidecar appeared during migration')
+            expected_payload = old_payload if is_old else target_payload
+            self._verify_proxy_sidecar(instance_id, sidecar, expected_payload, plan, network_ids)
+            sidecar_id = self._object(sidecar.get('Id'))
+            name = sidecar.get('Name')
+            if name not in ('/pa-proxy-' + instance_id, 'pa-proxy-' + instance_id):
+                raise DockerEngineError('Sidecar name identity changed during migration')
+        else:
+            is_old = is_target = False
+            sidecar_id = None
+
+        if is_target:
+            if stage not in {'creating_new', 'new_created', 'starting_new', 'new_running', 'complete'}:
+                raise DockerEngineError('Target Sidecar appeared before the journaled create stage')
+            item['new_sidecar_id'] = sidecar_id
+        elif is_old:
+            if stage in {'creating_new', 'new_created', 'starting_new', 'new_running', 'complete'}:
+                raise DockerEngineError('Old Sidecar reappeared after target creation began')
+            if stage in {'planned', 'web_attached'}:
+                web_after = self._ensure_container_network(
+                    item['web_container_id'], network_ids['frontend'],
+                    plan['frontend']['name'], plan['frontend']['web_ip'])
+                if type(web_after) is not dict or web_after.get('Id') != item['web_container_id']:
+                    raise DockerEngineError('Control Plane frontend reattachment failed')
+                self._verify_migration_networks(item, sidecar_id=sidecar_id)
+                checkpoint('web_attached')
+                stage = 'web_attached'
+            state = sidecar.get('State') or {}
+            status = state.get('Status')
+            if status == 'running':
+                checkpoint('stopping_old')
+                try:
+                    self._request('POST', '/containers/' + sidecar_id + '/stop?t=10', ok=(204, 304))
+                except DockerEngineError:
+                    latest = self._find_proxy_sidecar(instance_id)
+                    if latest is None or latest.get('Id') != sidecar_id:
+                        raise
+                latest = self._find_proxy_sidecar(instance_id)
+                if latest is None or latest.get('Id') != sidecar_id:
+                    raise DockerEngineError('Old Sidecar stop identity is unavailable')
+                state = latest.get('State') or {}
+                if state.get('Status') not in {'exited', 'dead'}:
+                    raise DockerEngineError('Old Sidecar stop could not be verified')
+                checkpoint('old_stopped')
+                stage = 'old_stopped'
+            elif status in {'exited', 'dead'} and stage in {'stopping_old', 'old_stopped', 'deleting_old'}:
+                checkpoint('old_stopped')
+                stage = 'old_stopped'
+            else:
+                raise DockerEngineError('Old Sidecar lifecycle state is ambiguous')
+            # Re-verify exact identity and stopped state immediately before deletion.
+            latest = self._find_proxy_sidecar(instance_id)
+            if latest is None or latest.get('Id') != item['old_sidecar_id']:
+                raise DockerEngineError('Old Sidecar changed before deletion')
+            self._verify_proxy_sidecar(instance_id, latest, old_payload, plan, network_ids)
+            if (latest.get('Config', {}).get('Labels', {}).get(self.SIDECAR_CONFIG_LABEL)
+                    != item['old_sidecar_config_sha256']):
+                raise DockerEngineError('Old Sidecar labels changed before deletion')
+            if stage != 'deleting_old':
+                checkpoint('deleting_old')
+            try:
+                self._delete_container(item['old_sidecar_id'])
+            except DockerEngineError:
+                if self._find_proxy_sidecar(instance_id) is not None:
+                    raise
+            if self._find_proxy_sidecar(instance_id) is not None:
+                raise DockerEngineError('Old Sidecar deletion could not be verified')
+            checkpoint('old_removed')
+            stage = 'old_removed'
+        elif sidecar is None:
+            if stage not in {'deleting_old', 'old_removed', 'creating_new', 'new_created',
+                             'starting_new', 'new_running', 'complete'}:
+                raise DockerEngineError('Sidecar absence is not explained by the journal')
+            self._verify_migration_networks(item, sidecar_id=None, web_attached=True)
+        else:
+            raise DockerEngineError('Sidecar state is ambiguous')
+
+        if not is_target:
+            checkpoint('creating_new')
+            self._verify_migration_gateway(item)
+            sidecar_id = self._create_proxy_sidecar(instance_id, target_payload, plan, network_ids)
+            if sidecar_id == item['old_sidecar_id']:
+                raise DockerEngineError('New Sidecar reused the old container identity')
+            item['new_sidecar_id'] = sidecar_id
+            checkpoint('new_created', new_sidecar_id=sidecar_id)
+            stage = 'new_created'
+            self._verify_migration_gateway(item)
+            self._verify_migration_networks(
+                item, sidecar_id=sidecar_id, allow_unstarted=True)
+            sidecar = self._find_proxy_sidecar(instance_id)
+            if sidecar is None or sidecar.get('Id') != sidecar_id:
+                raise DockerEngineError('New Sidecar creation could not be verified')
+            self._verify_proxy_sidecar(instance_id, sidecar, target_payload, plan, network_ids)
+            status = (sidecar.get('State') or {}).get('Status')
+            if status not in {'created', 'exited', 'running'}:
+                raise DockerEngineError('New Sidecar lifecycle state is invalid')
+            checkpoint('starting_new', new_sidecar_id=sidecar_id)
+            try:
+                self._request('POST', '/containers/' + sidecar_id + '/start', ok=(204, 304))
+            except DockerEngineError:
+                latest = self._find_proxy_sidecar(instance_id)
+                if latest is None or latest.get('Id') != sidecar_id:
+                    raise
+            checkpoint('new_created', new_sidecar_id=sidecar_id)
+        else:
+            sidecar_id = self._object(sidecar_id)
+            status = (sidecar.get('State') or {}).get('Status')
+            if status != 'running':
+                checkpoint('starting_new', new_sidecar_id=sidecar_id)
+                try:
+                    self._request('POST', '/containers/' + sidecar_id + '/start', ok=(204, 304))
+                except DockerEngineError:
+                    latest = self._find_proxy_sidecar(instance_id)
+                    if latest is None or latest.get('Id') != sidecar_id:
+                        raise
+
+        checkpoint('new_running', new_sidecar_id=sidecar_id)
+        sidecar = self._wait_proxy_sidecar_healthy(
+            instance_id, target_payload, plan, network_ids, sidecar_id)
+        self._verify_migration_gateway(item)
+        self._verify_migration_networks(item, sidecar_id=sidecar_id, web_attached=True)
+        current = self._find_proxy_sidecar(instance_id)
+        if current is None or current.get('Id') != sidecar_id:
+            raise DockerEngineError('Migrated Sidecar identity changed during final verification')
+        self._verify_proxy_sidecar(instance_id, current, target_payload, plan, network_ids)
+        target = self.control_ui_target(instance_id, item['owner_id'])
+        if (type(target) is not dict
+                or target.get('identity') != {
+                    'gateway_id': item['gateway_id'], 'sidecar_id': sidecar_id,
+                    'agent_network_id': network_ids['agent'],
+                    'frontend_network_id': network_ids['frontend']}):
+            raise DockerEngineError('Migrated Control UI target is not ready')
+        checkpoint('complete', new_sidecar_id=sidecar_id, result='verified')
+        return {'gateway_id': item['gateway_id'], 'sidecar_id': sidecar_id}
+
+    def rollback_control_ui_sidecar(self, item, checkpoint):
+        """Restore the saved Sidecar only; the current WebUI remains fail-closed."""
+        if type(item) is not dict or not callable(checkpoint):
+            raise DockerEngineError('Saved migration item is invalid')
+        instance_id = self._instance(item.get('instance_id'))
+        web = self._verify_migration_web(item)
+        old_payload, target_payload = self._migration_payloads(item, web)
+        plan, network_ids = item['network_plan'], item['network_ids']
+        self._verify_migration_gateway(item)
+        sidecar = self._find_proxy_sidecar(instance_id)
+        if sidecar is not None:
+            labels = sidecar.get('Config', {}).get('Labels', {})
+            current_spec = json.loads(labels.get(self.SIDECAR_SPEC_LABEL, '{}'))
+            observed_id = sidecar.get('Id')
+            is_old = (observed_id == item['old_sidecar_id']
+                      and current_spec == item['old_sidecar_spec'])
+            if (current_spec == item['target_sidecar_spec']
+                    and observed_id == item['old_sidecar_id'] and not is_old):
+                raise DockerEngineError('Target Sidecar reused the old container identity')
+            is_target = (observed_id != item['old_sidecar_id']
+                         and current_spec == item['target_sidecar_spec'])
+            if (is_target and item.get('new_sidecar_id') is not None
+                    and sidecar.get('Id') != item.get('new_sidecar_id')):
+                raise DockerEngineError('Migrated Sidecar container identity changed before rollback')
+            if not (is_old or is_target):
+                raise DockerEngineError('Unexpected Sidecar prevents rollback')
+            expected = old_payload if is_old else target_payload
+            self._verify_proxy_sidecar(instance_id, sidecar, expected, plan, network_ids)
+            sidecar_id = self._object(sidecar.get('Id'))
+            if sidecar.get('Name') not in ('/pa-proxy-' + instance_id, 'pa-proxy-' + instance_id):
+                raise DockerEngineError('Sidecar name identity prevents rollback')
+            if is_target:
+                checkpoint('rollback_deleting_new', new_sidecar_id=sidecar_id)
+                state = sidecar.get('State') or {}
+                if state.get('Status') == 'running':
+                    self._request('POST', '/containers/' + sidecar_id + '/stop?t=10', ok=(204, 304))
+                    stopped = self._find_proxy_sidecar(instance_id)
+                    if (stopped is None or stopped.get('Id') != sidecar_id
+                            or (stopped.get('State') or {}).get('Status') not in {'exited', 'dead'}):
+                        raise DockerEngineError('New Sidecar stop could not be verified for rollback')
+                latest = self._find_proxy_sidecar(instance_id)
+                if latest is None or latest.get('Id') != sidecar_id:
+                    raise DockerEngineError('New Sidecar identity changed during rollback')
+                self._verify_proxy_sidecar(instance_id, latest, target_payload, plan, network_ids)
+                self._delete_container(sidecar_id)
+                if self._find_proxy_sidecar(instance_id) is not None:
+                    raise DockerEngineError('New Sidecar deletion could not be verified for rollback')
+            else:
+                sidecar_id = self._object(sidecar_id)
+                if (sidecar.get('State') or {}).get('Status') == 'running':
+                    self._wait_proxy_sidecar_healthy(
+                        instance_id, old_payload, plan, network_ids, sidecar_id)
+                    self._verify_migration_gateway(item)
+                    self._verify_migration_networks(
+                        item, sidecar_id=sidecar_id, web_attached=True)
+                    checkpoint('rolled_back', new_sidecar_id=sidecar_id,
+                               result='old_sidecar_restored_control_ui_closed')
+                    return {'gateway_id': item['gateway_id'], 'sidecar_id': sidecar_id}
+        elif item.get('stage') not in {'deleting_old', 'old_removed', 'creating_new',
+                                      'new_created', 'starting_new', 'new_running',
+                                      'rollback_deleting_new', 'needs_attention'}:
+            raise DockerEngineError('Sidecar absence is not explained by the rollback journal')
+
+        restore_candidate = self._find_proxy_sidecar(instance_id)
+        restore_id = None
+        if restore_candidate is not None:
+            labels = restore_candidate.get('Config', {}).get('Labels', {})
+            try:
+                restore_spec = json.loads(labels.get(self.SIDECAR_SPEC_LABEL, '{}'))
+                restore_id = self._object(restore_candidate.get('Id'))
+            except (TypeError, ValueError, DockerEngineError):
+                raise DockerEngineError('Old Sidecar identity is ambiguous before rollback') from None
+            if (restore_id != item['old_sidecar_id']
+                    or restore_spec != item['old_sidecar_spec']
+                    or restore_candidate.get('Name') not in (
+                        '/pa-proxy-' + instance_id, 'pa-proxy-' + instance_id)):
+                raise DockerEngineError('Old Sidecar identity changed before rollback restore')
+            self._verify_proxy_sidecar(
+                instance_id, restore_candidate, old_payload, plan, network_ids)
+        self._verify_migration_gateway(item)
+        self._verify_migration_networks(
+            item, sidecar_id=restore_id, web_attached=True, allow_unstarted=True)
+        if restore_candidate is None:
+            sidecar_id = self._create_proxy_sidecar(instance_id, old_payload, plan, network_ids)
+        else:
+            if restore_id is None:
+                raise DockerEngineError('Old Sidecar identity is unavailable before rollback')
+            sidecar_id = restore_id
+        self._ensure_container_network(
+            sidecar_id, network_ids['agent'], plan['agent']['name'], plan['agent']['sidecar_ip'])
+        self._verify_proxy_sidecar(instance_id, self._find_proxy_sidecar(instance_id),
+                                   old_payload, plan, network_ids)
+        self._request('POST', '/containers/' + sidecar_id + '/start', ok=(204, 304))
+        self._wait_proxy_sidecar_healthy(instance_id, old_payload, plan, network_ids, sidecar_id)
+        self._verify_migration_gateway(item)
+        self._verify_migration_networks(item, sidecar_id=sidecar_id, web_attached=True)
+        checkpoint('rolled_back', new_sidecar_id=sidecar_id,
+                   result='old_sidecar_restored_control_ui_closed')
+        return {'gateway_id': item['gateway_id'], 'sidecar_id': sidecar_id}
+
     def _verify_proxy_sidecar(self, instance_id, observed, expected, plan, network_ids):
         try:
             self._instance(instance_id)
@@ -1463,6 +2106,45 @@ class DockerEngine:
                 or labels.get(self.SIDECAR_ROLE_LABEL) != self.SIDECAR_ROLE):
             raise DockerEngineError('Proxy sidecar ownership verification failed')
         return observed
+
+    def _list_proxy_sidecars(self):
+        """Return the globally labelled Sidecars only after exact label/spec validation."""
+        filters = {'label': [self.SIDECAR_ROLE_LABEL + '=' + self.SIDECAR_ROLE]}
+        rows = self._request('GET', '/containers/json?' + urlencode(
+            {'all': 'true', 'filters': self._json(filters)}))
+        if type(rows) is not list or len(rows) > 4096:
+            raise DockerEngineError('Proxy sidecar inventory is invalid')
+        result = {}
+        for row in rows:
+            if type(row) is not dict:
+                raise DockerEngineError('Proxy sidecar inventory is invalid')
+            container_id = self._object(row.get('Id'))
+            observed = self._request('GET', '/containers/' + container_id + '/json')
+            config = observed.get('Config') if type(observed) is dict else None
+            labels = config.get('Labels') if type(config) is dict else None
+            names = row.get('Names')
+            if (type(observed) is not dict or observed.get('Id') != container_id
+                    or type(config) is not dict or type(labels) is not dict
+                    or type(names) is not list):
+                raise DockerEngineError('Proxy sidecar identity is invalid')
+            try:
+                instance_id = self._instance(labels.get(self.INSTANCE_LABEL))
+                spec = json.loads(labels[self.SIDECAR_SPEC_LABEL])
+            except (KeyError, TypeError, ValueError):
+                raise DockerEngineError('Proxy sidecar identity is invalid') from None
+            expected_label_names = {
+                self.INSTANCE_LABEL, self.SIDECAR_ROLE_LABEL,
+                self.SIDECAR_SPEC_LABEL, self.SIDECAR_CONFIG_LABEL,
+            }
+            if (labels.get(self.SIDECAR_ROLE_LABEL) != self.SIDECAR_ROLE
+                    or set(labels) != expected_label_names
+                    or names != ['/pa-proxy-' + instance_id]
+                    or type(spec) is not dict
+                    or labels.get(self.SIDECAR_CONFIG_LABEL) != self._hash(spec)
+                    or instance_id in result):
+                raise DockerEngineError('Proxy sidecar identity is ambiguous')
+            result[instance_id] = observed
+        return result
 
     def _find(self, instance_id):
 
@@ -2076,6 +2758,64 @@ class DockerEngine:
         if state['container_id'] != container_id or state['state'] not in expected:
             raise DockerEngineError('Managed container action could not be verified')
         return state
+
+    def _verify_migration_frontend_membership(self, instance_id, network_id, plan,
+                                              web_id, sidecar_id=None):
+        """Read-only check allowing only the known WebUI to be temporarily detached."""
+        network = self._request('GET', '/networks/' + self._object(network_id))
+        pool = self.frontend_network_pool
+        if type(pool) is not str or type(network) is not dict:
+            raise DockerEngineError('Frontend network verification is unavailable')
+        actual_plan = self._proxy_network_from_observation(
+            instance_id, 'frontend', network, self._proxy_pool(pool))
+        if actual_plan != plan:
+            raise DockerEngineError('Frontend network identity changed')
+        containers = network.get('Containers') or {}
+        if type(containers) is not dict:
+            raise DockerEngineError('Frontend network membership is invalid')
+        members = set(containers)
+        web_id = self._object(web_id)
+        if sidecar_id is None:
+            if members != {web_id}:
+                raise DockerEngineError('Frontend network has an unexpected participant')
+        else:
+            sidecar_id = self._object(sidecar_id)
+            if sidecar_id not in members or members not in ({sidecar_id}, {sidecar_id, web_id}):
+                raise DockerEngineError('Frontend network has an unexpected participant')
+        for container_id in members:
+            observed = self._request('GET', '/containers/' + self._object(container_id) + '/json')
+            if type(observed) is not dict or observed.get('Id') != container_id:
+                raise DockerEngineError('Frontend participant identity verification failed')
+            if container_id == web_id:
+                config = observed.get('Config')
+                labels = config.get('Labels') if type(config) is dict else None
+                if type(labels) is not dict or labels.get(self.CONTROL_PLANE_LABEL) != 'true':
+                    raise DockerEngineError('Frontend WebUI identity verification failed')
+                expected_ip = plan['web_ip']
+            else:
+                if sidecar_id is None:
+                    raise DockerEngineError('Frontend network has an unexpected participant')
+                config = observed.get('Config')
+                labels = config.get('Labels') if type(config) is dict else None
+                if (type(labels) is not dict
+                        or labels.get(self.INSTANCE_LABEL) != instance_id
+                        or labels.get(self.SIDECAR_ROLE_LABEL) != self.SIDECAR_ROLE):
+                    raise DockerEngineError('Frontend Sidecar identity verification failed')
+                expected_ip = plan['sidecar_ip']
+            self._verify_proxy_endpoint(observed, plan['name'], network_id, expected_ip)
+            member = containers[container_id]
+            if type(member) is not dict:
+                raise DockerEngineError('Frontend network endpoint metadata is invalid')
+            address_value = member.get('IPv4Address')
+            if type(address_value) is not str:
+                raise DockerEngineError('Frontend network endpoint address is invalid')
+            try:
+                member_ip = str(ipaddress.ip_interface(address_value).ip)
+            except ValueError:
+                raise DockerEngineError('Frontend network endpoint address is invalid') from None
+            if member_ip != expected_ip:
+                raise DockerEngineError('Frontend network endpoint address changed')
+        return web_id in members
 
     def _proxy_firewall_ready(self, instance_id, gateway_spec):
         ready = getattr(self.firewall, 'ready', None)
