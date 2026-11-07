@@ -1,0 +1,145 @@
+--- a/src/gateway/server/ws-connection/connect-device-pairing.ts
++++ b/src/gateway/server/ws-connection/connect-device-pairing.ts
+@@ -25,6 +25,7 @@
+   updatePairedDeviceMetadata,
+ } from "../../../infra/device-pairing.js";
+ import { roleScopesAllow } from "../../../shared/operator-scope-compat.js";
++import { GATEWAY_CLIENT_NAMES } from "../../../../packages/gateway-protocol/src/client-info.js";
+ import { isBrowserCopilotClient } from "../../../utils/message-channel.js";
+ import { pruneSupersededSilentPairingsAfterApproval } from "../../device-pairing-prune.js";
+ import { retireDeviceTokenClients } from "../../device-token-client-lifecycle.js";
+@@ -126,6 +127,12 @@
+   const browserCopilotOrigin = isBrowserCopilotClient(connectParams.client)
+     ? normalizeChromeExtensionOrigin(requestOrigin)
+     : undefined;
++  // Control UI origins are copied only after Gateway WebSocket origin admission.
++  const pairingBrowserOrigin =
++    browserCopilotOrigin ??
++    (connectParams.client.id === GATEWAY_CLIENT_NAMES.CONTROL_UI
++      ? context.browserOrigin?.origin
++      : undefined);
+   if (device && devicePublicKey) {
+     const formatAuditList = (items: string[] | undefined): string =>
+       normalizeSortedUniqueTrimmedStringList(items).join(",") || "<none>";
+@@ -143,7 +150,7 @@
+       deviceFamily: connectParams.client.deviceFamily,
+       clientId: connectParams.client.id,
+       clientMode: connectParams.client.mode,
+-      ...(browserCopilotOrigin ? { browserOrigin: browserCopilotOrigin } : {}),
++      ...(pairingBrowserOrigin ? { browserOrigin: pairingBrowserOrigin } : {}),
+       role,
+       scopes,
+       remoteIp: reportedClientIp,
+--- a/src/gateway/server/ws-connection/connect-device-pairing.test.ts
++++ b/src/gateway/server/ws-connection/connect-device-pairing.test.ts
+@@ -987,4 +987,110 @@
+       testTailscaleWhois.value = null;
+     }
+   });
++
++  test("persists the verified Control UI Origin on pairing and reconnects after approval", async () => {
++    const origin = "https://control-ui.example.test";
++    const auth = { mode: "token", token: "control-ui-browser-origin-token" } as const;
++    const scopes = ["operator.read", "operator.write"];
++    testState.gatewayAuth = auth;
++    testState.gatewayControlUi = { allowedOrigins: [origin] };
++    await replaceConfigFile({
++      nextConfig: {
++        gateway: {
++          auth,
++          controlUi: { allowedOrigins: [origin] },
++          nodes: { pairing: { autoApproveLocal: false } },
++        },
++      },
++      afterWrite: { mode: "auto" },
++    });
++    const started = await startServerWithClient(undefined, {
++      auth,
++      controlUiEnabled: true,
++      wsHeaders: { origin },
++    });
++    const loaded = loadDeviceIdentity("control-ui-browser-origin");
++    let reconnect: Awaited<ReturnType<typeof openTrackedWs>> | undefined;
++    try {
++      const first = await connectReq(started.ws, {
++        client: CONTROL_UI_CLIENT,
++        token: auth.token,
++        scopes,
++        deviceIdentityPath: loaded.identityPath,
++        prePairDevice: false,
++      });
++      expect(first.ok).toBe(false);
++      const pending = (await listDevicePairing()).pending.find(
++        (entry) => entry.deviceId === loaded.identity.deviceId,
++      );
++      expect(pending).toMatchObject({
++        browserOrigin: origin,
++        clientId: CONTROL_UI_CLIENT.id,
++        role: "operator",
++      });
++      if (!pending) {
++        throw new Error("expected a pending Control UI pairing request");
++      }
++      const approved = await pairingApprovals.approveDevicePairing(pending.requestId, {
++        callerScopes: ["operator.admin"],
++      });
++      expect(approved.status).toBe("approved");
++
++      reconnect = await openTrackedWs(started.port, { origin });
++      const connected = await connectReq(reconnect, {
++        client: CONTROL_UI_CLIENT,
++        token: auth.token,
++        scopes,
++        deviceIdentityPath: loaded.identityPath,
++        prePairDevice: false,
++      });
++      expect(connected.ok, JSON.stringify(connected)).toBe(true);
++      expect(
++        (await listDevicePairing()).pending.map((entry) => entry.deviceId),
++      ).not.toContain(loaded.identity.deviceId);
++    } finally {
++      reconnect?.close();
++      started.ws.close();
++      await started.server.close();
++      started.envSnapshot.restore();
++    }
++  });
++
++  test("rejects a foreign Origin before persisting Control UI pairing", async () => {
++    const allowedOrigin = "https://control-ui.example.test";
++    const foreignOrigin = "https://attacker.example.test";
++    const auth = { mode: "token", token: "foreign-control-ui-origin-token" } as const;
++    testState.gatewayAuth = auth;
++    testState.gatewayControlUi = { allowedOrigins: [allowedOrigin] };
++    await replaceConfigFile({
++      nextConfig: {
++        gateway: { auth, controlUi: { allowedOrigins: [allowedOrigin] } },
++      },
++      afterWrite: { mode: "auto" },
++    });
++    const started = await startServerWithClient(undefined, {
++      auth,
++      controlUiEnabled: true,
++      wsHeaders: { origin: foreignOrigin },
++    });
++    const loaded = loadDeviceIdentity("foreign-control-ui-origin");
++    try {
++      const response = await connectReq(started.ws, {
++        client: CONTROL_UI_CLIENT,
++        token: auth.token,
++        scopes: ["operator.read"],
++        deviceIdentityPath: loaded.identityPath,
++        prePairDevice: false,
++      });
++      expect(response.ok).toBe(false);
++      expect(response.error?.details).toMatchObject({
++        code: ConnectErrorDetailCodes.CONTROL_UI_ORIGIN_NOT_ALLOWED,
++      });
++      expect((await listDevicePairing()).pending).toHaveLength(0);
++    } finally {
++      started.ws.close();
++      await started.server.close();
++      started.envSnapshot.restore();
++    }
++  });
+ });

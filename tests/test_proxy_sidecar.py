@@ -509,6 +509,31 @@ class SidecarLocalHttpWebSocketTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call[0]['method'] for call in self.admin_rpc_calls],
                          ['device.pair.list'])
 
+    async def test_pairing_rpc_missing_browser_origin_cannot_be_approved(self):
+        pending = dict(self.pairing_pending[0])
+        pending.pop('browserOrigin')
+        self.pairing_pending = [pending]
+        headers = {
+            **self.internal_headers, 'Origin': self.origin,
+            'Content-Type': 'application/json',
+        }
+        response = await self.client.post('/_bezr/pairing-rpc', headers=headers,
+                                          json={'action': 'list'})
+        self.assertEqual(response.status, 200)
+        item = (await response.json())['requests'][0]
+        self.assertFalse(item['approvable'])
+        self.assertEqual(item['reason'], 'origin_mismatch')
+
+        approval = await self.client.post('/_bezr/pairing-rpc', headers=headers, json={
+            'action': 'approve', 'requestId': pending['requestId'],
+            'expectedDeviceId': pending['deviceId'], 'expectedRole': 'operator',
+            'expectedScopes': sorted(pending['scopes']),
+            'expectedClientId': 'openclaw-control-ui',
+        })
+        self.assertEqual(approval.status, 409)
+        self.assertFalse(any(call[0]['method'] == 'device.pair.approve'
+                             for call in self.admin_rpc_calls))
+
     async def test_pairing_rpc_marks_untrusted_browser_metadata_as_unapprovable(self):
         base = dict(self.pairing_pending[0])
         cases = (

@@ -8,7 +8,15 @@
   },
   "openclaw_theory_baseline": {
     "commit": "7c12438929e5d198616fe8f602d896e011647d39",
-    "deployed": false
+    "deployed": false,
+    "patches": [
+      {
+        "id": "control-ui-browser-origin-v1",
+        "file": "lab/openclaw/patches/7c12438929e5-control-ui-browser-origin.patch",
+        "sha256": "bccb8a1d381760fcd53d6848ab20a9814cf35dc59074ab15fa9df3873eaf2cd5",
+        "vm_acceptance": "pending"
+      }
+    ]
   },
   "integration_status": "source_and_contract_tests_only; full_image_build_pending"
 }
