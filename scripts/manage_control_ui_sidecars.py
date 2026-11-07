@@ -28,7 +28,7 @@ class UnixAdminConnection(http.client.HTTPConnection):
 
     def connect(self):
         family = getattr(socket, 'AF_UNIX', None)
-        if type(family) is not int:
+        if not isinstance(family, int):
             raise OSError('Unix sockets unavailable')
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(self.timeout)
