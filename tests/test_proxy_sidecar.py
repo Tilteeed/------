@@ -256,6 +256,7 @@ class SidecarPolicyTests(unittest.TestCase):
 class SidecarLocalHttpWebSocketTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         try:
+            import asyncio
             import aiohttp
             from aiohttp import web
             from aiohttp.test_utils import TestClient, TestServer
@@ -326,7 +327,24 @@ class SidecarLocalHttpWebSocketTests(unittest.IsolatedAsyncioTestCase):
                     await ws.send_str(message.data)
             return ws
 
+        async def streamed_javascript(request):
+            compressed = bytes.fromhex(
+                '5be6fb81df388c63c4ab163fa7861d334c680967be76beba104926f950a6c043'
+                '2ed4c3879b0fa063a80901e3422a6dacf321a65c6aeb63ae7deefb0400')
+            response = web.StreamResponse(status=200, headers={
+                'Content-Type': 'application/javascript; charset=utf-8',
+                'Content-Encoding': 'br',
+                'Content-Length': str(len(compressed)),
+            })
+            await response.prepare(request)
+            for offset in range(0, len(compressed), 7):
+                await response.write(compressed[offset:offset + 7])
+                await asyncio.sleep(0.01)
+            await response.write_eof()
+            return response
+
         gateway.router.add_post('/api/v1/admin/rpc', admin_rpc)
+        gateway.router.add_get('/assets/app.js', streamed_javascript)
         gateway.router.add_route('*', '/{path:.*}', echo)
         gateway.router.add_route('*', '/', echo)
         gateway.router.add_get('/ws', websocket)
@@ -341,7 +359,8 @@ class SidecarLocalHttpWebSocketTests(unittest.IsolatedAsyncioTestCase):
             'e' * 32 + '.agents.example.test', '127.0.0.1', '127.0.0.1', 'P' * 43,
         )
         proxy = proxy_sidecar._create_app(config)
-        self.client = TestClient(TestServer(proxy, host='127.0.0.1'))
+        self.proxy_server = TestServer(proxy, host='127.0.0.1')
+        self.client = TestClient(self.proxy_server)
         await self.client.start_server()
         self.addAsyncCleanup(self.client.close)
         self.internal_headers = {
@@ -368,6 +387,34 @@ class SidecarLocalHttpWebSocketTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(data['authorization'])
         self.assertIsNone(data['cookie'])
         self.assertEqual(response.headers['cache-control'], 'no-store')
+
+    async def test_streamed_brotli_javascript_is_returned_with_matching_size_and_hash(self):
+        import hashlib
+
+        source = b"window.__agentAsset='" + b'abcdefghijklmnopqrstuvwxyz' * 5000 + b"';"
+        compressed = bytes.fromhex(
+            '5be6fb81df388c63c4ab163fa7861d334c680967be76beba104926f950a6c043'
+            '2ed4c3879b0fa063a80901e3422a6dacf321a65c6aeb63ae7deefb0400')
+        self.assertEqual(len(source), 130023)
+        self.assertEqual(hashlib.sha256(source).hexdigest(),
+                         '0103c441177b09e572b9d5b602fc2aea29e242f3ace5dbb116c4cff3e989feac')
+        self.assertEqual(len(compressed), 61)
+        expected_digest = 'e7e531b73c265a294d05e9f24e1be90c9be4ed7718132c5a1e074fb2a4c78ccb'
+
+        async with self.aiohttp.ClientSession(
+                auto_decompress=False,
+                timeout=self.aiohttp.ClientTimeout(total=5, connect=2, sock_read=1)) as session:
+            async with session.get(self.proxy_server.make_url('/assets/app.js'), headers={
+                **self.internal_headers, 'Origin': self.origin,
+            }) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers['Content-Encoding'], 'br')
+                self.assertEqual(response.headers['Content-Length'], str(len(compressed)))
+                body = await response.read()
+
+        self.assertEqual(len(body), len(compressed))
+        self.assertEqual(hashlib.sha256(body).hexdigest(), expected_digest)
+        self.assertEqual(body, compressed)
 
     async def test_public_admin_rpc_route_is_never_relayed(self):
         for path in ('/api/v1/admin/rpc', '/api/v1/admin/rpc/extra',

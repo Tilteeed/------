@@ -303,10 +303,12 @@ class AiohttpSidecarTransport:
                                          auto_decompress=False) as session:
             async with session.request(method, url, headers=headers, data=body,
                                        allow_redirects=False) as response:
-                content = await response.content.read(_MAX_PROXY_RESPONSE + 1)
-                if len(content) > _MAX_PROXY_RESPONSE:
-                    raise ValueError('Proxy response limit exceeded')
-                return response.status, dict(response.headers), content
+                response_buffer = bytearray()
+                async for chunk in response.content.iter_chunked(65536):
+                    if len(response_buffer) + len(chunk) > _MAX_PROXY_RESPONSE:
+                        raise ValueError('Proxy response limit exceeded')
+                    response_buffer.extend(chunk)
+                return response.status, dict(response.headers), bytes(response_buffer)
 
     @asynccontextmanager
     async def websocket(self, target, path, headers, protocols):

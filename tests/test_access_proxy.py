@@ -404,5 +404,54 @@ class AccessProxyRequestTests(unittest.TestCase):
                 self.assertEqual(transport.calls, [])
 
 
+class AiohttpSidecarTransportStreamingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_request_reads_complete_streamed_brotli_javascript(self):
+        import asyncio
+        import hashlib
+        from aiohttp import web
+        from aiohttp.test_utils import TestServer
+        from control_plane.access_proxy import AiohttpSidecarTransport
+
+        source = b"window.__agentAsset='" + b'abcdefghijklmnopqrstuvwxyz' * 5000 + b"';"
+        compressed = bytes.fromhex(
+            '5be6fb81df388c63c4ab163fa7861d334c680967be76beba104926f950a6c043'
+            '2ed4c3879b0fa063a80901e3422a6dacf321a65c6aeb63ae7deefb0400')
+        self.assertEqual(len(source), 130023)
+        self.assertEqual(hashlib.sha256(source).hexdigest(),
+                         '0103c441177b09e572b9d5b602fc2aea29e242f3ace5dbb116c4cff3e989feac')
+        self.assertEqual(len(compressed), 61)
+        expected_digest = 'e7e531b73c265a294d05e9f24e1be90c9be4ed7718132c5a1e074fb2a4c78ccb'
+        self.assertEqual(hashlib.sha256(compressed).hexdigest(), expected_digest)
+
+        async def streamed_javascript(request):
+            response = web.StreamResponse(status=200, headers={
+                'Content-Type': 'application/javascript; charset=utf-8',
+                'Content-Encoding': 'br',
+                'Content-Length': str(len(compressed)),
+            })
+            await response.prepare(request)
+            for offset in range(0, len(compressed), 7):
+                await response.write(compressed[offset:offset + 7])
+                await asyncio.sleep(0.01)
+            await response.write_eof()
+            return response
+
+        app = web.Application()
+        app.router.add_get('/assets/app.js', streamed_javascript)
+        server = TestServer(app, host='127.0.0.1')
+        await server.start_server()
+        self.addAsyncCleanup(server.close)
+
+        status, headers, body = await AiohttpSidecarTransport().request(
+            {'ip': '127.0.0.1', 'port': server.port}, 'GET', '/assets/app.js', {}, b'')
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers['Content-Encoding'], 'br')
+        self.assertEqual(headers['Content-Length'], str(len(compressed)))
+        self.assertEqual(len(body), len(compressed))
+        self.assertEqual(hashlib.sha256(body).hexdigest(), expected_digest)
+        self.assertEqual(body, compressed)
+
+
 if __name__ == '__main__':
     unittest.main()

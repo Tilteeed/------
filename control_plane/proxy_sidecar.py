@@ -474,9 +474,12 @@ def _create_app(config):
                                              auto_decompress=False) as session:
                 async with session.request(request.method, url, headers=headers, data=body,
                                            allow_redirects=False) as upstream:
-                    response_body = await upstream.content.read(MAX_RESPONSE_BYTES + 1)
-                    if len(response_body) > MAX_RESPONSE_BYTES:
-                        raise web.HTTPBadGateway(headers={'Cache-Control': 'no-store'})
+                    response_buffer = bytearray()
+                    async for chunk in upstream.content.iter_chunked(65536):
+                        if len(response_buffer) + len(chunk) > MAX_RESPONSE_BYTES:
+                            raise web.HTTPBadGateway(headers={'Cache-Control': 'no-store'})
+                        response_buffer.extend(chunk)
+                    response_body = bytes(response_buffer)
                     response_headers = _safe_response_headers(upstream.headers, config.public_origin)
                     return web.Response(status=upstream.status, body=response_body,
                                         headers=response_headers)
