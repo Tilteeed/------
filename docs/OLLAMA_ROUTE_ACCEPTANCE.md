@@ -3,6 +3,14 @@
 **Status: implemented locally; real Linux/Docker acceptance NOT RUN. No receipt
 has been produced.** Portable tests validate contracts, rejection and argv only.
 
+**Not authorized for an in-use GPU server.** Do not supply
+`--confirm-disposable-host` on a host with existing workloads. The base proxy
+Docker check and the route private-daemon check have different safety boundaries;
+neither is an approved busy-host procedure. See
+[the GPU-host acceptance proposal](GPU_HOST_ACCEPTANCE_PLAN.md) for the separate,
+unapproved staged plan, resource/isolation prerequisites and receipt boundaries.
+A disposable VM receipt must not be transferred or rebound to the GPU host.
+
 ## Authorized operator run
 
 Use an explicitly authorized, disposable Linux VM as the outer boundary. Root,
