@@ -38,6 +38,7 @@ from .ollama_config import (
     replace_ollama_policy_in_config, validate_ollama_config,
 )
 from .ollama_firewall import validate_ollama_route_inputs
+from .model_readiness import CachedModelStatus, model_status
 from .policy import evaluate_admission
 from .runtime_store import RuntimeStore, StoreError, canonical
 from .workspace_files import RetainedWorkspace, WorkspaceFileError
@@ -333,6 +334,7 @@ class RuntimeService:
                     self.ollama_config['default_model_id'])
             self.ollama_config = {**self.ollama_config,
                                   'default_model_id': selected_model}
+        self.model_status_cache = CachedModelStatus(model_status)
         self.lock = threading.RLock()
         self.sidecar_migration: Any = None
 
@@ -524,6 +526,11 @@ class RuntimeService:
                 runtime['network_profile'] = network_profile
             if gateway in ('connected', 'ready', 'starting', 'not_connected', 'unavailable', 'unknown', 'not_ready'):
                 runtime['gateway'] = gateway
+        config = getattr(self, 'ollama_config', None)
+        if config is not None:
+            runtime['model'] = 'configured'
+            if instance and instance['active']:
+                runtime['model'] = self.model_status_cache.get(config['base_url'], config['default_model_id'])
         result: dict[str, Any] = dict(runtime=runtime,
             capabilities=dict(provisioning=False, chat=False, telegram=False, metrics=False),
             retained=self.store.retained(instance['actor']) if instance else [])
@@ -1366,6 +1373,7 @@ class RuntimeApplication(RuntimeService):
                          ollama_config=config.get('ollama'))
 
     def close(self):
+        self.model_status_cache.close()
         if hasattr(self.metrics, 'close'):
             self.metrics.close()
         self.store.close()
@@ -1759,7 +1767,7 @@ def serve(config):
     _trusted_directory(state, 0o700, create=True)
     _trusted_directory(socket_path.parent, 0o750, create=True)
     lock_fd = _root_file(state / 'service.lock', 0o600, create=True)
-    store = server = admin_server = None
+    store = server = admin_server = controller = None
     admin_thread = None
     bound_identity = admin_bound_identity = None
     try:
@@ -1864,6 +1872,8 @@ def serve(config):
             info = admin_socket_path.lstat()
             if (info.st_dev, info.st_ino) == admin_bound_identity:
                 admin_socket_path.unlink()
+        if controller is not None:
+            controller.model_status_cache.close()
         if metrics:
             metrics.close()
         if store:

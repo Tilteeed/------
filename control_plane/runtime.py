@@ -132,6 +132,9 @@ class SupervisorClient:
                 'pending_restore_key', 'pending_restore_revision',
                 'pending_purge_key', 'pending_purge_revision',
             ) and type(v) in (str, int, bool, type(None))}
+            if 'model' in safe_runtime and safe_runtime['model'] not in (
+                    'not_connected', 'configured', 'unavailable', 'model_missing', 'model_present'):
+                safe_runtime['model'] = 'unavailable'
             safe_caps = {k: capabilities.get(k) is True for k in ('provisioning', 'chat', 'telegram', 'metrics')}
             retained = data.get('retained', [])
             if type(retained) is not list or len(retained) > 100:

@@ -2542,6 +2542,12 @@ class DockerEngineNetworkTests(unittest.TestCase):
         }
         self.assertEqual(engine._verify(instance_id, observed, expected_spec=spec,
                                         expected_token=token), container_id)
+        self.assertEqual(engine._verify(instance_id, observed), container_id)
+        # Existing legacy configuration is valid by itself, but create() requests
+        # the current read-only config policy and must not adopt the older one.
+        engine._find = lambda instance_id: observed
+        with self.assertRaises(DockerEngineError):
+            engine.create(instance_id, '/srv/agent-data/' + instance_id, limits, token)
 
     def test_create_uses_owned_internal_network_without_published_ports(self):
         engine = DockerEngine('sha256:' + 'a' * 64)

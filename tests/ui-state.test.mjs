@@ -81,3 +81,12 @@ test('runtime never claims an agent is running without a connection', () => {
     description: 'Сохранённые данные не удалены. Продолжите восстановление или удалите экземпляр с сохранением данных.',
   });
 });
+
+
+test('model status labels do not claim inference readiness', () => {
+  assert.match(ui.modelStatusLabel('model_present'), /не подтверждён/);
+  assert.match(ui.modelStatusLabel('model_missing'), /не найдена/);
+  assert.match(ui.modelStatusLabel('unavailable'), /недоступ/);
+  assert.match(ui.modelStatusLabel('configured'), /настроена/);
+  assert.doesNotMatch(ui.modelStatusLabel('<secret>'), /secret/);
+});

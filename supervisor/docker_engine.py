@@ -2935,13 +2935,13 @@ class DockerEngine:
                 raise ValueError
             if set(spec) != spec_keys:
                 raise ValueError
-            expected_spec = self._spec(
+            canonical_spec = self._spec(
                 spec['host_path'], AgentLimits(**spec['limits']), version=spec['version'],
                 instance_id=instance_id if spec['version'] == 3 else None,
                 proxy_network=spec.get('proxy_network'), owner_id=spec.get('owner_id'),
                 control_ui_origin=spec.get('control_ui_origin'),
                 config_policy_version=config_policy_version)
-            if spec != expected_spec:
+            if spec != canonical_spec:
                 raise ValueError
             if spec['image'] != self.image or (expected_spec is not None and spec != expected_spec):
                 raise ValueError

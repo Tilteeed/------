@@ -78,3 +78,58 @@ export function runtimeView(runtime, connected = false) {
   const value = states[runtime?.state] || ['Состояние уточняется', 'Получен ответ supervisor. Обновите состояние через несколько секунд.'];
   return { label: value[0], description: value[1] };
 }
+
+export function modelStatusLabel(status) {
+  return ({configured: 'Модель настроена; проверка не выполнена', unavailable: 'Сервис модели недоступен', model_missing: 'Модель не найдена', model_present: 'Модель найдена; ответ не подтверждён'})[status] || 'Не подключена / не подтверждена';
+}
+export function createReadinessPoll({ refresh, invalidate, interval = 5000, maxAge = 15000,
+  requestTimeout = 10000, setTimer = setTimeout, clearTimer = clearTimeout, now = () => Date.now() }) {
+  let active = false, generation = 0, freshness = 0, next = null, expiry = null, pending = null, deadline = 0;
+  const expire = () => { expiry = null; freshness += 1; invalidate(); };
+  function armExpiry() {
+    if (expiry !== null) clearTimer(expiry);
+    deadline = now() + maxAge;
+    expiry = setTimer(expire, maxAge);
+  }
+  async function run(epoch) {
+    const version = freshness, controller = new AbortController();
+    const current = () => active && epoch === generation && version === freshness
+      && !controller.signal.aborted && now() < deadline;
+    let timeout;
+    const timedOut = new Promise((_, reject) => {
+      timeout = setTimer(() => { controller.abort(); reject(new Error('readiness timeout')); }, requestTimeout);
+    });
+    pending = { controller, timeout };
+    try {
+      await Promise.race([refresh(current, controller.signal), timedOut]);
+      if (!current()) return;
+      armExpiry();
+    } catch {
+      if (!active || epoch !== generation) return;
+      if (expiry !== null) clearTimer(expiry);
+      expiry = null;
+      freshness += 1;
+      invalidate();
+    } finally {
+      clearTimer(timeout);
+      if (pending?.controller === controller) pending = null;
+      if (active && epoch === generation) next = setTimer(() => { next = null; void run(epoch); }, interval);
+    }
+  }
+  return {
+    start() {
+      if (!active) {
+        active = true; generation += 1;
+        armExpiry();
+        void run(generation);
+      }
+    },
+    stop() {
+      active = false; generation += 1;
+      if (next !== null) clearTimer(next);
+      if (expiry !== null) clearTimer(expiry);
+      if (pending !== null) { clearTimer(pending.timeout); pending.controller.abort(); pending = null; }
+      next = expiry = null;
+    },
+  };
+}

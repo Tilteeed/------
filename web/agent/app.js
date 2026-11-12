@@ -1,4 +1,4 @@
-import { controlUiLaunch, controlUiStatus, draftView, errorView, runtimeView, settingsPayload } from './ui-state.mjs';
+import { controlUiLaunch, controlUiStatus, createReadinessPoll, draftView, errorView, modelStatusLabel, runtimeView, settingsPayload } from './ui-state.mjs';
 
 const $ = (id) => document.getElementById(id);
 const apiRoot = '/api/v1/agent-platform/me';
@@ -18,6 +18,26 @@ let controlUi = { available: false, origin: null, loading: false, busy: false };
 let pairing = { loading: false, approving: false, requests: [] };
 const operationMemory = new Map();
 let sessionStorageAvailable = true;
+
+function invalidateModel() {
+  runtimeData = { ...runtimeData, model: 'unavailable' };
+  $('model-state').textContent = 'Состояние модели не подтверждено';
+}
+const readinessPoll = createReadinessPoll({
+  invalidate: invalidateModel,
+  refresh: async (isCurrent, signal) => {
+    const epoch = identityEpoch;
+    try {
+      const data = await request('', 'GET', undefined, signal);
+      if (!authenticated || epoch !== identityEpoch || !isCurrent()) throw new Error('session changed');
+      runtimeData = { ...runtimeData, model: data.runtime?.model };
+      $('model-state').textContent = modelStatusLabel(runtimeData.model);
+    } catch (error) {
+      if (epoch === identityEpoch && isCurrent() && (error.status === 401 || error.status === 403)) showError(error);
+      throw error;
+    }
+  },
+});
 
 function operationGet(key) {
   if (operationMemory.has(key)) return operationMemory.get(key);
@@ -335,6 +355,7 @@ function renderRuntime(data) {
   $('runtime-title').textContent = view.label;
   $('runtime-description').textContent = view.description;
   $('gateway-state').textContent = runtimeData.gateway === 'ready' ? 'Готов' : 'Не готов / не подтверждён';
+  $('model-state').textContent = 'Состояние модели не подтверждено';
   $('metrics-state').textContent = capabilities.metrics ? 'Окно CPU готово' : 'Нет свежих данных / прогрев';
   renderRetained(data.retained);
   controls();
@@ -407,6 +428,7 @@ function controls() {
 }
 
 function revoke() {
+  readinessPoll.stop();
   authenticated = false;
   identityEpoch += 1;
   currentUser = '';
@@ -438,12 +460,15 @@ function showError(error) {
   controls();
 }
 
-async function request(path = '', method = 'GET', payload) {
+async function request(path = '', method = 'GET', payload, signal) {
   let token;
   try { token = localStorage.getItem('token'); } catch { /* Treat unavailable storage as signed out. */ }
   if (!token) throw { status: 401 };
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 130000);
+  const abort = () => controller.abort();
+  if (signal?.aborted) abort();
+  else signal?.addEventListener('abort', abort, { once: true });
+  const timeout = setTimeout(abort, 130000);
   try {
     const response = await fetch(`${apiRoot}${path}`, {
       method,
@@ -462,6 +487,7 @@ async function request(path = '', method = 'GET', payload) {
     return body;
   } finally {
     clearTimeout(timeout);
+    signal?.removeEventListener('abort', abort);
   }
 }
 
@@ -715,6 +741,8 @@ async function loadEvents() {
 async function load() {
   if (busy) return;
   if (dirty && !window.confirm('Перечитать настройки с сервера? Несохранённые изменения будут потеряны.')) return;
+  readinessPoll.stop();
+  invalidateModel();
   const epoch = identityEpoch;
   busy = true;
   controls();
@@ -849,7 +877,7 @@ $('refresh-runtime').addEventListener('click', async () => {
       renderRuntime(data);
       await refreshControlUiStatus(epoch);
     }
-  } catch (error) { if (epoch === identityEpoch) showError(error); }
+  } catch (error) { if (epoch === identityEpoch) { invalidateModel(); showError(error); } }
   finally { busy = false; controls(); }
 });
 $('reload').addEventListener('click', load);
@@ -857,6 +885,8 @@ $('refresh-events').addEventListener('click', loadEvents);
 window.addEventListener('beforeunload', (event) => {
   if (dirty) { event.preventDefault(); event.returnValue = ''; }
 });
+window.addEventListener('pagehide', () => readinessPoll.stop());
+window.addEventListener('pageshow', invalidateModel);
 window.addEventListener('storage', (event) => {
   if (event.key === 'token' || event.key === null) {
     revoke();
