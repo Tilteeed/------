@@ -900,9 +900,11 @@ class DockerEngine:
             route_network = ipaddress.IPv4Network(route.network, strict=True)
             if not route_network.overlaps(subnet):
                 continue
+            # Require the host route's preferred source to corroborate Docker IPAM;
+            # interface name plus an overlapping prefix is not sufficient ownership proof.
             if (not gateway_address_present or route.interface != bridge
                     or route.protocol != 'kernel'
-                    or route.prefsrc not in (None, gateway)):
+                    or route.prefsrc != gateway):
                 raise DockerEngineError('Ollama route subnet overlaps a foreign host route')
             if (route_network == subnet and route.scope == 'link'
                     and route.route_type in (None, 'unicast')):
@@ -1439,9 +1441,11 @@ class DockerEngine:
             route_network = ipaddress.IPv4Network(route.network)
             if not route_network.overlaps(subnet):
                 continue
+            # Require the host route's preferred source to corroborate Docker IPAM;
+            # interface name plus an overlapping prefix is not sufficient ownership proof.
             if (not gateway_address_present or route.interface != bridge
                     or route.protocol != 'kernel'
-                    or route.prefsrc not in (None, gateway)):
+                    or route.prefsrc != gateway):
                 return True
             if (route_network == subnet and route.scope == 'link'
                     and route.route_type in (None, 'unicast')):

@@ -222,6 +222,35 @@ class DockerEngineNetworkTests(unittest.TestCase):
         with self.assertRaises(DockerEngineError):
             engine.ollama_route_policies()
 
+    def test_ollama_route_inventory_rejects_ambiguous_connected_route_without_prefsrc(self):
+        config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b', 'context_tokens': 8192,
+            'max_tokens': 512, 'think': False,
+        }
+        engine = DockerEngine(
+            'sha256:' + 'a' * 64, agent_network_pool='10.240.0.0/13',
+            frontend_network_pool='10.248.0.0/13',
+            ollama_network_pool='172.20.0.0/16',
+            ollama_egress_interface='ens18', ollama_config=config)
+        instance_id = '0' * 32
+        plan = engine._ollama_network_plan(instance_id, engine.ollama_network_pool)
+        payload = engine._ollama_network_payload(instance_id, plan)
+        network = {**payload, 'Id': 'd' * 64, 'Ingress': False, 'Containers': {}}
+        ambiguous = IPv4Route(
+            plan['subnet'], plan['bridge'], 'unicast', 'kernel', 'link', None)
+        engine.host_route_provider = lambda: synthetic_ollama_host_inventory(
+            plan, extra_routes=(ambiguous,))
+        engine._request = lambda method, path, payload=None, *, ok=(200,): (
+            [{'Id': network['Id'], 'Name': network['Name'], 'IPAM': network['IPAM'],
+              'Labels': network['Labels']}]
+            if method == 'GET' and path == '/networks' else
+            network if method == 'GET' and path == '/networks/' + network['Id'] else
+            (_ for _ in ()).throw(AssertionError((method, path))))
+
+        with self.assertRaises(DockerEngineError):
+            engine.ollama_route_policies()
+
     def test_ollama_route_is_firewall_ready_before_gateway_network_connect(self):
         config = {
             'base_url': 'http://10.99.0.10:11434',
@@ -2399,6 +2428,16 @@ class DockerEngineNetworkTests(unittest.TestCase):
             frontend_network_pool=engine.frontend_network_pool)
         self.assertEqual(restored, plan)
         self.assertEqual(created, [])
+        ambiguous_rows = [*route_rows, {
+            'dst': plan['agent']['subnet'], 'dev': plan['agent']['bridge'],
+            'protocol': 'kernel', 'scope': 'link',
+        }]
+        inventory = parse_ipv4_networks(ambiguous_rows, address_rows)
+        with self.assertRaises(DockerEngineError):
+            engine.ensure_proxy_networks(instance_id,
+                agent_network_pool=engine.agent_network_pool,
+                frontend_network_pool=engine.frontend_network_pool)
+        inventory = parse_ipv4_networks(route_rows, address_rows)
         from supervisor.service import RuntimeService
         def prepare_restore(instance_id_value, owner_id, domain, host_path):
             plan_value = engine.ensure_proxy_networks(
