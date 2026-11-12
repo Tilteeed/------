@@ -126,6 +126,12 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             host_paths = []
             network_profiles = []
             state = 'absent'
+            sidecar_present = False
+            def assert_purge_runtime_absent(self, instance_id):
+                if not service.lock._is_owned():
+                    raise AssertionError('lifecycle lock not held')
+                if self.state != 'absent' or self.sidecar_present:
+                    raise RuntimeError('synthetic runtime still present')
             def inspect(self, instance_id):
                 return dict(state=self.state, gateway='unknown',
                             container_id='c' if self.state != 'absent' else None,
@@ -243,6 +249,26 @@ class ServiceWorkflowSmoke(unittest.TestCase):
                 service.action(foreign_purge)
             self.assertEqual(foreign_error.exception.code, 'instance_not_found')
             self.assertEqual(volumes.purge_calls, 0, 'A foreign owner must not reach storage deletion')
+            engine.assert_purge_runtime_absent = None
+            with self.assertRaises(ServiceError) as missing_error:
+                service.action(purge)
+            self.assertEqual(missing_error.exception.code, 'runtime_unavailable')
+            self.assertEqual(volumes.purge_calls, 0)
+            self.assertEqual(store.totals(), (0, 0, profile.agent_limits.disk_bytes))
+            self.assertEqual(store.instance(instance_id)['state'], 'purging')
+            missing_operation = store.operation('alice', 'purge-1')
+            assert missing_operation is not None
+            self.assertNotEqual(missing_operation['status'], 'completed')
+            del engine.assert_purge_runtime_absent
+            engine.sidecar_present = True
+            with self.assertRaises(ServiceError) as orphan_error:
+                service.action(purge)
+            self.assertEqual(orphan_error.exception.code, 'runtime_unavailable')
+            self.assertEqual(volumes.purge_calls, 0, 'An orphan sidecar must block storage deletion')
+            self.assertEqual(store.totals(), (0, 0, profile.agent_limits.disk_bytes))
+            self.assertEqual(store.instance(instance_id)['state'], 'purging')
+            self.assertNotEqual(store.operation('alice', 'purge-1')['status'], 'completed')
+            engine.sidecar_present = False
             with self.assertRaises(ServiceError):
                 service.action(purge)
             self.assertEqual(store.totals(), (0, 0, profile.agent_limits.disk_bytes),

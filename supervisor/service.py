@@ -790,6 +790,7 @@ class RuntimeService:
                     info = self._inspect(instance_id)
                     if not self._absent(info):
                         raise ServiceError('runtime_unavailable', 503)
+                    self.engine.assert_purge_runtime_absent(instance_id)
                     evidence = json.loads(instance['storage']) if instance['storage'] else None
                     expected_project_id = evidence.get('project_id') if evidence else None
                     self.volumes.purge(instance_id, instance['disk'], expected_project_id)
