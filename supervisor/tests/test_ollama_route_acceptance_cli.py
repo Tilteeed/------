@@ -96,9 +96,11 @@ class RouteAcceptanceTests(unittest.TestCase):
     def test_adapter_batch_uses_production_argv_and_bounded_runner(self):
         from scripts import ollama_route_linux as linux
         from types import SimpleNamespace
-        with patch.object(linux.os, 'fstat', return_value=SimpleNamespace(st_ino=10)), \
-             patch.object(linux.os, 'readlink', return_value='net:[10]'), \
-             patch.object(linux, 'inode', return_value=11), \
+        current = {'net': 11, 'mnt': 21, 'pid': 31}
+        parent = {'net': 10, 'mnt': 20, 'pid': 30}
+        with patch.object(linux, 'validate_lab_boundary', return_value=(current, parent)), \
+             patch.object(linux, 'current_namespaces', return_value=current), \
+             patch.object(linux.os, 'getpid', return_value=1), \
              patch.object(linux.Lab, 'run', return_value='') as runner:
             lab = linux.Lab(SimpleNamespace(parent_netns_fd=8), self.config(), False)
             lab.adapter.batch_runner(['nft', '-f', '-'], 'EXACT_BATCH\n')
@@ -243,6 +245,60 @@ class RouteAcceptanceTests(unittest.TestCase):
         lab.dc = Mock(return_value='leftover-owned-container\n')
         with self.assertRaises(RuntimeError):
             lab.cleanup()
+
+    def test_public_cli_cannot_select_internal_entry_with_namespace_descriptors(self):
+        from scripts import ollama_route_linux as linux
+        from unittest.mock import Mock
+        from contextlib import ExitStack, redirect_stderr
+        import io
+        argv = ['--agent-pool','10.240.0.0/13','--frontend-pool','10.248.0.0/13',
+                '--ollama-pool','172.20.0.0/16','--endpoint','192.168.40.10',
+                '--interface','ens18','--execute','--confirm-disposable-host',
+                '--parent-netns-fd','8','--parent-mntns-fd','9','--parent-pidns-fd','10']
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(linux.sys,'platform','linux'))
+            stack.enter_context(patch.object(linux.os,'geteuid',return_value=0,create=True))
+            stack.enter_context(patch.object(linux,'config_from',return_value=self.config()))
+            stack.enter_context(patch.object(linux,'prerequisites'))
+            stack.enter_context(patch.object(linux.signal,'signal'))
+            enter = stack.enter_context(patch.object(linux,'Lab',return_value=Mock()))
+            execute = stack.enter_context(patch.object(linux,'command'))
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                linux.main(argv)
+            self.assertEqual(caught.exception.code,2)
+            enter.assert_not_called()
+            execute.assert_not_called()
+
+    def test_internal_entry_requires_private_network_mount_pid_boundary(self):
+        from scripts import ollama_route_linux as linux
+        from types import SimpleNamespace
+        from unittest.mock import mock_open
+        from contextlib import ExitStack
+        args = SimpleNamespace(parent_netns_fd=8, parent_mntns_fd=9, parent_pidns_fd=10)
+        parent = {8: ('net',10), 9: ('mnt',20), 10: ('pid',30)}
+        mountinfo = '1 0 0:1 / / rw - ext4 test rw\n2 1 0:2 / /proc rw - proc proc rw\n'
+        for failure in (None, 'missing_fd', 'same_mount', 'same_pid', 'not_init', 'shared_mount', 'wrong_proc'):
+            current = {'net':11, 'mnt':21, 'pid':31}
+            selected = SimpleNamespace(**vars(args))
+            if failure=='missing_fd': selected.parent_mntns_fd=None
+            if failure=='same_mount': current['mnt']=20
+            if failure=='same_pid': current['pid']=30
+            with self.subTest(failure=failure), ExitStack() as stack:
+                stack.enter_context(patch.object(linux.os, 'fstat', side_effect=lambda fd: SimpleNamespace(st_ino=parent[fd][1])))
+                stack.enter_context(patch.object(linux.os, 'readlink', side_effect=lambda path:
+                    '%s:[%d]' % parent[int(path.rsplit('/',1)[1])] ))
+                stack.enter_context(patch.object(linux, 'inode', return_value=11))
+                stack.enter_context(patch.object(linux.os, 'stat', return_value=SimpleNamespace(st_ino=99 if failure=='wrong_proc' else 31)))
+                stack.enter_context(patch.object(linux.os, 'getpid', return_value=22 if failure=='not_init' else 1))
+                stack.enter_context(patch.object(linux, 'current_namespaces', return_value=current, create=True))
+                stack.enter_context(patch('builtins.open', mock_open(read_data=
+                    mountinfo.replace(' rw -',' rw shared:7 -',1) if failure=='shared_mount' else mountinfo)))
+                execute = stack.enter_context(patch.object(linux, 'command'))
+                if failure is None:
+                    linux.Lab(selected, self.config(), False)
+                else:
+                    with self.assertRaises(RuntimeError): linux.Lab(selected, self.config(), False)
+                execute.assert_not_called()
 
     def test_namespace_guard_blocks_mutation_in_callers_namespace(self):
         from scripts import ollama_route_linux as linux

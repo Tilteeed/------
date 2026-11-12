@@ -5,7 +5,9 @@ import ipaddress
 import os
 import signal
 import subprocess
+import sys
 import threading
+import time
 from typing import Any
 from supervisor.docker_engine import DockerEngine
 from supervisor.firewall import EndpointPair, NetworkPolicy, expected_ruleset as proxy_ruleset
@@ -169,48 +171,138 @@ def stop(process):
             process.wait(timeout=5)
 
 
-def command(argv, *, timeout: float = 30, input_text=None, pass_fds=(), env=None):
-    """No shell; bounded output; Linux timeout kills the complete process group."""
+def _parent_death_setup():
+    """Arm Linux direct-child SIGKILL before exec, including the fork race.
+
+    Load/resolve ctypes in the parent, not after fork. This hook is for the
+    standalone, single-threaded wrappers; arbitrary threaded embedders must
+    not use Python preexec_fn. Windows and other platforms have no such hook.
+    """
+    if sys.platform != 'linux':
+        return None
+    import ctypes
+    parent_pid = os.getpid()
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+                     ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    sigkill = signal.SIGKILL
+
+    def arm():
+        if prctl(1, sigkill, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+            os._exit(127)  # Fail closed: never exec an unprotected child.
+        if os.getppid() != parent_pid:
+            os.kill(os.getpid(), sigkill)
+
+    return arm
+
+
+def _kill_command(process, *, start_new_session=True):
+    # Only an owned session permits group signalling. An inherited session may
+    # contain our caller, so its direct child alone is safe to kill here.
+    if os.name == 'posix' and start_new_session:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    elif process.poll() is None:
+        process.kill()
+
+
+def command(argv, *, timeout: float = 30, input_text=None, pass_fds=(), env=None,
+            start_new_session=True):
+    """Bound concurrent pipe I/O and process wait by one monotonic deadline.
+
+    Nonblocking pipe operations also let both workers stop when a descendant
+    retains an inherited pipe; closing a buffered pipe from another thread can
+    itself block forever. Retained output is capped before every append.
+    """
+    deadline = time.monotonic() + timeout
     process = subprocess.Popen(argv, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=False,
-                               start_new_session=True, pass_fds=pass_fds, env=env)
-    assert process.stdout is not None
+                               start_new_session=start_new_session, pass_fds=pass_fds, env=env,
+                               bufsize=0, preexec_fn=_parent_death_setup())
     output = bytearray()
+    cancel = threading.Event()
     overflow = threading.Event()
+    errors = []
+    workers = []
+
     def read():
-        while True:
-            chunk = process.stdout.read(4096)
-            if not chunk:
-                break
-            if len(output) + len(chunk) > LIMIT:
-                overflow.set()
-                process.kill()
-                break
-            output.extend(chunk)
-    reader = threading.Thread(target=read, daemon=True)
-    reader.start()
-    try:
-        if input_text is not None:
-            assert process.stdin is not None
-            process.stdin.write(input_text.encode())
+        assert process.stdout is not None
+        try:
+            while not cancel.is_set():
+                try:
+                    chunk = os.read(process.stdout.fileno(), 4096)
+                except BlockingIOError:
+                    cancel.wait(.01)
+                    continue
+                if not chunk:
+                    return
+                if len(output) + len(chunk) > LIMIT:
+                    overflow.set()
+                    return
+                output.extend(chunk)
+        except OSError as error:
+            errors.append(error)
+
+    def write():
+        assert process.stdin is not None and input_text is not None
+        try:
+            # Encode in bounded pieces instead of duplicating a multi-MB input.
+            for offset in range(0, len(input_text), 4096):
+                data = memoryview(input_text[offset:offset + 4096].encode('utf-8'))
+                while data and not cancel.is_set():
+                    try:
+                        written = os.write(process.stdin.fileno(), data)
+                        data = data[written:]
+                    except BlockingIOError:
+                        cancel.wait(.01)
+                if cancel.is_set():
+                    return
+        except BrokenPipeError:
+            pass  # A child is allowed to finish without consuming all input.
+        except (OSError, UnicodeError) as error:
+            errors.append(error)
+        finally:
             process.stdin.close()
-        process.wait(timeout=timeout)
-        reader.join(timeout=3)
-        if reader.is_alive() or overflow.is_set() or process.returncode:
-            raise RuntimeError('Command failed or output exceeded bound: ' + argv[0])
-        return output.decode('utf-8')
+
+    try:
+        assert process.stdout is not None
+        os.set_blocking(process.stdout.fileno(), False)
+        workers.append(threading.Thread(target=read, name='acceptance-stdout'))
+        if process.stdin is not None:
+            os.set_blocking(process.stdin.fileno(), False)
+            workers.append(threading.Thread(target=write, name='acceptance-stdin'))
+        for worker in workers:
+            worker.start()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            if overflow.is_set() or errors:
+                raise RuntimeError('Command failed or output exceeded bound: ' + argv[0])
+            if process.poll() is not None and not any(worker.is_alive() for worker in workers):
+                # Recheck after workers finish: a worker may have published a
+                # failure between the earlier check and the liveness check.
+                if process.returncode or overflow.is_set() or errors:
+                    raise RuntimeError('Command failed or output exceeded bound: ' + argv[0])
+                return output.decode('utf-8')
+            cancel.wait(min(.01, remaining))
     finally:
-        if os.name == 'posix':
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        elif process.poll() is None:
-            process.kill()
-        process.wait(timeout=5)
-        reader.join(timeout=3)
-        if process.stdout:
-            process.stdout.close()
+        cancel.set()
+        try:
+            _kill_command(process, start_new_session=start_new_session)
+            process.wait(timeout=5)
+        finally:
+            for worker in workers:
+                if worker.ident is not None:
+                    worker.join(timeout=1)
+            if any(worker.is_alive() for worker in workers):
+                raise RuntimeError('Command pipe workers failed to stop')
+            for stream in (process.stdin, process.stdout):
+                if stream is not None:
+                    stream.close()
 
 
 def strict_json(text):

@@ -103,6 +103,46 @@ def inode(pid: str | int = 'self'):
     return os.stat('/proc/' + str(pid) + '/ns/net').st_ino
 
 
+def current_namespaces():
+    return {name: os.stat('/proc/self/ns/' + name).st_ino for name in ('net', 'mnt', 'pid')}
+
+
+def validate_lab_boundary(args):
+    """Internal flags alone grant nothing: require the whole disposable boundary."""
+    current, parent = current_namespaces(), {}
+    for name in ('net', 'mnt', 'pid'):
+        descriptor = getattr(args, 'parent_' + name + 'ns_fd', None)
+        if type(descriptor) is not int or descriptor < 0:
+            raise RuntimeError('All inherited caller namespace descriptors are required')
+        observed = os.fstat(descriptor).st_ino
+        if (os.readlink('/proc/self/fd/' + str(descriptor)) != f'{name}:[{observed}]'
+                or observed == current[name]):
+            raise RuntimeError('Network, mount and PID namespaces must all be isolated')
+        parent[name] = observed
+    if os.getpid() != 1 or os.stat('/proc/1/ns/pid').st_ino != current['pid']:
+        raise RuntimeError('Private PID namespace init and matching private procfs required')
+    with open('/proc/self/mountinfo', 'r', encoding='ascii') as source:
+        mounts = source.read(524289)
+    if not mounts or len(mounts) > 524288:
+        raise RuntimeError('Private mount propagation proof unavailable')
+    private_proc = False
+    for line in mounts.splitlines():
+        fields = line.split()
+        if '-' not in fields or fields.index('-') < 6:
+            raise RuntimeError('Malformed mount propagation proof')
+        separator = fields.index('-')
+        if len(fields) < separator + 4:
+            raise RuntimeError('Malformed mount propagation proof')
+        if any(value.startswith(('shared:', 'master:', 'propagate_from:'))
+               for value in fields[6:separator]):
+            raise RuntimeError('Caller-visible mount propagation is prohibited')
+        if fields[4] == '/proc' and fields[separator + 1] == 'proc':
+            private_proc = True
+    if not private_proc:
+        raise RuntimeError('Matching private procfs mount required')
+    return current, parent
+
+
 def daemon_argv(base, run_id):
     return ['dockerd', '--config-file', str(base / 'daemon.json'),
             '--host', 'unix://' + str(base / 'docker.sock'), '--data-root', str(base / 'data'),
@@ -132,10 +172,9 @@ def verify_network_readback(observed, identity, payload):
 class Lab:
     def __init__(self, args, config, docker):
         self.args, self.config, self.docker = args, config, docker
-        self.caller = os.fstat(args.parent_netns_fd).st_ino
-        if not os.readlink('/proc/self/fd/' + str(args.parent_netns_fd)).startswith('net:['):
-            raise RuntimeError('Inherited descriptor is not a network namespace')
-        self.router = inode()
+        self.namespace_binding, caller_namespaces = validate_lab_boundary(args)
+        self.caller = caller_namespaces['net']
+        self.router = self.namespace_binding['net']
         self.guard()
         self.policies, self.probes, self.addresses = make_plan(config)
         self.holders, self.processes, self.links, self.containers, self.networks = {}, [], [], [], []
@@ -151,8 +190,9 @@ class Lab:
         self.specs = network_specs(config)
 
     def guard(self):
-        if self.caller == self.router or inode() != self.router:
-            raise RuntimeError('Refusing mutation outside disposable router network namespace')
+        if (self.caller == self.router or current_namespaces() != self.namespace_binding
+                or os.getpid() != 1):
+            raise RuntimeError('Refusing mutation outside complete disposable namespace boundary')
 
     def run(self, argv, **kwargs):
         self.guard()
@@ -437,13 +477,24 @@ class Lab:
             raise RuntimeError('Disposable lab cleanup failed; no report/receipt')
 
 
-def main(argv=None, *, docker=False):
+def main(argv=None, *, docker=False, _inside=False):
     parser = argparse.ArgumentParser(description=__doc__)
     arguments(parser, docker=docker)
-    parser.add_argument('--parent-netns-fd', type=int, default=None, help=argparse.SUPPRESS)
-    parser.add_argument('--lab-dir', default=None, help=argparse.SUPPRESS)
+    if _inside:
+        parser.add_argument('--parent-netns-fd', type=int, required=True)
+        parser.add_argument('--parent-mntns-fd', type=int, required=True)
+        parser.add_argument('--parent-pidns-fd', type=int, required=True)
+        parser.add_argument('--lab-dir', required=True)
+    else:
+        # Public CLIs cannot choose the internal execution branch at all.
+        parser.set_defaults(parent_netns_fd=None, parent_mntns_fd=None,
+                            parent_pidns_fd=None, lab_dir=None)
     args = parser.parse_args(argv)
     require_opt_in(parser, args)
+    def interrupt(signum, frame):
+        raise RuntimeError('Acceptance interrupted')
+    signal.signal(signal.SIGTERM, interrupt)
+    signal.signal(signal.SIGINT, interrupt)
     try:
         if args.run_id is None:
             import secrets
@@ -455,35 +506,43 @@ def main(argv=None, *, docker=False):
         if args.interface in ('lo', 'bzrtarget', *(p.bridge for p in policies)):
             raise ValueError('Egress interface collides with disposable topology')
         prerequisites(args, docker=docker)
-        if args.parent_netns_fd is None:
-            fd = os.open('/proc/self/ns/net', os.O_RDONLY)
+        internal_fds = (args.parent_netns_fd, args.parent_mntns_fd, args.parent_pidns_fd)
+        if any(fd is not None for fd in internal_fds) and not all(fd is not None for fd in internal_fds):
+            raise RuntimeError('Partial internal namespace descriptor bundle prohibited')
+        if _inside and not all(fd is not None for fd in internal_fds):
+            raise RuntimeError('Internal namespace descriptor bundle required')
+        if not _inside:
+            descriptors = {}
             try:
-                script = ROOT / 'scripts' / (CHECKS[int(docker)] + '.py')
-                child = [sys.executable, str(script), '--agent-pool', args.agent_pool,
+                for name in ('net', 'mnt', 'pid'):
+                    descriptors[name] = os.open('/proc/self/ns/' + name, os.O_RDONLY)
+                bootstrap = (
+                    'import sys;sys.path.insert(0,sys.argv[1]);del sys.argv[1];'
+                    'from scripts.ollama_route_linux import main;'
+                    f'raise SystemExit(main(docker={docker!r},_inside=True))')
+                child = [sys.executable, '-c', bootstrap, str(ROOT), '--agent-pool', args.agent_pool,
                          '--frontend-pool', args.frontend_pool, '--ollama-pool', args.ollama_pool,
                          '--endpoint', args.endpoint, '--interface', args.interface,
-                         '--run-id', args.run_id, '--execute', '--confirm-disposable-host',
-                         '--parent-netns-fd', str(fd)]
+                         '--run-id', args.run_id, '--execute', '--confirm-disposable-host']
+                for name, descriptor in descriptors.items():
+                    child += ['--parent-' + name + 'ns-fd', str(descriptor)]
                 if docker:
                     child += ['--image-archive', args.image_archive, '--probe-image', args.probe_image]
                 # Outer-owned directory is removed even on child timeout or
-                # signal; no orphan daemon data-root is left by a killed child.
+                # handled signal. SIGKILL can leave an owned data-root; never a receipt.
                 with tempfile.TemporaryDirectory(prefix='bezr-ollama-') as workspace:
                     child += ['--lab-dir', workspace]
                     output = command(['unshare', '--mount', '--net', '--pid', '--fork',
                         '--kill-child=SIGKILL', '--mount-proc', '--propagation', 'private', '--', *child],
-                        timeout=600, pass_fds=(fd,))
+                        timeout=600, pass_fds=tuple(descriptors.values()), start_new_session=False)
             finally:
-                os.close(fd)
+                for descriptor in descriptors.values():
+                    os.close(descriptor)
             report = validate_report(strict_json(output), config, CHECKS[int(docker)], args.run_id)
             # Child PID namespace has exited: even emergency teardown is complete.
             print(json.dumps(report, sort_keys=True))
             return 0
         lab = Lab(args, config, docker)
-        def interrupt(signum, frame):
-            raise RuntimeError('Acceptance interrupted')
-        signal.signal(signal.SIGTERM, interrupt)
-        signal.signal(signal.SIGINT, interrupt)
         report = None
         try:
             lab.setup()

@@ -40,11 +40,15 @@ It does not change production rules, profiles, services or the default profile.
 
 ## What actually executes
 
-Each check creates an outer private mount/network/PID namespace, preserving an
-open descriptor to the original caller network namespace. Every command that
-can mutate network/firewall state checks that the current router inode is the
-expected child inode and differs from that descriptor. Target/client namespaces
-are independently checked before namespace mutations. `/run` is mounted private
+Each check creates an outer private mount/network/PID namespace, preserving
+open descriptors to all three original caller namespaces. Public CLIs reject
+internal descriptor/workspace flags: only a fixed Python bootstrap beyond
+`unshare` selects the internal branch. Before any mutation the lab proves all
+three namespace identities differ from the inherited caller descriptors, that
+it is private PID 1 with matching private procfs, and that mount propagation is
+not shared with the caller. Every network-mutating command rechecks the bound
+namespace identities. Target/client namespaces are independently checked before
+namespace mutations. `/run` is mounted private
 inside the lab. A veth target uses the **exact configured endpoint IPv4 and
 exact interface name**, without contacting the real endpoint. Its additional
 foreign address and HTTP listeners are controlled by the harness.
@@ -82,23 +86,41 @@ refusal, missing image/Python, malformed HTTP, command failure, no route or dead
 listener alone cannot satisfy acceptance. Changing the canonical policy to make
 the test pass is not an acceptance result.
 
-Each subprocess has bounded output and timeout. Child cleanup removes only
-tracked containers/networks, checks private-daemon inventories, stops tracked
-processes and verifies table/link absence. The outer PID namespace is a kill
-boundary; the outer process owns/removes the temporary directory even when a
-child times out. JSON success is forwarded only after normal lab cleanup,
-namespace-process exit and outer directory removal succeed. No system prune,
-caller ruleset flush or caller Docker/network mutation is used.
+Each subprocess has bounded output and a single deadline covering concurrent
+nonblocking stdin/stdout delivery and process wait. The nested `unshare` stays
+in the wrapper's owned process group; Linux command children arm parent-death
+SIGKILL with a post-fork parent check. Wrapper SIGTERM/SIGINT handlers are set
+before launch. These lifecycle paths have portable process tests and mocked
+Linux syscall-shape tests, not live Linux cancellation acceptance.
 
-## Local blocker found without privileged execution
+Normal cleanup removes only tracked containers/networks, checks private-daemon
+inventories, stops tracked processes and verifies table/link absence. The outer
+PID namespace is a kill boundary. The wrapper owns/removes the temporary
+directory on normal completion, timeout and handled cancellation. SIGKILL of
+that owner can leave its specifically named synthetic workspace/data-root;
+no cleanup/receipt success is emitted in that case. Inspect any such exact
+owned path before separately authorized cleanup; do not prune unrelated data.
+JSON success is forwarded only after normal lab cleanup, namespace-process exit
+and outer directory removal succeed. No system prune, caller ruleset flush or
+caller Docker/network mutation is used.
 
-The current `expected_ollama_ruleset()` returns mixed-chain rule order, whereas
-`NftablesAdapter._normalise_table()` sorts rules by chain. A portable comparison
-of the canonical manifests showed `inet=False, bridge=False` for equality to
-that sorted form. Therefore strict readback will fail until the production
-policy owner resolves that consistency bug (stable sorting preserves each
-chain's rule order). The acceptance scripts intentionally do not sort/relax
-observations or modify the production renderer to conceal it.
+## Local corrections and remaining kernel acceptance
+
+The production Ollama manifest now uses the same stable chain grouping as the
+production adapter and base proxy manifest. A RED→GREEN portable comparison
+checks exact adapter normalization and preserves allow-before-deny order inside
+each chain. No readback relaxation or nft rule allowance was added. Docker
+inspection accepts only absent/empty/null default `IPAM.Options` in addition to
+exact required creation fields; foreign IPAM options, labels or addresses fail.
+
+Every allowed enforced transaction also starts with flushed IPv4 neighbour
+caches in the isolated router, targets and clients. Structured reports must
+include that evidence. This prevents unenforced controls from hiding a cold-path
+ARP problem. The current route bridge's input/output drop rules have no explicit
+ARP exception; the cold-path run may therefore expose a real policy failure.
+Do not add permanent neighbour entries or weaken a check to obtain a receipt:
+that case must remain FAIL until the production policy is separately corrected
+and the complete real acceptance is rerun.
 
 Real namespace/nftables/Docker behavior, including namespace permissions,
 installed nft syntax and nested runtime/cgroup support, still requires an
