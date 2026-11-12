@@ -122,7 +122,13 @@ def replace_locked_config_at(parent_fd, expected_current, new_data, *, open_fn=N
                              set_immutable_fn=None, replace_fn=None, unlink_fn=None,
                              fsync_fn=None, verify_fn=None, close_fn=None,
                              nofollow_flag=None):
-    """Atomically replace one locked config after exact read-back and identity checks."""
+    """Replace a config, failing closed if the installed inode cannot be verified.
+
+    A failure after rename can leave new bytes unlocked. The caller must gate
+    runtime startup on immutable-policy verification and arrange recovery. A
+    failed restoration before rename can likewise leave the old inode unlocked;
+    merely seeing old bytes is not proof that recovery succeeded.
+    """
     if (type(parent_fd) is not int or parent_fd < 0
             or type(expected_current) is not bytes or not 1 <= len(expected_current) <= 65536
             or type(new_data) is not bytes or not 1 <= len(new_data) <= 65536
@@ -161,7 +167,10 @@ def replace_locked_config_at(parent_fd, expected_current, new_data, *, open_fn=N
         temp_fd = open_fn(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow,
                           0o600, dir_fd=parent_fd)
         temp_created = True
-        initialize_fn(temp_fd, new_data, require_immutable=True)
+        initialize_fn(temp_fd, new_data, require_immutable=False)
+        verify_fn(temp_fd, new_data, require_immutable=False)
+        temp_info = fstat_fn(temp_fd)
+        temp_identity = (temp_info.st_dev, temp_info.st_ino)
         fsync_fn(parent_fd)
 
         current = stat_fn(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -174,20 +183,36 @@ def replace_locked_config_at(parent_fd, expected_current, new_data, *, open_fn=N
         if type(old_was_immutable) is not bool:
             raise OSError(errno.EIO, 'managed config lock state is invalid')
         if old_was_immutable:
+            old_unlocked = True  # The clear may take effect even if read-back raises.
             set_immutable_fn(old_fd, False)
-            old_unlocked = True
             if is_immutable_fn(old_fd) is not False:
                 raise OSError(errno.EIO, 'managed config immutable flag did not clear')
         current = stat_fn(name, dir_fd=parent_fd, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != identity:
             raise OSError(errno.EAGAIN, 'managed config identity changed before rename')
+        candidate = stat_fn(temporary, dir_fd=parent_fd, follow_symlinks=False)
+        if (candidate.st_dev, candidate.st_ino) != temp_identity:
+            raise OSError(errno.EAGAIN, 'temporary config identity changed before rename')
         replace_fn(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         temp_created = False
         replaced = True
+        # Lock through the retained descriptor, never a potentially substituted path.
+        set_immutable_fn(temp_fd, True)
+        verify_fn(temp_fd, new_data, require_immutable=True)
+        fsync_fn(temp_fd)
         fsync_fn(parent_fd)
         replacement_fd = open_fn(name, os.O_RDONLY | nofollow, dir_fd=parent_fd)
-        return verify_fn(replacement_fd, new_data, require_immutable=True)
-    except Exception:
+        installed = fstat_fn(replacement_fd)
+        if (installed.st_dev, installed.st_ino) != temp_identity:
+            raise OSError(errno.EAGAIN, 'installed config identity changed after replacement')
+        result = verify_fn(replacement_fd, new_data, require_immutable=True)
+        installed = stat_fn(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (installed.st_dev, installed.st_ino) != temp_identity:
+            raise OSError(errno.EAGAIN, 'installed config identity changed during verification')
+        return result
+    except Exception as error:
+        if replaced:
+            raise OSError(errno.EIO, 'managed config replaced but protection or identity is unverified; recovery required') from error
         if old_unlocked and not replaced and old_fd is not None:
             try:
                 set_immutable_fn(old_fd, True)
@@ -199,10 +224,13 @@ def replace_locked_config_at(parent_fd, expected_current, new_data, *, open_fn=N
     finally:
         if temp_created and temp_fd is not None:
             try:
-                if is_immutable_fn(temp_fd) is True:
-                    set_immutable_fn(temp_fd, False)
-                unlink_fn(temporary, dir_fd=parent_fd)
-                fsync_fn(parent_fd)
+                temp_now = fstat_fn(temp_fd)
+                named_temp = stat_fn(temporary, dir_fd=parent_fd, follow_symlinks=False)
+                if (temp_now.st_dev, temp_now.st_ino) == (named_temp.st_dev, named_temp.st_ino):
+                    if is_immutable_fn(temp_fd) is True:
+                        set_immutable_fn(temp_fd, False)
+                    unlink_fn(temporary, dir_fd=parent_fd)
+                    fsync_fn(parent_fd)
             except Exception:
                 pass
         for fd in (replacement_fd, temp_fd, old_fd):

@@ -10,6 +10,63 @@ from supervisor.config_lock import (FS_IMMUTABLE_FL, initialize_config_fd, is_im
                                     read_managed_config_fd, verify_config_fd)
 
 
+class FakeFilesystem:
+    def __init__(self, initial):
+        self.files = {'openclaw.json': self._new_file(initial, 1, True)}
+        self.handles = {}
+        self.next_fd = 10
+    @staticmethod
+    def _new_file(content, inode, immutable):
+        return {'content': content, 'immutable': immutable, 'info': SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o440, st_uid=0, st_gid=1000,
+            st_nlink=1, st_size=len(content), st_dev=1, st_ino=inode)}
+    def open(self, name, _flags, _mode=None, *, dir_fd=None):
+        if name not in self.files:
+            if _flags & os.O_CREAT:
+                self.files[name] = self._new_file(b'', 2, False)
+            else:
+                raise FileNotFoundError(name)
+        fd = self.next_fd
+        self.next_fd += 1
+        self.handles[fd] = self.files[name]
+        return fd
+    def fstat(self, fd):
+        return self.handles[fd]['info']
+    def stat(self, name, *, dir_fd=None, follow_symlinks=True):
+        return self.files[name]['info']
+    def read(self, fd, *, require_immutable=True):
+        item = self.handles[fd]
+        if require_immutable and not item['immutable']:
+            raise OSError('not immutable')
+        return item['info'], item['content']
+    def initialize(self, fd, data, *, require_immutable=True):
+        item = self.handles[fd]
+        item['content'] = data
+        item['info'].st_size = len(data)
+        item['immutable'] = require_immutable
+        return item['info']
+    def is_immutable(self, fd):
+        return self.handles[fd]['immutable']
+    def set_immutable(self, fd, enabled):
+        self.handles[fd]['immutable'] = enabled
+    def replace(self, source, target, *, src_dir_fd=None, dst_dir_fd=None):
+        # Linux refuses rename of an immutable source or target inode.
+        if self.files[source]['immutable'] or self.files[target]['immutable']:
+            raise PermissionError('immutable inode cannot be renamed')
+        self.files[target] = self.files.pop(source)
+    def unlink(self, name, *, dir_fd=None):
+        del self.files[name]
+    def verify(self, fd, expected, *, require_immutable=True):
+        item = self.handles[fd]
+        if item['content'] != expected or (require_immutable and not item['immutable']):
+            raise OSError('verification failed')
+        return item['info']
+    @staticmethod
+    def fsync(_fd):
+        return None
+
+
+
 class ImmutableConfigFlagTests(unittest.TestCase):
     def make_ioctl(self, initial_flags, *, ignore_set=False):
         state = {'flags': initial_flags, 'requests': []}
@@ -83,58 +140,6 @@ class ImmutableConfigFlagTests(unittest.TestCase):
         self.assertIn(('immutable', fd, True), calls)
 
     def test_replace_locked_config_at_atomically_swaps_only_expected_policy_bytes(self):
-        class FakeFilesystem:
-            def __init__(self, initial):
-                self.files = {'openclaw.json': self._new_file(initial, 1, True)}
-                self.handles = {}
-                self.next_fd = 10
-            @staticmethod
-            def _new_file(content, inode, immutable):
-                return {'content': content, 'immutable': immutable, 'info': SimpleNamespace(
-                    st_mode=stat.S_IFREG | 0o440, st_uid=0, st_gid=1000,
-                    st_nlink=1, st_size=len(content), st_dev=1, st_ino=inode)}
-            def open(self, name, _flags, _mode=None, *, dir_fd=None):
-                if name not in self.files:
-                    if _flags & os.O_CREAT:
-                        self.files[name] = self._new_file(b'', 2, False)
-                    else:
-                        raise FileNotFoundError(name)
-                fd = self.next_fd
-                self.next_fd += 1
-                self.handles[fd] = self.files[name]
-                return fd
-            def fstat(self, fd):
-                return self.handles[fd]['info']
-            def stat(self, name, *, dir_fd=None, follow_symlinks=True):
-                return self.files[name]['info']
-            def read(self, fd, *, require_immutable=True):
-                item = self.handles[fd]
-                if require_immutable and not item['immutable']:
-                    raise OSError('not immutable')
-                return item['info'], item['content']
-            def initialize(self, fd, data, *, require_immutable=True):
-                item = self.handles[fd]
-                item['content'] = data
-                item['info'].st_size = len(data)
-                item['immutable'] = require_immutable
-                return item['info']
-            def is_immutable(self, fd):
-                return self.handles[fd]['immutable']
-            def set_immutable(self, fd, enabled):
-                self.handles[fd]['immutable'] = enabled
-            def replace(self, source, target, *, src_dir_fd=None, dst_dir_fd=None):
-                self.files[target] = self.files.pop(source)
-            def unlink(self, name, *, dir_fd=None):
-                del self.files[name]
-            def verify(self, fd, expected, *, require_immutable=True):
-                item = self.handles[fd]
-                if item['content'] != expected or (require_immutable and not item['immutable']):
-                    raise OSError('verification failed')
-                return item['info']
-            @staticmethod
-            def fsync(_fd):
-                return None
-
         old = b'{"gateway":{},"models":{"selected":"old"}}\n'
         new = b'{"gateway":{},"models":{"selected":"new"}}\n'
         fs = FakeFilesystem(old)
@@ -147,6 +152,44 @@ class ImmutableConfigFlagTests(unittest.TestCase):
         self.assertEqual(fs.files['openclaw.json']['content'], new)
         self.assertTrue(fs.files['openclaw.json']['immutable'])
         self.assertNotIn('.openclaw.json.update', fs.files)
+
+    def test_replacement_failure_restores_old_lock(self):
+        fs = FakeFilesystem(b'old')
+        def fail(*args, **kwargs):
+            raise OSError('rename failed')
+        with self.assertRaisesRegex(OSError, 'rename failed'):
+            self._replace_fake(fs, replace_fn=fail)
+        self.assertTrue(fs.files['openclaw.json']['immutable'])
+        self.assertEqual(fs.files['openclaw.json']['content'], b'old')
+
+    def test_relock_failure_reports_installed_unprotected_config(self):
+        fs = FakeFilesystem(b'old')
+        def set_flag(fd, enabled):
+            if enabled and fs.handles[fd]['content'] == b'new':
+                raise OSError('relock failed')
+            fs.set_immutable(fd, enabled)
+        with self.assertRaisesRegex(OSError, 'recovery required'):
+            self._replace_fake(fs, set_immutable_fn=set_flag)
+        self.assertEqual(fs.files['openclaw.json']['content'], b'new')
+        self.assertFalse(fs.files['openclaw.json']['immutable'])
+
+    def test_replacement_detects_installed_inode_drift(self):
+        fs = FakeFilesystem(b'old')
+        def drift(source, target, **kwargs):
+            fs.replace(source, target, **kwargs)
+            fs.files[target] = fs._new_file(b'new', 3, True)
+        with self.assertRaisesRegex(OSError, 'recovery required'):
+            self._replace_fake(fs, replace_fn=drift)
+        self.assertTrue(fs.handles[11]['immutable'])
+
+    def _replace_fake(self, fs, **overrides):
+        options = dict(open_fn=fs.open, fstat_fn=fs.fstat, stat_fn=fs.stat,
+                       read_fn=fs.read, initialize_fn=fs.initialize,
+                       is_immutable_fn=fs.is_immutable, set_immutable_fn=fs.set_immutable,
+                       replace_fn=fs.replace, unlink_fn=fs.unlink, fsync_fn=fs.fsync,
+                       verify_fn=fs.verify, close_fn=lambda _fd: None, nofollow_flag=1)
+        options.update(overrides)
+        return replace_locked_config_at(99, b'old', b'new', **options)
 
     def test_read_managed_config_fd_returns_verified_bounded_bytes(self):
         expected = b'{"models":{}}\n'

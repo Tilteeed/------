@@ -134,6 +134,30 @@ class OllamaFirewallPolicyTests(unittest.TestCase):
             receipt, 'a' * 64, '10.240.0.0/13', '10.248.0.0/13',
             '172.20.0.0/16', '10.99.0.10', 'ens19'))
 
+    def test_written_receipt_is_valid_json(self):
+        import json
+        import tempfile
+        from unittest.mock import patch
+        from supervisor import ollama_firewall as firewall
+
+        payload = bytearray()
+        with tempfile.TemporaryDirectory() as state_dir:
+            with patch.object(firewall, 'machine_id_sha256', return_value='a' * 64), \
+                 patch.object(firewall, '_open_state_directory', return_value=100), \
+                 patch.object(firewall.os, 'open', return_value=101), \
+                 patch.object(firewall.os, 'fchown', create=True), \
+                 patch.object(firewall.os, 'fchmod', create=True), \
+                 patch.object(firewall.os, 'write', side_effect=lambda fd, data: payload.extend(data) or len(data)), \
+                 patch.object(firewall.os, 'fsync'), \
+                 patch.object(firewall.os, 'close'), \
+                 patch.object(firewall.os, 'replace'):
+                receipt = firewall.write_ollama_route_receipt(
+                    state_dir, '10.240.0.0/13', '10.248.0.0/13',
+                    '172.20.0.0/16', '10.99.0.10', 'ens18')
+
+        self.assertEqual(json.loads(payload.decode('utf-8')), receipt)
+        self.assertTrue(payload.endswith(b'\n'))
+
     def test_route_firewall_removes_the_owned_table_after_last_route_is_purged(self):
         from supervisor.ollama_firewall import (
             OllamaFirewallManager, expected_ollama_ruleset,

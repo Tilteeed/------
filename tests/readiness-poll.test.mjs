@@ -69,6 +69,21 @@ test('stop aborts each request before a new session starts', async () => {
   assert.ok(signals.every(signal => signal?.aborted));
 });
 
+test('fresh response after expiry restores readiness', async () => {
+  let display = 'initial', calls = 0;
+  const poll = createReadinessPoll({ interval: 5, maxAge: 15, requestTimeout: 25,
+    invalidate: () => { display = 'unavailable'; },
+    refresh: async current => {
+      if (++calls === 1) return new Promise(() => {});
+      if (current()) display = 'model_present';
+    } });
+  poll.start();
+  await new Promise(resolve => setTimeout(resolve, 60));
+  poll.stop();
+  assert.ok(calls >= 2);
+  assert.equal(display, 'model_present');
+});
+
 test('hung requests time out and polling continues', async () => {
   let calls = 0, invalid = 0;
   const poll = createReadinessPoll({ interval: 5, maxAge: 50, requestTimeout: 10,
@@ -106,6 +121,7 @@ test('poll auth errors revoke only the current session', async () => {
     const request = () => new Promise((resolve, reject) => { rejectRequest = reject; });
     const showError = () => { errors++; };
     const invalidateModel = () => {};
+    const modelUpdates = { begin: () => ({ apply: () => {} }) };
     const modelStatusLabel = x => x;
     const $ = () => ({ textContent: '' });
     ${code}
@@ -125,4 +141,108 @@ test('poll auth errors revoke only the current session', async () => {
   harness.reject({ status: 401 });
   await assert.rejects(result);
   assert.equal(harness.errors(), 1);
+});
+
+
+test('older manual response cannot overwrite a newer poll response', async () => {
+  const { createModelUpdates } = await import('../web/agent/ui-state.mjs');
+  let displayed;
+  const updates = createModelUpdates({ apply: value => { displayed = value; }, isAuthorized: () => true });
+  const manual = updates.begin();
+  const poll = updates.begin();
+  poll.apply('model_present');
+  manual.apply('unavailable');
+  assert.equal(displayed, 'model_present');
+});
+
+
+test('model updates reject expired and previous-session responses', async () => {
+  const { createModelUpdates } = await import('../web/agent/ui-state.mjs');
+  let displayed = 'unknown', time = 0, session = 1;
+  const updates = createModelUpdates({ apply: value => { displayed = value; }, now: () => time, maxAge: 15,
+    getSession: () => session, isAuthorized: () => true });
+  const old = updates.begin();
+  session++;
+  old.apply('old user');
+  assert.equal(displayed, 'unknown');
+  const late = updates.begin();
+  time = 15;
+  late.apply('late');
+  assert.equal(displayed, 'unknown');
+});
+
+
+test('accepted model status expires based on request start, even without poll activity', async () => {
+  const { createModelUpdates } = await import('../web/agent/ui-state.mjs');
+  let time = 0, expire, delay, display = 'unknown';
+  const updates = createModelUpdates({ now: () => time, maxAge: 15, isAuthorized: () => true,
+    setTimer: (fn, ms) => { expire = fn; delay = ms; return 1; }, clearTimer: () => {},
+    apply: value => { display = value; }, invalidate: () => { display = 'unknown'; } });
+  const response = updates.begin();
+  time = 10; response.apply('present');
+  assert.equal(delay, 5);
+  time = 15; expire();
+  assert.equal(display, 'unknown');
+});
+
+
+test('newer manual result defeats older poll, and invalidation rejects late replies', async () => {
+  const { createModelUpdates } = await import('../web/agent/ui-state.mjs');
+  let value = 'unknown', authorized = true;
+  const updates = createModelUpdates({ apply: x => { value = x; }, isAuthorized: () => authorized,
+    setTimer: () => 1, clearTimer: () => {} });
+  const poll = updates.begin(), manual = updates.begin();
+  manual.apply('model_missing');
+  poll.apply('model_present');
+  assert.equal(value, 'model_missing');
+  const late = updates.begin();
+  updates.invalidate();
+  late.apply('model_present');
+  assert.equal(value, 'model_missing');
+  const revoked = updates.begin();
+  authorized = false;
+  revoked.apply('model_present');
+  assert.equal(value, 'model_missing');
+});
+
+
+test('failed older refresh cannot invalidate a newer successful observation', async () => {
+  const { createModelUpdates } = await import('../web/agent/ui-state.mjs');
+  let display = 'unknown';
+  const updates = createModelUpdates({ apply: x => { display = x; }, invalidate: () => { display = 'unknown'; }, isAuthorized: () => true, setTimer: () => 1, clearTimer: () => {} });
+  const oldPoll = updates.begin(), manual = updates.begin();
+  manual.apply('ready');
+  oldPoll.fail();
+  assert.equal(display, 'ready');
+  updates.begin().fail();
+  assert.equal(display, 'unknown');
+});
+
+
+test('action completion supersedes an in-flight poll and its later failure', async () => {
+  const { createModelUpdates } = await import('../web/agent/ui-state.mjs');
+  let display = 'unknown';
+  const updates = createModelUpdates({ apply: x => { display = x; }, invalidate: () => { display = 'unknown'; }, isAuthorized: () => true, setTimer: () => 1, clearTimer: () => {} });
+  const poll = updates.begin();
+  updates.begin().apply('action result');
+  poll.fail();
+  assert.equal(display, 'action result');
+  const manual = updates.begin();
+  updates.begin().fail();
+  manual.apply('obsolete');
+  assert.equal(display, 'unknown');
+});
+
+test('poll invalidation is associated with the poll request, not a newer manual result', async () => {
+  let failPoll, display = 'unknown';
+  const { createModelUpdates } = await import('../web/agent/ui-state.mjs');
+  const updates = createModelUpdates({ apply: x => { display = x; }, invalidate: () => { display = 'unknown'; }, isAuthorized: () => true, setTimer: () => 1, clearTimer: () => {} });
+  const poll = createReadinessPoll({ makeInvalidation: () => { const update = updates.begin(); return () => update.fail(); },
+    invalidate: () => { display = 'unknown'; }, refresh: () => new Promise((_, reject) => { failPoll = reject; }) });
+  poll.start();
+  updates.begin().apply('manual');
+  failPoll(new Error('offline'));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  poll.stop();
+  assert.equal(display, 'manual');
 });

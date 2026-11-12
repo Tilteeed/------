@@ -80,19 +80,19 @@ export function runtimeView(runtime, connected = false) {
 }
 
 export function modelStatusLabel(status) {
-  return ({configured: 'Модель настроена; проверка не выполнена', unavailable: 'Сервис модели недоступен', model_missing: 'Модель не найдена', model_present: 'Модель найдена; ответ не подтверждён'})[status] || 'Не подключена / не подтверждена';
+  return ({configured: 'Модель настроена; проверка не выполнена', unavailable: 'Сервис модели недоступен', model_missing: 'Модель не найдена в последнем полученном списке', model_present: 'Модель есть в последнем полученном списке; ответ не подтверждён'})[status] || 'Не подключена / не подтверждена';
 }
-export function createReadinessPoll({ refresh, invalidate, interval = 5000, maxAge = 15000,
+export function createReadinessPoll({ refresh, invalidate, makeInvalidation = () => invalidate, interval = 5000, maxAge = 15000,
   requestTimeout = 10000, setTimer = setTimeout, clearTimer = clearTimeout, now = () => Date.now() }) {
-  let active = false, generation = 0, freshness = 0, next = null, expiry = null, pending = null, deadline = 0;
-  const expire = () => { expiry = null; freshness += 1; invalidate(); };
-  function armExpiry() {
+  let active = false, generation = 0, freshness = 0, next = null, expiry = null, pending = null;
+  function armExpiry(invalidateRequest) {
     if (expiry !== null) clearTimer(expiry);
-    deadline = now() + maxAge;
-    expiry = setTimer(expire, maxAge);
+    expiry = setTimer(() => { expiry = null; freshness += 1; invalidateRequest(); }, maxAge);
   }
   async function run(epoch) {
-    const version = freshness, controller = new AbortController();
+    const invalidateRequest = makeInvalidation();
+    if (expiry === null) armExpiry(invalidateRequest);
+    const version = freshness, controller = new AbortController(), deadline = now() + maxAge;
     const current = () => active && epoch === generation && version === freshness
       && !controller.signal.aborted && now() < deadline;
     let timeout;
@@ -103,13 +103,13 @@ export function createReadinessPoll({ refresh, invalidate, interval = 5000, maxA
     try {
       await Promise.race([refresh(current, controller.signal), timedOut]);
       if (!current()) return;
-      armExpiry();
+      armExpiry(invalidateRequest);
     } catch {
       if (!active || epoch !== generation) return;
       if (expiry !== null) clearTimer(expiry);
       expiry = null;
       freshness += 1;
-      invalidate();
+      invalidateRequest();
     } finally {
       clearTimer(timeout);
       if (pending?.controller === controller) pending = null;
@@ -120,7 +120,6 @@ export function createReadinessPoll({ refresh, invalidate, interval = 5000, maxA
     start() {
       if (!active) {
         active = true; generation += 1;
-        armExpiry();
         void run(generation);
       }
     },
@@ -131,5 +130,37 @@ export function createReadinessPoll({ refresh, invalidate, interval = 5000, maxA
       if (pending !== null) { clearTimer(pending.timeout); pending.controller.abort(); pending = null; }
       next = expiry = null;
     },
+  };
+}
+
+
+export function createModelUpdates({ apply, isAuthorized, invalidate = () => {}, getSession = () => null,
+  maxAge = 15000, now = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout }) {
+  let serial = 0, accepted = 0, generation = 0, expiry = null;
+  function reset() {
+    generation++;
+    if (expiry !== null) clearTimer(expiry);
+    expiry = null;
+  }
+  return {
+    begin() {
+      const id = ++serial, version = generation, session = getSession(), deadline = now() + maxAge;
+      const valid = () => version === generation && session === getSession() && id >= accepted && isAuthorized();
+      return { fail() {
+        if (!valid()) return false;
+        accepted = id;
+        reset();
+        invalidate();
+        return true;
+      }, apply(value) {
+        if (!valid() || now() >= deadline) return false;
+        accepted = id;
+        if (expiry !== null) clearTimer(expiry);
+        expiry = setTimer(() => { expiry = null; generation++; invalidate(); }, deadline - now());
+        apply(value);
+        return true;
+      } };
+    },
+    invalidate: reset,
   };
 }

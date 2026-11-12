@@ -7,6 +7,42 @@ from pathlib import Path
 
 
 class DurableIntentSmoke(unittest.TestCase):
+    def test_failed_stop_intent_is_durable_before_runtime_mutation(self):
+        from supervisor.runtime_store import RuntimeStore
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'runtime.sqlite3'
+            store = RuntimeStore(path, 'v1', 'a' * 64)
+            payload = {'actor_id': 'alice', 'action': 'create', 'idempotency_key': 'one',
+                       'settings_revision': 1, 'settings': {}}
+            create = store.intent(payload, (1, 1, 1), (10, 10, 10))
+            store.complete(create['id'], 'running', 'container')
+            stop = store.intent(dict(payload, action='stop', idempotency_key='stop'),
+                                (1, 1, 1), (10, 10, 10))
+            store.fail(stop['id'], 'runtime_unavailable')
+            store.close()
+            reopened = RuntimeStore(path, 'v1', 'a' * 64)
+            self.assertEqual(reopened.current('alice')['desired_state'], 'stopped')
+            reopened.close()
+
+    def test_replaying_failed_stop_clears_later_running_intent(self):
+        from supervisor.runtime_store import RuntimeStore
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RuntimeStore(Path(tmp) / 'runtime.sqlite3', 'v1', 'a' * 64)
+            p = {'actor_id': 'alice', 'action': 'create', 'idempotency_key': 'create',
+                 'settings_revision': 1, 'settings': {}}
+            args = ((1, 1, 1), (10, 10, 10))
+            created = store.intent(p, *args)
+            store.complete(created['id'], 'running', 'container')
+            stop = dict(p, action='stop', idempotency_key='stop')
+            operation = store.intent(stop, *args)
+            store.fail(operation['id'], 'runtime_unavailable')
+            start = store.intent(dict(p, action='start', idempotency_key='start'), *args)
+            store.complete(start['id'], 'running', 'container')
+            store.intent(stop, *args)
+            current = store.current('alice')
+            store.close()
+            self.assertEqual(current['desired_state'], 'stopped')
+
     def test_retained_disk_and_exact_replay(self):
         from supervisor.runtime_store import RuntimeStore, StoreError
         with tempfile.TemporaryDirectory() as tmp:
@@ -932,3 +968,151 @@ class OllamaModelChangeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ProductionWiringTests(unittest.TestCase):
+    def test_serve_passes_ollama_configuration_to_engine(self):
+        import stat
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from supervisor.service import serve
+
+        config = dict(profile_path='/trusted/profile', state_dir='/state',
+                      socket_path='/run/control.sock', token_file='/state/service.token',
+                      image='image', agent_network_pool='agent', frontend_network_pool='front',
+                      ollama_network_pool='ollama-pool', ollama_egress_interface='eth0',
+                      ollama={'base_url': 'http://10.0.0.1:11434'})
+        profile = SimpleNamespace(storage=SimpleNamespace(mountpoint='/pool'))
+        marker = object()
+        with (patch.dict(sys.modules, {'fcntl': SimpleNamespace()}),
+             patch('supervisor.service.load_profile', return_value=profile),
+             patch('supervisor.service._trusted_directory'),
+             patch('supervisor.service._runtime_firewall', return_value='firewall'),
+             patch('supervisor.service._runtime_ollama_firewall', return_value=marker),
+             patch('pathlib.Path.lstat', return_value=SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0)),
+             patch('pathlib.Path.resolve', lambda self, **kwargs: self),
+             patch('supervisor.service.os.path.lexists', return_value=False),
+             patch('supervisor.docker_engine.DockerEngine') as constructor):
+            constructor.return_value.check_host.side_effect = RuntimeError('stop')
+            with self.assertRaisesRegex(RuntimeError, 'stop'):
+                serve(config)
+        self.assertEqual(constructor.call_args.kwargs['ollama_config'], config['ollama'])
+        self.assertEqual(constructor.call_args.kwargs['ollama_network_pool'], 'ollama-pool')
+        self.assertEqual(constructor.call_args.kwargs['ollama_egress_interface'], 'eth0')
+        self.assertIs(constructor.call_args.kwargs['ollama_firewall'], marker)
+
+
+class RecoveryRetryTests(unittest.TestCase):
+    def test_background_retry_is_disabled_for_safe_containment(self):
+        from supervisor.service import _retry_recovery
+        class Controller:
+            calls = 0
+            def reconcile(self): self.calls += 1
+        class Stop:
+            def wait(self, seconds): return False
+        controller = Controller()
+        _retry_recovery(controller, Stop())
+        self.assertEqual(controller.calls, 0)
+
+    def test_repeated_recovery_does_not_readmit_running_instance(self):
+        from supervisor.service import RuntimeService, ServiceError
+        instance = dict(id='a' * 32, active=1, state='running',
+                        desired_state='running', network_profile='legacy_none')
+        class Store:
+            def all_instances(self): return [instance]
+            def observe(self, instance_id, state, container_id): instance['state'] = state
+        class Engine:
+            def __init__(self): self.calls = []
+            def stop(self, instance_id): self.calls.append('stop')
+            def inspect(self, instance_id):
+                return dict(state='running', container_id='c', network_profile='legacy_none')
+        service = object.__new__(RuntimeService)
+        service.lock = threading.RLock()
+        service.store, service.engine = Store(), Engine()
+        service.sidecar_migration = None
+        service._inspect = service.engine.inspect
+        service._storage = lambda instance: {'disk_quota_verified': True}
+        def deny(**kwargs): raise ServiceError('admission_denied', 503)
+        service._admit = deny
+        service.reconcile()
+        self.assertEqual(service.engine.calls, [])
+        self.assertEqual(instance['desired_state'], 'running')
+
+    def test_recovery_worker_retries_after_warmup_and_stops(self):
+        from supervisor.service import _retry_recovery
+        class Stop:
+            def __init__(self): self.waits = []
+            def wait(self, seconds):
+                self.waits.append(seconds)
+                return len(self.waits) == 4
+        class Controller:
+            def __init__(self): self.calls = 0
+            def reconcile(self):
+                self.calls += 1
+                if self.calls == 1: raise RuntimeError('transient')
+        stop, controller = Stop(), Controller()
+        _retry_recovery(controller, stop)
+        self.assertEqual(controller.calls, 0)
+        self.assertEqual(stop.waits, [])
+
+    def test_warmup_retry_restores_only_desired_running_after_firewall(self):
+        from supervisor.service import RuntimeService, ServiceError, _retry_recovery
+        running = dict(id='a' * 32, active=1, state='stopped', desired_state='running',
+                       network_profile='agent_proxy_v1')
+        stopped = dict(id='b' * 32, active=1, state='stopped', desired_state='stopped',
+                       network_profile='agent_proxy_v1')
+        class Store:
+            def all_instances(self): return [running, stopped]
+            def observe(self, instance_id, state, container_id):
+                next(i for i in (running, stopped) if i['id'] == instance_id)['state'] = state
+        class Engine:
+            def __init__(self): self.calls = []; self.states = {}
+            def restore_firewall(self):
+                self.calls.append('firewall')
+                return dict(ready=True, instance_ids=[running['id']])
+            def inspect(self, instance_id):
+                return dict(state=self.states.get(instance_id, 'stopped'), container_id='c',
+                            network_profile='agent_proxy_v1')
+            def start(self, instance_id):
+                self.calls.append(('start', instance_id)); self.states[instance_id] = 'running'
+        service = object.__new__(RuntimeService)
+        service.lock = threading.RLock()
+        service.store, service.engine = Store(), Engine()
+        service.sidecar_migration = None
+        service._inspect = service.engine.inspect
+        service._storage = lambda instance: {'disk_quota_verified': True}
+        warm = [False]
+        def admit(**kwargs):
+            if not warm[0]: raise ServiceError('admission_denied', 503)
+        service._admit = admit
+        service.reconcile()
+        self.assertEqual(service.engine.calls, ['firewall'])
+        class Stop:
+            calls = 0
+            def wait(self, seconds):
+                self.calls += 1
+                warm[0] = True
+                return self.calls > 1
+        _retry_recovery(service, Stop())
+        self.assertEqual(service.engine.calls, ['firewall'])
+        self.assertEqual((running['desired_state'], running['state']), ('running', 'stopped'))
+        self.assertEqual((stopped['desired_state'], stopped['state']), ('stopped', 'stopped'))
+
+    def test_recovery_worker_is_bounded_and_shutdown_interrupts_wait(self):
+        from supervisor.service import _retry_recovery
+        class Controller:
+            calls = 0
+            def reconcile(self): self.calls += 1
+        class NeverStop:
+            def wait(self, seconds): return False
+        controller = Controller()
+        _retry_recovery(controller, NeverStop())
+        self.assertEqual(controller.calls, 0)
+        stop = threading.Event()
+        worker = threading.Thread(target=_retry_recovery, args=(controller, stop))
+        worker.start()
+        stop.set()
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(controller.calls, 0)

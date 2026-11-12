@@ -977,6 +977,16 @@ class RuntimeService:
                 raise ServiceError('admin_config_uninitialized', 503)
             new_id = payload['new_model_id']
             if new_id == current_id:
+                for instance in self.store.all_instances():
+                    if (not instance.get('initialized') or not instance.get('storage')
+                            or instance.get('state') == 'purged'):
+                        continue
+                    saved = self._read_managed_gateway_config(
+                        self._storage(instance), require_immutable=True, with_bytes=True)
+                    if (type(saved) is not tuple or len(saved) != 2
+                            or not ollama_policy_matches_config(saved[0], self.ollama_config)
+                            or saved[1] != (canonical(saved[0]) + '\n').encode('utf-8')):
+                        raise ServiceError('model_policy_unverified', 503)
                 return {'status': 'unchanged', 'model_id': current_id,
                         'updated_instances': 0, 'restart_pending': 0}
             if payload['expected_model_id'] != current_id:
@@ -1003,7 +1013,7 @@ class RuntimeService:
                     raise ServiceError('runtime_unavailable', 503)
                 evidence = self._storage(instance)
                 saved = self._read_managed_gateway_config(
-                    evidence, require_immutable=False, with_bytes=True)
+                    evidence, require_immutable=True, with_bytes=True)
                 if type(saved) is not tuple or len(saved) != 2:
                     raise ServiceError('model_policy_unverified', 503)
                 current_config, old_blob = saved
@@ -1034,15 +1044,12 @@ class RuntimeService:
                                            stopped.get('container_id'))
                         plan['info'] = stopped
             except Exception as stop_error:
-                try:
-                    self.reconcile()
-                except Exception:
-                    pass
                 if isinstance(stop_error, ServiceError):
                     raise stop_error
                 raise ServiceError('runtime_unavailable', 503) from None
 
             attempted = []
+            db_attempted = False
             try:
                 for plan in plans:
                     if not plan['needs_update']:
@@ -1054,15 +1061,29 @@ class RuntimeService:
                             state_fd, plan['old_blob'], plan['new_blob'])
                     finally:
                         os.close(state_fd)
+                for plan in plans:
+                    saved = self._read_managed_gateway_config(
+                        plan['evidence'], require_immutable=True, with_bytes=True)
+                    if type(saved) is not tuple or len(saved) != 2 or saved[1] != plan['new_blob']:
+                        raise ServiceError('model_policy_unverified', 503)
+                db_attempted = True
                 self.store.update_ollama_model_id(current_id, new_id)
                 if self.store.ollama_model_id() != new_id:
                     raise StoreError('admin_config_conflict')
+                for plan in plans:
+                    saved = self._read_managed_gateway_config(
+                        plan['evidence'], require_immutable=True, with_bytes=True)
+                    if type(saved) is not tuple or len(saved) != 2 or saved[1] != plan['new_blob']:
+                        raise ServiceError('model_policy_unverified', 503)
             except Exception as error:
+                if db_attempted:
+                    # A failed CAS/readback can still have committed; never guess.
+                    raise ServiceError('model_policy_unverified', 503) from None
                 rollback_failed = False
                 for plan in reversed(attempted):
                     try:
                         saved = self._read_managed_gateway_config(
-                            plan['evidence'], require_immutable=False, with_bytes=True)
+                            plan['evidence'], require_immutable=True, with_bytes=True)
                         if type(saved) is not tuple or len(saved) != 2:
                             rollback_failed = True
                             continue
@@ -1078,13 +1099,12 @@ class RuntimeService:
                                 state_fd, plan['new_blob'], plan['old_blob'])
                         finally:
                             os.close(state_fd)
+                        restored = self._read_managed_gateway_config(
+                            plan['evidence'], require_immutable=True, with_bytes=True)
+                        if type(restored) is not tuple or len(restored) != 2 or restored[1] != plan['old_blob']:
+                            rollback_failed = True
                     except Exception:
                         rollback_failed = True
-                if not rollback_failed:
-                    try:
-                        self.reconcile()
-                    except Exception:
-                        pass
                 if rollback_failed:
                     raise ServiceError('model_policy_unverified', 503) from None
                 if isinstance(error, ServiceError):
@@ -1266,9 +1286,10 @@ class RuntimeService:
                 if desired_state == 'running' and not self._absent(info):
                     try:
                         evidence = self._storage(instance)
-                        self._admit(quota=evidence['disk_quota_verified'],
-                                    requested_disk_bytes=0,
-                                    network_profile=instance['network_profile'])
+                        if info['state'] not in {'running', 'restarting', 'paused'}:
+                            self._admit(quota=evidence['disk_quota_verified'],
+                                        requested_disk_bytes=0,
+                                        network_profile=instance['network_profile'])
                         if getattr(self, 'ollama_config', None) is not None:
                             self._require_ollama_policy(instance, evidence, info)
                     except ServiceError as error:
@@ -1720,6 +1741,12 @@ def create_admin_handler(app, token):
     return BoundAdminHandler
 
 
+def _retry_recovery(controller, stop_event):
+    """Disabled: unrestricted reconciliation can restart post-boot crashes."""
+    print('Boot recovery retry disabled; blocked instances require manual action',
+          file=sys.stderr, flush=True)
+
+
 def serve(config):
     # Deliberately imported only beyond explicit Linux/root CLI gate.
     import fcntl
@@ -1755,7 +1782,11 @@ def serve(config):
     engine = DockerEngine(
         config['image'], agent_network_pool=config['agent_network_pool'],
         frontend_network_pool=config['frontend_network_pool'],
-        firewall=_runtime_firewall(config))
+        ollama_network_pool=config.get('ollama_network_pool'),
+        ollama_egress_interface=config.get('ollama_egress_interface'),
+        ollama_config=config.get('ollama'),
+        firewall=_runtime_firewall(config),
+        ollama_firewall=_runtime_ollama_firewall(config))
     engine.check_host()
     metrics = HostMetrics(profile.storage.mountpoint)
     metrics.collect()
@@ -1769,6 +1800,7 @@ def serve(config):
     lock_fd = _root_file(state / 'service.lock', 0o600, create=True)
     store = server = admin_server = controller = None
     admin_thread = None
+    recovery_stop = threading.Event()
     bound_identity = admin_bound_identity = None
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1854,6 +1886,7 @@ def serve(config):
             admin_thread = threading.Thread(
                 target=admin_server.serve_forever, kwargs={'poll_interval': 0.5}, daemon=True)
             admin_thread.start()
+        _retry_recovery(controller, recovery_stop)
         print('Supervisor listening on private Unix sockets; CPU window warms for 60 seconds.', flush=True)
         server.serve_forever(poll_interval=0.5)
     finally:

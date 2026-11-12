@@ -492,6 +492,9 @@ class RuntimeStore:
                 other = self.db.execute("SELECT 1 FROM operations WHERE instance_id=? AND id!=? AND status='pending'", (replay['instance_id'], replay['id'])).fetchone()
                 if other and replay['status'] != 'completed' and payload['action'] not in {'stop', 'remove'}:
                     raise StoreError('operation_pending')
+                if replay['status'] != 'completed' and payload['action'] in {'stop', 'remove'}:
+                    self.db.execute("UPDATE instances SET desired_state='stopped' WHERE id=? AND active=1",
+                                    (replay['instance_id'],))
                 return replay
             actor, action = payload['actor_id'], payload['action']
             if type(network_profile) is not str or network_profile not in self.NETWORK_PROFILES:
@@ -556,6 +559,8 @@ class RuntimeStore:
                 'instance_id': payload.get('instance_id')}}) if action == 'restore' else self._payload(payload))
             self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?,?,NULL)',
                             (operation_id, actor, payload['idempotency_key'], saved_payload, instance_id, action, 'pending'))
+            if action in {'stop', 'remove'}:
+                self.db.execute("UPDATE instances SET desired_state='stopped' WHERE id=? AND active=1", (instance_id,))
             if action == 'purge':
                 self.db.execute("UPDATE instances SET state='purging' WHERE id=?", (instance_id,))
             elif action == 'restore':

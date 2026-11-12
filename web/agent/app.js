@@ -1,9 +1,11 @@
-import { controlUiLaunch, controlUiStatus, createReadinessPoll, draftView, errorView, modelStatusLabel, runtimeView, settingsPayload } from './ui-state.mjs';
+import { controlUiLaunch, controlUiStatus, createReadinessPoll, createModelUpdates, draftView, errorView, modelStatusLabel, runtimeView, settingsPayload } from './ui-state.mjs';
 
 const $ = (id) => document.getElementById(id);
 const apiRoot = '/api/v1/agent-platform/me';
 let revision = 0;
 let authenticated = false;
+let pageVisible = true;
+let pageEpoch = 0;
 let busy = false;
 let eventsBusy = false;
 let conflict = false;
@@ -19,19 +21,33 @@ let pairing = { loading: false, approving: false, requests: [] };
 const operationMemory = new Map();
 let sessionStorageAvailable = true;
 
+const modelUpdates = createModelUpdates({
+  getSession: () => identityEpoch,
+  isAuthorized: () => authenticated && pageVisible,
+  invalidate: () => invalidateModel(),
+  apply: observation => {
+    runtimeData = { ...runtimeData, ...observation };
+    $('model-state').textContent = modelStatusLabel(observation.model);
+    $('gateway-state').textContent = observation.gateway === 'ready' ? 'Готов' : 'Не готов / не подтверждён';
+  },
+});
+
 function invalidateModel() {
-  runtimeData = { ...runtimeData, model: 'unavailable' };
+  modelUpdates.invalidate();
+  runtimeData = { ...runtimeData, model: 'unavailable', gateway: 'unavailable' };
   $('model-state').textContent = 'Состояние модели не подтверждено';
+  $('gateway-state').textContent = 'Не готов / не подтверждён';
 }
 const readinessPoll = createReadinessPoll({
   invalidate: invalidateModel,
+  makeInvalidation: () => { const update = modelUpdates.begin(); return () => update.fail(); },
   refresh: async (isCurrent, signal) => {
     const epoch = identityEpoch;
+    const update = modelUpdates.begin();
     try {
       const data = await request('', 'GET', undefined, signal);
       if (!authenticated || epoch !== identityEpoch || !isCurrent()) throw new Error('session changed');
-      runtimeData = { ...runtimeData, model: data.runtime?.model };
-      $('model-state').textContent = modelStatusLabel(runtimeData.model);
+      update.apply({ model: data.runtime?.model, gateway: data.runtime?.gateway });
     } catch (error) {
       if (epoch === identityEpoch && isCurrent() && (error.status === 401 || error.status === 403)) showError(error);
       throw error;
@@ -346,7 +362,7 @@ async function downloadWorkspaceFile(instanceId, path, browser, epoch) {
 }
 
 function renderRuntime(data) {
-  runtimeData = data.runtime || { state: 'unavailable' };
+  runtimeData = { ...(data.runtime || { state: 'unavailable' }), model: runtimeData.model, gateway: runtimeData.gateway };
   observeGeneration(runtimeData);
   capabilities = data.capabilities || {};
   connected = !['not_connected', 'unavailable'].includes(runtimeData.state);
@@ -355,7 +371,7 @@ function renderRuntime(data) {
   $('runtime-title').textContent = view.label;
   $('runtime-description').textContent = view.description;
   $('gateway-state').textContent = runtimeData.gateway === 'ready' ? 'Готов' : 'Не готов / не подтверждён';
-  $('model-state').textContent = 'Состояние модели не подтверждено';
+  $('model-state').textContent = modelStatusLabel(runtimeData.model);
   $('metrics-state').textContent = capabilities.metrics ? 'Окно CPU готово' : 'Нет свежих данных / прогрев';
   renderRetained(data.retained);
   controls();
@@ -429,6 +445,7 @@ function controls() {
 
 function revoke() {
   readinessPoll.stop();
+  modelUpdates.invalidate();
   authenticated = false;
   identityEpoch += 1;
   currentUser = '';
@@ -757,6 +774,7 @@ async function load() {
     currentUser = data.user.id;
     $('identity').textContent = data.user.name;
     renderRuntime(data);
+    if (pageVisible) readinessPoll.start();
     void refreshControlUiStatus(identityEpoch);
     void loadEvents();
   } catch (error) {
@@ -798,7 +816,7 @@ async function submitAction(button, action, targetInstanceId = null, savedOperat
   if (button.disabled || busy || !authenticated) return;
   if (action === 'remove' && !window.confirm('Удалить контейнер? Данные будут сохранены. Для следующего экземпляра потребуется дополнительный дисковый бюджет.')) return;
   if (action === 'purge' && !window.confirm('Удалить контейнер, файлы экземпляра, runtime-снимок и его секреты, затем освободить дисковую квоту? Черновик настроек кабинета сохранится. Действие нельзя отменить.')) return;
-  const epoch = identityEpoch;
+  const epoch = identityEpoch, actionPageEpoch = pageEpoch;
   if (['purge', 'restore'].includes(action) && !targetInstanceId) targetInstanceId = runtimeData.instance_id;
   const currentTarget = targetInstanceId === runtimeData.instance_id;
   const pendingKey = action === 'create' ? runtimeData.pending_create_key
@@ -826,8 +844,9 @@ async function submitAction(button, action, targetInstanceId = null, savedOperat
     const payload = { action, idempotency_key: key, settings_revision: requestRevision };
     if (['purge', 'restore'].includes(action)) payload.instance_id = targetInstanceId || runtimeData.instance_id;
     const data = await request('/actions', 'POST', payload);
-    if (epoch !== identityEpoch) return;
+    if (epoch !== identityEpoch || pageEpoch !== actionPageEpoch) return;
     renderRuntime(data);
+    modelUpdates.begin().apply({ model: data.runtime?.model, gateway: data.runtime?.gateway });
     void refreshControlUiStatus(epoch);
     // Failed/ambiguous requests retain the same key so a retry cannot duplicate effects.
     if (data.operation?.status === 'succeeded' || data.operation?.status === 'completed') {
@@ -835,7 +854,8 @@ async function submitAction(button, action, targetInstanceId = null, savedOperat
     }
     notice('saved', 'Ответ supervisor получен. Состояние контейнера показано справа.');
   } catch (error) {
-    if (epoch === identityEpoch) {
+    if (epoch === identityEpoch && pageEpoch === actionPageEpoch) {
+      modelUpdates.begin().fail();
       if (error.body?.detail?.code === 'instance_retired') {
         operationSet(storageKey, null);
         notice('error', 'Операция относится к удалённому экземпляру. Обновите состояние и повторите действие.');
@@ -843,9 +863,11 @@ async function submitAction(button, action, targetInstanceId = null, savedOperat
         showError(error);
         if (error.status === 503) {
           try {
+            const latestUpdate = modelUpdates.begin();
             const latest = await request();
             if (epoch === identityEpoch) {
               renderRuntime(latest);
+              latestUpdate.apply({ model: latest.runtime?.model, gateway: latest.runtime?.gateway });
               void refreshControlUiStatus(epoch);
             }
           } catch { /* Keep the original operation error visible if refresh also fails. */ }
@@ -869,15 +891,17 @@ $('refresh-pairing').addEventListener('click', () => refreshControlUiPairing());
 $('refresh-runtime').addEventListener('click', async () => {
   if (!authenticated || busy) return;
   const epoch = identityEpoch;
+  const modelUpdate = modelUpdates.begin();
   busy = true;
   controls();
   try {
     const data = await request();
     if (epoch === identityEpoch) {
       renderRuntime(data);
+      modelUpdate.apply({ model: data.runtime?.model, gateway: data.runtime?.gateway });
       await refreshControlUiStatus(epoch);
     }
-  } catch (error) { if (epoch === identityEpoch) { invalidateModel(); showError(error); } }
+  } catch (error) { if (epoch === identityEpoch) { modelUpdate.fail(); showError(error); } }
   finally { busy = false; controls(); }
 });
 $('reload').addEventListener('click', load);
@@ -885,8 +909,8 @@ $('refresh-events').addEventListener('click', loadEvents);
 window.addEventListener('beforeunload', (event) => {
   if (dirty) { event.preventDefault(); event.returnValue = ''; }
 });
-window.addEventListener('pagehide', () => readinessPoll.stop());
-window.addEventListener('pageshow', invalidateModel);
+window.addEventListener('pagehide', () => { pageEpoch += 1; pageVisible = false; readinessPoll.stop(); invalidateModel(); });
+window.addEventListener('pageshow', () => { pageVisible = true; if (authenticated) { invalidateModel(); readinessPoll.start(); } });
 window.addEventListener('storage', (event) => {
   if (event.key === 'token' || event.key === null) {
     revoke();

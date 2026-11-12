@@ -219,7 +219,7 @@ def write_ollama_route_receipt(state_dir, agent_pool, frontend_pool,
     receipt = build_ollama_route_receipt(
         host_digest, agent_pool, frontend_pool, ollama_network_pool,
         endpoint_ip, egress_interface)
-    payload = (json.dumps(receipt, sort_keys=True, separators=(',', ':')) + '\\n').encode('utf-8')
+    payload = (json.dumps(receipt, sort_keys=True, separators=(',', ':')) + '\n').encode('utf-8')
     directory_fd = _open_state_directory(state_dir, create=True)
     temporary = '.ollama-route-acceptance-' + secrets.token_hex(8) + '.tmp'
     file_fd = None
