@@ -16,3 +16,5 @@ node_modules/
 .coverage
 htmlcov/
 .DS_Store
+# Private GPU-server inventory; local only, never commit host-specific data.
+/docs/GPU_SERVER_PRIVATE.md
