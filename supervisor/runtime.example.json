@@ -11,5 +11,6 @@
   "network_profile_default": "legacy_none",
   "control_ui_domain": null,
   "agent_network_pool": null,
-  "frontend_network_pool": null
+  "frontend_network_pool": null,
+  "ollama": null
 }

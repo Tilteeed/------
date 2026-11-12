@@ -90,6 +90,63 @@ class ServiceConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_service_config(path)
 
+    def test_ollama_policy_is_optional_and_closed(self):
+        from supervisor.service import load_service_config
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'runtime.json'
+            data = self.config()
+            path.write_text(json.dumps(data), encoding='utf-8')
+            disabled = load_service_config(path)
+            self.assertIn('ollama', disabled)
+            self.assertIsNone(disabled['ollama'])
+
+            policy = {
+                'base_url': 'http://10.99.0.10:11434',
+                'default_model_id': 'qwen3.5:9b',
+                'context_tokens': 8192,
+                'max_tokens': 512,  # Synthetic test cap, not a production decision.
+                'think': False,
+            }
+            data['ollama'] = policy
+            path.write_text(json.dumps(data), encoding='utf-8')
+            enabled = load_service_config(path)
+            self.assertEqual(enabled['ollama'], policy)
+            higher_context = policy | {'context_tokens': 16384, 'max_tokens': 1024}
+            data['ollama'] = higher_context
+            path.write_text(json.dumps(data), encoding='utf-8')
+            self.assertEqual(load_service_config(path)['ollama'], higher_context)
+
+            for invalid in (
+                policy | {'model_id': 'unapproved/model'},
+                policy | {'base_url': 'http://127.0.0.1:11434'},
+                policy | {'base_url': 'http://192.0.2.10:11434'},
+                policy | {'context_tokens': True},
+                policy | {'context_tokens': 32768},
+                policy | {'max_tokens': 8193},
+                policy | {'think': 0},
+            ):
+                data['ollama'] = invalid
+                path.write_text(json.dumps(data), encoding='utf-8')
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    load_service_config(path)
+
+
+class OllamaAdminConfigTests(unittest.TestCase):
+    def test_site_policy_requires_all_values_and_is_disabled_when_unset(self):
+        from scripts.configure_supervisor import build_ollama_policy
+        self.assertIsNone(build_ollama_policy(None, None, None, 8192, False))
+        with self.assertRaises(ValueError):
+            build_ollama_policy('http://10.99.0.10:11434', None, None, 8192, False)
+        config = build_ollama_policy(
+            'http://10.99.0.10:11434', 'qwen3.5:9b', 512, 8192, False)
+        self.assertEqual(config, {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b',
+            'context_tokens': 8192,
+            'max_tokens': 512,
+            'think': False,
+        })
+
 
 class ProfileTests(unittest.TestCase):
     def test_explicit_site_profile_becomes_immutable_snapshot(self):

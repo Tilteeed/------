@@ -102,9 +102,18 @@ class ServiceWorkflowSmoke(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
             store = stack.enter_context(closing(RuntimeStore(Path(tmp) / 'runtime.sqlite3', profile.profile_version, fingerprint)))
             volumes, engine = Volumes(), Engine()
+            ollama_policy = {
+                'base_url': 'http://10.99.0.10:11434',
+                'default_model_id': 'qwen3.5:9b',
+                'context_tokens': 8192,
+                'max_tokens': 512,  # Synthetic test cap, not a production decision.
+                'think': False,
+            }
+            initialized = []
             service = RuntimeService(profile, store, volumes, engine, Metrics(),
                                      capacities=(10**14, 1000000, 10**14), disk_floor_bytes=0,
-                                     clock=lambda: 100, initialize=lambda *args: None)
+                                     clock=lambda: 100, initialize=lambda *args: initialized.append(args),
+                                     ollama_config=ollama_policy)
             payload = dict(actor_id='alice', action='create', idempotency_key='key',
                            settings_revision=0, settings=dict(name='Agent', instructions='Hello'))
             with self.assertRaises(ServiceError):
@@ -117,6 +126,7 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             self.assertEqual(result['runtime']['instance_id'], instance_id)
             self.assertEqual(result['runtime']['network_profile'], 'legacy_none')
             self.assertEqual(engine.network_profiles[-1], 'legacy_none')
+            self.assertEqual(initialized[0][2], ollama_policy)
             engine.network_profiles[-1] = 'agent_internal_v1'
             with self.assertRaises(ServiceError):
                 service.me({'actor_id': 'alice'})

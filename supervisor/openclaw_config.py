@@ -3,6 +3,8 @@ import ipaddress
 import re
 from urllib.parse import urlsplit
 
+from .ollama_config import build_openclaw_ollama_config
+
 
 _OWNER_RE = re.compile(r"[^\x00-\x20\x7f]{1,256}\Z")
 _INSTANCE_RE = re.compile(r'[0-9a-f]{32}\Z')
@@ -40,8 +42,14 @@ def _validate_proxy_ip(value):
     return str(address)
 
 
-def build_gateway_config(instance):
-    """Build only a supported auth profile; never mix proxy auth with a token."""
+def _with_ollama(config, ollama):
+    if ollama is None:
+        return config
+    return {**config, **build_openclaw_ollama_config(ollama)}
+
+
+def build_gateway_config(instance, *, ollama=None):
+    """Build a supported auth profile and optional trusted native model policy."""
     if type(instance) is not dict:
         raise ValueError('Invalid Gateway instance')
     profile = instance.get('network_profile', 'legacy_none')
@@ -55,7 +63,7 @@ def build_gateway_config(instance):
             'controlUi': {'allowedOrigins': [
                 'http://localhost:18789', 'http://127.0.0.1:18789']},
         })
-        return {'gateway': gateway}
+        return _with_ollama({'gateway': gateway}, ollama)
     if profile != 'agent_proxy_v1':
         raise ValueError('Unsupported Gateway network profile')
     instance_id = instance.get('id')
@@ -85,7 +93,7 @@ def build_gateway_config(instance):
             },
         },
     })
-    return {
+    return _with_ollama({
         'gateway': gateway,
         'plugins': {'entries': {'admin-http-rpc': {'enabled': True}}},
-    }
+    }, ollama)

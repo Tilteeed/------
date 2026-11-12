@@ -29,6 +29,7 @@ from urllib.parse import quote
 from .config import load_profile, _unique_object, _reject_constant
 from .metrics import HostMetrics, MetricsUnavailable
 from .openclaw_config import build_gateway_config
+from .ollama_config import validate_ollama_config
 from .policy import evaluate_admission
 from .runtime_store import RuntimeStore, StoreError, canonical
 from .workspace_files import RetainedWorkspace, WorkspaceFileError
@@ -183,7 +184,7 @@ def _initial_file(parent_fd, name, data):
         os.close(fd)
 
 
-def initialize_files(instance, evidence):
+def initialize_files(instance, evidence, ollama_config=None):
     """Fixed filenames only. Existing initialized agent files are never overwritten."""
     root_fd = os.open(evidence['host_path'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     state_fd = workspace_fd = None
@@ -192,7 +193,7 @@ def initialize_files(instance, evidence):
         # Per-agent profile config trusts one exact sidecar IP and one owner;
         # the legacy/internal profiles retain token auth until explicit migration.
         try:
-            config = build_gateway_config(instance)
+            config = build_gateway_config(instance, ollama=ollama_config)
         except ValueError:
             raise ServiceError('unsafe_initialization', 503) from None
         _initial_file(state_fd, 'openclaw.json', (canonical(config) + '\n').encode('utf-8'))
@@ -224,7 +225,7 @@ class RuntimeService:
                  disk_floor_bytes, clock=time.monotonic, initialize=initialize_files,
                  network_profile_default=RuntimeStore.NETWORK_PROFILE_LEGACY,
                  control_ui_domain=None, agent_network_pool=None,
-                 frontend_network_pool=None):
+                 frontend_network_pool=None, ollama_config=None):
         fingerprint = hashlib.sha256(canonical(asdict(profile)).encode('ascii')).hexdigest()
         if (store.profile_version, store.profile_hash) != (profile.profile_version, fingerprint):
             raise StoreError('profile_drift')
@@ -255,6 +256,8 @@ class RuntimeService:
         self.control_ui_domain = control_ui_domain
         self.agent_network_pool = agent_network_pool
         self.frontend_network_pool = frontend_network_pool
+        self.ollama_config = (None if ollama_config is None else
+                              asdict(validate_ollama_config(ollama_config)))
         self.lock = threading.RLock()
         self.sidecar_migration: Any = None
 
@@ -555,7 +558,7 @@ class RuntimeService:
                         instance, action=action,
                         host_path=evidence.get('host_path') if evidence else None)
                     if not instance['initialized']:
-                        self.initialize(prepared_instance, evidence)
+                        self.initialize(prepared_instance, evidence, self.ollama_config)
                         self.store.initialized(instance_id)
                     # Re-observe AFTER real quota verification. Intent is not a permit.
                     self._admit(quota=evidence['disk_quota_verified'],
@@ -736,7 +739,7 @@ class RuntimeService:
         enriched = dict(instance)
         enriched.update(resolved)
         try:
-            build_gateway_config(enriched)
+            build_gateway_config(enriched, ollama=getattr(self, 'ollama_config', None))
         except Exception:
             raise ServiceError('runtime_unavailable', 503) from None
         return enriched
@@ -896,7 +899,8 @@ class RuntimeApplication(RuntimeService):
                              'network_profile_default', RuntimeStore.NETWORK_PROFILE_LEGACY),
                          control_ui_domain=config.get('control_ui_domain'),
                          agent_network_pool=config.get('agent_network_pool'),
-                         frontend_network_pool=config.get('frontend_network_pool'))
+                         frontend_network_pool=config.get('frontend_network_pool'),
+                         ollama_config=config.get('ollama'))
 
     def close(self):
         if hasattr(self.metrics, 'close'):
@@ -910,6 +914,11 @@ CONFIG_KEYS = BASE_CONFIG_KEYS | {'network_profile_default'}
 CONFIG_KEYS_WITH_DOMAIN = CONFIG_KEYS | {'control_ui_domain'}
 CONFIG_KEYS_WITH_NETWORKS = CONFIG_KEYS | {
     'control_ui_domain', 'agent_network_pool', 'frontend_network_pool'}
+CONFIG_KEY_SETS = (
+    BASE_CONFIG_KEYS, CONFIG_KEYS, CONFIG_KEYS_WITH_DOMAIN, CONFIG_KEYS_WITH_NETWORKS,
+    BASE_CONFIG_KEYS | {'ollama'}, CONFIG_KEYS | {'ollama'},
+    CONFIG_KEYS_WITH_DOMAIN | {'ollama'}, CONFIG_KEYS_WITH_NETWORKS | {'ollama'},
+)
 _CONTROL_UI_DOMAIN_LABEL = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z')
 
 
@@ -934,14 +943,16 @@ def load_service_config(path):
     if len(blob) > 65536:
         raise ValueError('Invalid service config')
     config = decode_json(blob)
-    allowed_keys = (BASE_CONFIG_KEYS, CONFIG_KEYS, CONFIG_KEYS_WITH_DOMAIN,
-                    CONFIG_KEYS_WITH_NETWORKS)
+    allowed_keys = CONFIG_KEY_SETS
     if type(config) is not dict or set(config) not in allowed_keys:
         raise ValueError('Invalid service config')
     config.setdefault('network_profile_default', RuntimeStore.NETWORK_PROFILE_LEGACY)
     config.setdefault('control_ui_domain', None)
     config.setdefault('agent_network_pool', None)
     config.setdefault('frontend_network_pool', None)
+    config.setdefault('ollama', None)
+    if config['ollama'] is not None:
+        config['ollama'] = asdict(validate_ollama_config(config['ollama']))
     if (type(config['network_profile_default']) is not str
             or config['network_profile_default'] not in RuntimeStore.NETWORK_PROFILES):
         raise ValueError('Invalid default network profile')
@@ -1258,7 +1269,8 @@ def serve(config):
                                     network_profile_default=config['network_profile_default'],
                                     control_ui_domain=config['control_ui_domain'],
                                     agent_network_pool=config['agent_network_pool'],
-                                    frontend_network_pool=config['frontend_network_pool'])
+                                    frontend_network_pool=config['frontend_network_pool'],
+                                    ollama_config=config.get('ollama'))
         if type(config.get('control_ui_domain')) is str:
             from .control_ui_migration import ControlUiSidecarMigration
             controller.sidecar_migration = ControlUiSidecarMigration(

@@ -80,6 +80,60 @@ class GatewayConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_gateway_config(self.instance('legacy_shared'))
 
+    def test_proxy_profile_emits_explicit_native_ollama_models_and_default(self):
+        instance = self.instance()
+        instance.update({
+            'sidecar_ip': '172.31.4.2',
+            'control_ui_origin': 'https://' + 'a' * 32 + '.agents.example.test',
+        })
+        # Synthetic provider policy; values are not deployment defaults.
+        ollama = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b',
+            'context_tokens': 8192,
+            'max_tokens': 512,
+            'think': False,
+        }
+        built = build_gateway_config(instance, ollama=ollama)
+        provider = built['models']['providers']['ollama']
+        self.assertEqual(provider['api'], 'ollama')
+        self.assertEqual(provider['baseUrl'], ollama['base_url'])
+        models = provider['models']
+        self.assertEqual([model['id'] for model in models], ['qwen3.5:9b'])
+        self.assertEqual(built['agents']['defaults']['model']['primary'], 'ollama/qwen3.5:9b')
+        self.assertEqual(models[0]['contextWindow'], 8192)
+        self.assertEqual(models[0]['maxTokens'], 512)
+        self.assertEqual(models[0]['params'], {'num_ctx': 8192, 'think': False})
+
+    def test_admin_can_select_each_approved_model_without_exposing_the_other(self):
+        instance = self.instance()
+        instance.update({
+            'sidecar_ip': '172.31.4.2',
+            'control_ui_origin': 'https://' + 'a' * 32 + '.agents.example.test',
+        })
+        approved = (
+            'qwen3.5:9b',
+            'hf.co/DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF:Q4_K_M',
+        )
+        for model_id in approved:
+            policy = {
+                'base_url': 'http://10.99.0.10:11434',
+                'default_model_id': model_id,
+                'context_tokens': 8192,
+                'max_tokens': 512,
+                'think': False,
+            }
+            with self.subTest(model_id=model_id):
+                built = build_gateway_config(instance, ollama=policy)
+                self.assertEqual(
+                    [item['id'] for item in built['models']['providers']['ollama']['models']],
+                    [model_id],
+                )
+                self.assertEqual(
+                    built['agents']['defaults']['model']['primary'], 'ollama/' + model_id)
+                self.assertEqual(
+                    built['models']['providers']['ollama']['models'][0]['id'], model_id)
+
 
 if __name__ == '__main__':
     unittest.main()

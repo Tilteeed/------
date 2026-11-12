@@ -19,6 +19,7 @@ from supervisor.config import load_profile
 from supervisor.firewall_acceptance import (
     build_firewall_acceptance_receipt, load_firewall_acceptance_receipt,
 )
+from supervisor.ollama_config import MODEL_NAMES, validate_ollama_config
 from supervisor.runtime_store import RuntimeStore
 from supervisor.probes import ProbeFailure, run_command
 
@@ -28,6 +29,24 @@ def amount(value):
     if not 0 <= number <= 2**63 - 1:
         raise argparse.ArgumentTypeError('Expected non-negative int64')
     return number
+
+
+def build_ollama_policy(base_url, default_model_id, max_tokens,
+                        context_tokens=8192, think=False):
+    """Build an optional trusted model policy; no endpoint means LLM stays disabled."""
+    if (base_url is None and default_model_id is None and max_tokens is None
+            and context_tokens == 8192 and think is False):
+        return None
+    if base_url is None or default_model_id is None or max_tokens is None:
+        raise ValueError('Ollama URL, admin-selected model and max tokens are required together')
+    policy = {
+        'base_url': base_url,
+        'default_model_id': default_model_id,
+        'context_tokens': context_tokens,
+        'max_tokens': max_tokens,
+        'think': think,
+    }
+    return asdict(validate_ollama_config(policy))
 
 
 def validate_network_activation(profile, domain, agent_pool, frontend_pool, state_dir):
@@ -62,12 +81,25 @@ def main(argv=None):
                         default=RuntimeStore.NETWORK_PROFILE_LEGACY)
     parser.add_argument('--agent-network-pool', default=None)
     parser.add_argument('--frontend-network-pool', default=None)
+    parser.add_argument('--ollama-api-url', default=None,
+                        help='Private IPv4 Ollama API address; enables the native provider')
+    parser.add_argument('--ollama-default-model-id', choices=sorted(MODEL_NAMES), default=None,
+                        help='Operator-selected default from the fixed approved model catalog')
+    parser.add_argument('--ollama-context-tokens', type=amount, default=8192)
+    parser.add_argument('--ollama-max-tokens', type=amount, default=None)
+    parser.add_argument('--ollama-think', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--state-dir', default='/var/lib/personal-agent-supervisor')
     parser.add_argument('--socket-path', default='/run/personal-agent-supervisor/control.sock')
     parser.add_argument('--prepare-host-config', action='store_true')
     args = parser.parse_args(argv)
     if sys.platform != 'linux' or not args.prepare_host_config or os.geteuid() != 0:
         parser.error('Explicit --prepare-host-config, Linux and root required')
+    try:
+        ollama_policy = build_ollama_policy(
+            args.ollama_api_url, args.ollama_default_model_id,
+            args.ollama_max_tokens, args.ollama_context_tokens, args.ollama_think)
+    except ValueError as error:
+        parser.error(str(error))
     if args.control_ui_domain is not None:
         labels = args.control_ui_domain.split('.')
         label_re = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z')
@@ -153,6 +185,7 @@ def main(argv=None):
             'control_ui_domain': args.control_ui_domain,
             'agent_network_pool': args.agent_network_pool,
             'frontend_network_pool': args.frontend_network_pool,
+            'ollama': ollama_policy,
         }
         descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(descriptor, 'w', encoding='utf-8') as target:
