@@ -3256,6 +3256,19 @@ class DockerEngine:
         except Exception:
             return None
 
+    def assert_purge_runtime_absent(self, instance_id):
+        """Prove both managed containers absent at this instant.
+
+        The caller must hold the shared lifecycle serialization lock through this
+        check and the entire storage purge; external Docker mutation is excluded.
+        An observation error or either container's presence blocks deletion.
+        """
+        self._instance(instance_id)
+        gateway = self._find(instance_id)
+        sidecar = self._find_proxy_sidecar(instance_id)
+        if gateway is not None or sidecar is not None:
+            raise DockerEngineError('Runtime containers must be absent before purge')
+
     def inspect(self, instance_id):
         self._instance(instance_id)
         observed = self._find(instance_id)
@@ -3620,6 +3633,29 @@ class DockerEngine:
             except Exception:
                 clean = False
         return clean
+
+    def start_bound(self, instance_id, expected_container_id):
+        """Start only the verified Docker object, never a replacement by name.
+
+        Proxy startup requires identity binding of both containers and its cleanup;
+        until that is available this entry point deliberately refuses it.
+        """
+        instance_id = self._instance(instance_id)
+        expected_container_id = self._object(expected_container_id)
+        observed = self._find(instance_id)
+        if observed is None or self._verify(instance_id, observed) != expected_container_id:
+            raise DockerEngineError('Managed container identity changed')
+        try:
+            spec = json.loads(observed['Config']['Labels'][self.SPEC_LABEL])
+        except Exception:
+            raise DockerEngineError('Managed container configuration verification failed') from None
+        if type(spec) is not dict or spec.get('version') != 1:
+            raise DockerEngineError('Identity-bound start is not supported for this profile')
+        self._request('POST', f'/containers/{expected_container_id}/start', ok=(204, 304))
+        state = self.inspect(instance_id)
+        if state.get('container_id') != expected_container_id or state.get('state') != 'running':
+            raise DockerEngineError('Managed container action could not be verified')
+        return state
 
     def start(self, instance_id):
         instance_id = self._instance(instance_id)
