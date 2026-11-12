@@ -1,9 +1,12 @@
-# Ollama route acceptance: blocked
+# Ollama route acceptance: real execution pending
 
-No Ollama route acceptance command or receipt is supplied by this change. The
-existing proxy acceptance scripts test a different policy and are not evidence
-that the Ollama route policy works. Synthetic fixtures are not packet-level
-acceptance.
+Opt-in runnable namespace/Docker checks and the receipt orchestrator are now
+supplied. See [OLLAMA_ROUTE_ACCEPTANCE.md](OLLAMA_ROUTE_ACCEPTANCE.md) for the
+operator command, safety boundaries, portable results and production readback
+blocker. **Real Linux/Docker acceptance has not been run and no receipt has been
+produced.** The requirements below remain acceptance criteria, not evidence.
+Existing proxy acceptance scripts test a different policy; synthetic fixtures
+are not packet-level acceptance.
 
 ## Receipt serialization
 

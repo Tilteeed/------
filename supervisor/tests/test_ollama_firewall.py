@@ -79,6 +79,31 @@ class OllamaFirewallPolicyTests(unittest.TestCase):
         self.assertTrue(any('bridge input deny' in item['comment'] for item in bridge_rules))
         self.assertTrue(any('bridge egress deny' in item['comment'] for item in bridge_rules))
 
+    def test_canonical_manifest_matches_adapter_chain_order_without_reordering_a_chain(self):
+        # Synthetic nft JSON shape, not a kernel capture or live acceptance.
+        import json
+        from supervisor.firewall import NftablesAdapter
+        from supervisor.ollama_firewall import TABLE_NAME, TABLE_COMMENT, expected_ollama_ruleset
+        adapter = NftablesAdapter(table_name=TABLE_NAME, table_comment=TABLE_COMMENT)
+        desired = expected_ollama_ruleset((route(), route('b'*32, '10.98.0.8/29')))
+        for family, table in desired['tables'].items():
+            raw = {'nftables': [{'table': {**table['table'], 'handle': 1}},
+                *({'chain': {**chain, 'handle': index + 2}}
+                  for index, chain in enumerate(table['chains'])),
+                *({'rule': {**rule, 'handle': index + 20}}
+                  for index, rule in enumerate(table['rules']))]}
+            normalized, handle = adapter._normalise_table(json.dumps(raw), family)
+            self.assertEqual(handle, 1)
+            self.assertEqual(normalized['tables'][family], table)
+            for chain in table['chains']:
+                rules = [r for r in table['rules'] if r['chain'] == chain['name']]
+                denied = False
+                for rule in rules:
+                    if 'drop' in rule['expr'][-1]:
+                        denied = True
+                    elif 'accept' in rule['expr'][-1]:
+                        self.assertFalse(denied, 'Stable chain grouping must preserve allow-before-deny')
+
     def test_ollama_ruleset_uses_separate_owned_table_and_renders_tcp_scope(self):
         from supervisor.firewall import NftablesAdapter
         from supervisor.ollama_firewall import (

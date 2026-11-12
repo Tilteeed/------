@@ -3110,7 +3110,7 @@ class DockerEngine:
             raise DockerEngineError('Managed container creation could not be verified')
         return self._verify(instance_id, existing, spec, token)
 
-    def control_ui_target(self, instance_id, owner_id):
+    def control_ui_target(self, instance_id, owner_id, *, read_only=False):
         """Resolve an owner-bound private sidecar only after all live checks pass."""
         try:
             instance_id = self._instance(instance_id)
@@ -3171,9 +3171,13 @@ class DockerEngine:
                 plan=plan, image_info=web['image_info'])
             sidecar_id = self._verify_proxy_sidecar(
                 instance_id, sidecar, expected_sidecar, plan, network_ids)
-            web_after_connect = self._ensure_container_network(
-                web['container_id'], network_ids['frontend'],
-                plan['frontend']['name'], plan['frontend']['web_ip'])
+            if read_only:
+                web_after_connect = self._request(
+                    'GET', '/containers/' + self._object(web['container_id']) + '/json')
+            else:
+                web_after_connect = self._ensure_container_network(
+                    web['container_id'], network_ids['frontend'],
+                    plan['frontend']['name'], plan['frontend']['web_ip'])
             if type(web_after_connect) is not dict or web_after_connect.get('Id') != web['container_id']:
                 return None
             web_settings = web_after_connect.get('NetworkSettings')
@@ -3269,9 +3273,23 @@ class DockerEngine:
         if gateway is not None or sidecar is not None:
             raise DockerEngineError('Runtime containers must be absent before purge')
 
-    def inspect(self, instance_id):
+    def inspect(self, instance_id, *, read_only=False,
+                expected_container_id=None, expected_sidecar_id=None):
         self._instance(instance_id)
+        if expected_container_id is not None:
+            expected_container_id = self._object(expected_container_id)
+        if expected_sidecar_id is not None:
+            expected_sidecar_id = self._object(expected_sidecar_id)
+        if not read_only and (expected_container_id is not None or expected_sidecar_id is not None):
+            raise DockerEngineError('Bound observation must be read-only')
         observed = self._find(instance_id)
+        if expected_container_id is not None and (
+                observed is None or observed.get('Id') != expected_container_id):
+            raise DockerEngineError('Managed container identity changed during observation')
+        if expected_sidecar_id is not None:
+            sidecar = self._find_proxy_sidecar(instance_id)
+            if sidecar is None or sidecar.get('Id') != expected_sidecar_id:
+                raise DockerEngineError('Sidecar identity changed during observation')
         if observed is None:
             return {'state': 'absent', 'gateway': 'unknown', 'container_id': None}
         try:
@@ -3286,7 +3304,7 @@ class DockerEngine:
                                  and docker_status in {'running', 'paused', 'restarting'})
             except Exception:
                 is_live_proxy = False
-            if is_live_proxy and not self._stop_proxy_containers(instance_id):
+            if not read_only and is_live_proxy and not self._stop_proxy_containers(instance_id):
                 raise DockerEngineError(
                     'Proxy verification failed and container stop could not be verified') from None
             raise
@@ -3317,8 +3335,19 @@ class DockerEngine:
                   'config_policy_version': config_policy_version}
         if spec_version == 3:
             spec = json.loads(observed['Config']['Labels'][self.SPEC_LABEL])
-            target = self.control_ui_target(instance_id, spec['owner_id'])
-            if target is None and state == 'running' and not self._proxy_firewall_ready(instance_id, spec):
+            if read_only:
+                target = self.control_ui_target(instance_id, spec['owner_id'], read_only=True)
+                isolation_ready = self._proxy_firewall_ready(
+                    instance_id, spec, read_only=True,
+                    expected_gateway_id=expected_container_id,
+                    expected_sidecar_id=expected_sidecar_id)
+                if not isolation_ready and state in {'running', 'paused', 'restarting'}:
+                    raise DockerEngineError('Read-only observation found proxy isolation drift')
+            else:
+                target = self.control_ui_target(instance_id, spec['owner_id'])
+                isolation_ready = (target is not None or state != 'running'
+                                   or self._proxy_firewall_ready(instance_id, spec))
+            if target is None and state == 'running' and not isolation_ready:
                 if not self._stop_proxy_containers(instance_id):
                     raise DockerEngineError(
                         'Proxy isolation drift detected and container stop could not be verified')
@@ -3357,6 +3386,8 @@ class DockerEngine:
                 route_ready = False
             result['ollama_route_state'] = 'ready' if route_ready else 'not_ready'
             if not route_ready and state in {'running', 'paused', 'restarting'}:
+                if read_only:
+                    raise DockerEngineError('Read-only observation found Ollama route drift')
                 if not self._stop_proxy_containers(instance_id):
                     raise DockerEngineError(
                         'Ollama route drift detected and Gateway stop could not be verified')
@@ -3458,7 +3489,9 @@ class DockerEngine:
                 raise DockerEngineError('Frontend network endpoint address changed')
         return web_id in members
 
-    def _proxy_firewall_ready(self, instance_id, gateway_spec):
+    def _proxy_firewall_ready(self, instance_id, gateway_spec, *,
+                              expected_gateway_id=None, expected_sidecar_id=None,
+                              read_only=False):
         ready = getattr(self.firewall, 'ready', None)
         if not callable(ready):
             return False
@@ -3467,6 +3500,9 @@ class DockerEngine:
             if type(gateway_spec) is not dict or gateway_spec.get('version') != 3:
                 return False
             gateway = self._find(instance_id)
+            if expected_gateway_id is not None and (
+                    gateway is None or gateway.get('Id') != expected_gateway_id):
+                return False
             if gateway is None or self._verify(instance_id, gateway) is None:
                 return False
             gateway_labels = gateway.get('Config', {}).get('Labels', {})
@@ -3475,6 +3511,8 @@ class DockerEngine:
                 return False
             sidecar = self._find_proxy_sidecar(instance_id)
             if sidecar is None:
+                return False
+            if expected_sidecar_id is not None and sidecar.get('Id') != expected_sidecar_id:
                 return False
             labels = sidecar.get('Config', {}).get('Labels', {})
             sidecar_spec = json.loads(labels[self.SIDECAR_SPEC_LABEL])
@@ -3515,9 +3553,13 @@ class DockerEngine:
                 plan=plan, image_info=sidecar_image_info)
             sidecar_id = self._verify_proxy_sidecar(
                 instance_id, sidecar, expected_sidecar, plan, network_ids)
-            web_after_connect = self._ensure_container_network(
-                web['container_id'], network_ids['frontend'],
-                plan['frontend']['name'], plan['frontend']['web_ip'])
+            if read_only:
+                web_after_connect = self._request(
+                    'GET', '/containers/' + self._object(web['container_id']) + '/json')
+            else:
+                web_after_connect = self._ensure_container_network(
+                    web['container_id'], network_ids['frontend'],
+                    plan['frontend']['name'], plan['frontend']['web_ip'])
             if type(web_after_connect) is not dict or web_after_connect.get('Id') != web['container_id']:
                 return False
             web_settings = web_after_connect.get('NetworkSettings')
@@ -3634,14 +3676,101 @@ class DockerEngine:
                 clean = False
         return clean
 
-    def start_bound(self, instance_id, expected_container_id):
-        """Start only the verified Docker object, never a replacement by name.
+    def stop_bound(self, expected_container_id, expected_sidecar_id=None):
+        """Contain captured full IDs only; true means every stop was read back.
 
-        Proxy startup requires identity binding of both containers and its cleanup;
-        until that is available this entry point deliberately refuses it.
+        Missing/unreadable objects are not assumed stopped. Attempt both IDs even
+        if one fails, and never resolve an instance name during cleanup.
         """
+        gateway_id = self._object(expected_container_id)
+        sidecar_id = (self._object(expected_sidecar_id)
+                      if expected_sidecar_id is not None else None)
+        identities = [sidecar_id, gateway_id] if sidecar_id is not None else [gateway_id]
+        clean = True
+        for container_id in dict.fromkeys(identities):
+            try:
+                observed = self._request('GET', f'/containers/{container_id}/json')
+                if type(observed) is not dict or observed.get('Id') != container_id:
+                    raise DockerEngineError('Captured container identity changed')
+                status = self._container_status(observed)
+                if status not in {'created', 'exited', 'dead'}:
+                    if status == 'paused':
+                        self._request('POST', f'/containers/{container_id}/unpause', ok=(204,))
+                    self._request('POST', f'/containers/{container_id}/stop?t=10', ok=(204, 304))
+                latest = self._request('GET', f'/containers/{container_id}/json')
+                if (type(latest) is not dict or latest.get('Id') != container_id
+                        or self._container_status(latest) not in {'created', 'exited', 'dead'}):
+                    clean = False
+            except Exception:
+                clean = False
+        return clean
+
+    def _verified_bound_proxy(self, instance_id, gateway_id, sidecar_id, statuses):
+        """Verify the captured pair without provisioning or by-name containment."""
+        gateway = self._request('GET', f'/containers/{gateway_id}/json')
+        sidecar = self._request('GET', f'/containers/{sidecar_id}/json')
+        if (type(gateway) is not dict or gateway.get('Id') != gateway_id
+                or type(sidecar) is not dict or sidecar.get('Id') != sidecar_id
+                or gateway_id == sidecar_id):
+            raise DockerEngineError('Recovery pair identity changed')
+        if (self._container_status(gateway) not in statuses
+                or self._container_status(sidecar) not in statuses):
+            raise DockerEngineError('Recovery pair lifecycle state is invalid')
+        if self._verify(instance_id, gateway) != gateway_id:
+            raise DockerEngineError('Managed container identity changed')
+        spec = json.loads(gateway['Config']['Labels'][self.SPEC_LABEL])
+        if not self._proxy_firewall_ready(
+                instance_id, spec, expected_gateway_id=gateway_id,
+                expected_sidecar_id=sidecar_id, read_only=True):
+            raise DockerEngineError('Recovery proxy isolation verification failed')
+        if self.ollama_config is not None:
+            manager = self.ollama_firewall
+            ready = getattr(manager, 'ready', None)
+            if (getattr(manager, 'can_apply', False) is not True or not callable(ready)
+                    or spec.get('config_policy_version') != 1):
+                raise DockerEngineError('Recovery Ollama route is not authorized')
+            self._verify_ollama_network_attachment(instance_id, gateway_id, gateway)
+            policies = self.ollama_route_policies()
+            if (not any(item.instance_id == instance_id for item in policies)
+                    or ready(policies) is not True):
+                raise DockerEngineError('Recovery Ollama route firewall is not ready')
+        latest_gateway = self._find(instance_id)
+        latest_sidecar = self._find_proxy_sidecar(instance_id)
+        if (latest_gateway is None or latest_gateway.get('Id') != gateway_id
+                or latest_sidecar is None or latest_sidecar.get('Id') != sidecar_id
+                or self._container_status(latest_gateway) not in statuses
+                or self._container_status(latest_sidecar) not in statuses):
+            raise DockerEngineError('Recovery pair identity or lifecycle state changed')
+        return latest_gateway, latest_sidecar, spec
+
+    def recovery_identity(self, instance_id):
+        """Capture an existing, verified stopped object; never provision resources."""
+        instance_id = self._instance(instance_id)
+        observed = self._find(instance_id)
+        if observed is None:
+            raise DockerEngineError('Managed container is absent')
+        gateway_id = self._verify(instance_id, observed)
+        if self._container_status(observed) not in {'created', 'exited'}:
+            raise DockerEngineError('Recovery requires a stopped managed container')
+        spec = json.loads(observed['Config']['Labels'][self.SPEC_LABEL])
+        if type(spec) is not dict or spec.get('version') not in (1, 3):
+            raise DockerEngineError('Recovery is not supported for this profile')
+        sidecar_id = None
+        if spec['version'] == 3:
+            sidecar = self._find_proxy_sidecar(instance_id)
+            if sidecar is None:
+                raise DockerEngineError('Proxy sidecar is absent')
+            sidecar_id = self._object(sidecar.get('Id'))
+            self._verified_bound_proxy(
+                instance_id, gateway_id, sidecar_id, {'created', 'exited'})
+        return {'gateway_id': gateway_id, 'sidecar_id': sidecar_id}
+
+    def start_bound(self, instance_id, expected_container_id, expected_sidecar_id=None):
+        """Start only captured Docker IDs after strict live isolation checks."""
         instance_id = self._instance(instance_id)
         expected_container_id = self._object(expected_container_id)
+        if expected_sidecar_id is not None:
+            expected_sidecar_id = self._object(expected_sidecar_id)
         observed = self._find(instance_id)
         if observed is None or self._verify(instance_id, observed) != expected_container_id:
             raise DockerEngineError('Managed container identity changed')
@@ -3649,10 +3778,55 @@ class DockerEngine:
             spec = json.loads(observed['Config']['Labels'][self.SPEC_LABEL])
         except Exception:
             raise DockerEngineError('Managed container configuration verification failed') from None
-        if type(spec) is not dict or spec.get('version') != 1:
+        if type(spec) is dict and spec.get('version') == 3:
+            if expected_sidecar_id is None:
+                raise DockerEngineError('Identity-bound proxy start requires both full IDs')
+            self._verified_bound_proxy(instance_id, expected_container_id,
+                                       expected_sidecar_id, {'created', 'exited'})
+            try:
+                self._request('POST', f'/containers/{expected_container_id}/start', ok=(204, 304))
+                gateway, sidecar, _ = self._verified_bound_proxy(
+                    instance_id, expected_container_id, expected_sidecar_id,
+                    {'running', 'created', 'exited'})
+                if (self._container_status(gateway) != 'running'
+                        or self._container_status(sidecar) not in {'created', 'exited'}):
+                    raise DockerEngineError('Gateway start postcondition failed')
+                self._request('POST', f'/containers/{expected_sidecar_id}/start', ok=(204, 304))
+                gateway, sidecar, spec = self._verified_bound_proxy(
+                    instance_id, expected_container_id, expected_sidecar_id, {'running'})
+                target = self.control_ui_target(instance_id, spec['owner_id'], read_only=True)
+                gateway, sidecar, spec = self._verified_bound_proxy(
+                    instance_id, expected_container_id, expected_sidecar_id, {'running'})
+                health = (gateway.get('State', {}).get('Health') or {}).get('Status')
+                sidecar_health = (sidecar.get('State', {}).get('Health') or {}).get('Status')
+                if target is None and health == 'healthy' and sidecar_health == 'healthy':
+                    raise DockerEngineError('Control UI target failed after healthy startup')
+                if target is not None:
+                    identity = target.get('identity')
+                    if (type(identity) is not dict
+                            or identity.get('gateway_id') != expected_container_id
+                            or identity.get('sidecar_id') != expected_sidecar_id):
+                        raise DockerEngineError('Control UI target identity changed')
+                result = {'state': 'running', 'container_id': expected_container_id,
+                        'gateway': 'ready' if health == 'healthy' else 'not_ready',
+                        'network_profile': self.NETWORK_PROFILE_PROXY,
+                        'config_policy_version': spec.get('config_policy_version', 0),
+                        'proxy_state': 'ready' if target is not None else 'not_ready',
+                        'proxy_identity': target['identity'] if target is not None else None}
+                if self.ollama_config is not None:
+                    result['ollama_route_state'] = 'ready'
+                return result
+            except Exception:
+                if not self.stop_bound(expected_container_id, expected_sidecar_id):
+                    raise DockerEngineError(
+                        'Identity-bound start failed and captured container stop could not be verified') from None
+                raise
+        if (type(spec) is not dict or spec.get('version') != 1
+                or expected_sidecar_id is not None):
             raise DockerEngineError('Identity-bound start is not supported for this profile')
         self._request('POST', f'/containers/{expected_container_id}/start', ok=(204, 304))
-        state = self.inspect(instance_id)
+        state = self.inspect(instance_id, read_only=True,
+                             expected_container_id=expected_container_id)
         if state.get('container_id') != expected_container_id or state.get('state') != 'running':
             raise DockerEngineError('Managed container action could not be verified')
         return state

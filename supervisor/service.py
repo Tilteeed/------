@@ -45,6 +45,7 @@ from .workspace_files import RetainedWorkspace, WorkspaceFileError
 
 
 class ServiceError(Exception):
+    admission_reasons: tuple[str, ...] = ()
     def __init__(self, code, status=409):
         self.code, self.status = code, status
         super().__init__(code)
@@ -336,6 +337,10 @@ class RuntimeService:
                                   'default_model_id': selected_model}
         self.model_status_cache = CachedModelStatus(model_status)
         self.lock = threading.RLock()
+        self._boot_candidates = {}
+        self._boot_initialized = False
+        self._boot_recovery_deadline = 0.0
+        self._boot_recovery_status = 'not_started'
         self.sidecar_migration: Any = None
 
     def _sample(self):
@@ -368,12 +373,20 @@ class RuntimeService:
             # This sole exception permits quota PREPARATION, never runtime execution.
             reasons.discard('disk_quota_unverified')
         if reasons:
-            raise ServiceError('admission_denied', 503)
+            error = ServiceError('admission_denied', 503)
+            error.admission_reasons = tuple(sorted(reasons))
+            raise error
         return decision
 
-    def _inspect(self, instance_id):
+    def _inspect(self, instance_id, *, read_only=False, identity=None):
         try:
-            info = self.engine.inspect(instance_id)
+            if read_only:
+                binding = identity or {'gateway_id': None, 'sidecar_id': None}
+                info = self.engine.inspect(
+                    instance_id, read_only=True, expected_container_id=binding['gateway_id'],
+                    expected_sidecar_id=binding['sidecar_id'])
+            else:
+                info = self.engine.inspect(instance_id)
             if type(info) is not dict or info.get('state') not in {
                     'absent', 'not_created', 'missing', 'created', 'running', 'stopped',
                     'exited', 'paused', 'restarting', 'dead', 'failed'}:
@@ -725,6 +738,9 @@ class RuntimeService:
                     payload, (limits.ram_bytes, limits.cpu_millicores, limits.disk_bytes),
                     self.capacities, network_profile=self.network_profile_default)
                 self.store.pending(operation['id'])
+                # Any explicit lifecycle action supersedes delayed boot intent,
+                # including an ambiguous/failed action. Never resurrect it later.
+                getattr(self, '_boot_candidates', {}).pop(operation['instance_id'], None)
                 instance = self.store.instance(operation['instance_id'])
                 instance_id, action = instance['id'], payload['action']
                 evidence = None
@@ -1031,11 +1047,13 @@ class RuntimeService:
                     'instance': instance, 'info': info, 'evidence': evidence,
                     'old_blob': old_blob, 'new_blob': new_blob,
                     'needs_update': old_blob != new_blob,
+                    'was_live': info['state'] in {'running', 'restarting', 'paused'},
                 })
 
             try:
                 for plan in plans:
                     instance, info = plan['instance'], plan['info']
+                    getattr(self, '_boot_candidates', {}).pop(instance['id'], None)
                     if instance['active'] and info['state'] in {'running', 'restarting', 'paused'}:
                         self.engine.stop(instance['id'])
                         stopped = self._inspect(instance['id'])
@@ -1117,7 +1135,8 @@ class RuntimeService:
 
             self.ollama_config = new_policy
             try:
-                self.reconcile()
+                self.reconcile(recover_ids={plan['instance']['id'] for plan in plans
+                                            if plan['was_live']})
             except Exception:
                 # The selection and per-instance files are committed; recovery remains gated.
                 pass
@@ -1205,13 +1224,152 @@ class RuntimeService:
                     'proxy_token': target['proxy_token']}}
         return unavailable
 
-    def reconcile(self):
+    def _boot_identity(self, instance, info):
+        """Bind an initialized, desired-running stopped instance to exact Docker IDs."""
+        if (not instance.get('active') or not instance.get('initialized')
+                or instance.get('desired_state') != 'running'
+                or info.get('state') not in {'created', 'stopped', 'exited'}
+                or instance.get('container_id') != info.get('container_id')):
+            raise ServiceError('runtime_unavailable', 503)
+        identity = self.engine.recovery_identity(instance['id'])
+        if (type(identity) is not dict or set(identity) != {'gateway_id', 'sidecar_id'}
+                or type(identity['gateway_id']) is not str
+                or re.fullmatch(r'[0-9a-f]{64}', identity['gateway_id']) is None
+                or identity['gateway_id'] != info.get('container_id')):
+            raise ServiceError('runtime_unavailable', 503)
+        sidecar = identity['sidecar_id']
+        if instance['network_profile'] == RuntimeStore.NETWORK_PROFILE_PROXY:
+            if type(sidecar) is not str or re.fullmatch(r'[0-9a-f]{64}', sidecar) is None:
+                raise ServiceError('runtime_unavailable', 503)
+        elif sidecar is not None:
+            raise ServiceError('runtime_unavailable', 503)
+        return dict(identity)
+
+    def _defer_boot_candidate(self, instance, info, evidence):
+        # This method is called only for the *sole* admission failure
+        # cpu_window_incomplete during the initial boot reconcile pass.
+        if getattr(self, 'ollama_config', None) is not None:
+            if info.get('config_policy_version') != 1 or not self._ollama_policy_file_matches(evidence):
+                raise ServiceError('model_policy_unverified', 503)
+        identity = self._boot_identity(instance, info)
+        current = self.store.instance(instance['id'])
+        self._boot_candidates[instance['id']] = {
+            'identity': identity,
+            'binding': {key: current.get(key) for key in
+                        ('actor', 'settings', 'storage', 'network_profile', 'initialized')},
+            'model_id': (getattr(self, 'ollama_config', None) or {}).get('default_model_id'),
+        }
+
+    def recover_boot_once_if_ready(self, stop_event):
+        """A server-loop tick, not a restart thread. Consume the boot set once.
+
+        Waiting is bounded to 180 seconds; actual engine calls retain their own
+        transport timeouts. No lock wait or worker join can outlive shutdown.
+        """
+        import math
+        if not self.lock.acquire(blocking=False):
+            return
+        try:
+            candidates = getattr(self, '_boot_candidates', {})
+            if not candidates:
+                return
+            if stop_event.is_set():
+                candidates.clear()
+                self._boot_recovery_status = 'cancelled'
+                return
+            now = self.clock()
+            if now >= self._boot_recovery_deadline:
+                candidates.clear()
+                self._boot_recovery_status = 'metrics_timeout'
+                print('Boot recovery expired before fresh CPU metrics; manual action required',
+                      file=sys.stderr, flush=True)
+                return
+            try:
+                sample = self._sample()
+                window, sampled = sample['cpu_window_seconds'], sample['sampled_at']
+                if (any(type(value) not in (int, float) or not math.isfinite(value)
+                        for value in (window, sampled, now))
+                        or window < 60 or not 0 <= now - sampled <= 10):
+                    return
+            except Exception:
+                return
+            # Consume before starting any operation: exceptions and ordinary
+            # crashes must not lead to a second automatic start attempt.
+            self._boot_candidates = {}
+            self._boot_recovery_status = 'attempted'
+            for instance_id, candidate in candidates.items():
+                if stop_event.is_set():
+                    self._boot_recovery_status = 'cancelled'
+                    break
+                attempted = False
+                ids = candidate['identity']
+                try:
+                    current = self.store.instance(instance_id)
+                    if (type(current) is not dict or not current.get('active')
+                            or current.get('desired_state') != 'running'
+                            or any(current.get(key) != value for key, value in candidate['binding'].items())
+                            or (getattr(self, 'ollama_config', None) or {}).get('default_model_id')
+                            != candidate['model_id']):
+                        continue
+                    migration = getattr(self, 'sidecar_migration', None)
+                    if migration is not None and instance_id in migration.in_progress_instances():
+                        continue
+                    restore = getattr(self.engine, 'restore_firewall', None)
+                    if callable(restore):
+                        restored = restore()
+                        if (type(restored) is not dict or restored.get('ready') is not True
+                                or type(restored.get('instance_ids')) is not list
+                                or (current['network_profile'] != RuntimeStore.NETWORK_PROFILE_LEGACY
+                                    and instance_id not in restored['instance_ids'])):
+                            raise ServiceError('runtime_unavailable', 503)
+                    elif current['network_profile'] != RuntimeStore.NETWORK_PROFILE_LEGACY:
+                        raise ServiceError('runtime_unavailable', 503)
+                    info = self._inspect(instance_id, read_only=True, identity=ids)
+                    if self._boot_identity(current, info) != ids:
+                        continue
+                    evidence = self._storage(current)
+                    self._admit(quota=evidence['disk_quota_verified'], requested_disk_bytes=0,
+                                network_profile=current['network_profile'])
+                    self._require_ollama_policy(current, evidence, info)
+                    attempted = True
+                    self.engine.start_bound(instance_id, ids['gateway_id'], ids['sidecar_id'])
+                    after = self._inspect(instance_id, read_only=True, identity=ids)
+                    if after.get('container_id') != ids['gateway_id'] or after.get('state') != 'running':
+                        raise ServiceError('runtime_unavailable', 503)
+                    self.store.observe(instance_id, after['state'], after['container_id'])
+                except Exception:
+                    if attempted:
+                        try:
+                            if self.engine.stop_bound(ids['gateway_id'], ids['sidecar_id']) is not True:
+                                raise ServiceError('runtime_unavailable', 503)
+                        except Exception:
+                            print('Boot recovery containment unverified for ' + instance_id,
+                                  file=sys.stderr, flush=True)
+                    print('Deferred boot recovery blocked for ' + instance_id + '; manual action required',
+                          file=sys.stderr, flush=True)
+        finally:
+            self.lock.release()
+
+    def reconcile(self, *, boot=False, recover_ids=None, startup=False):
         """Restore only persisted running intent after storage/resource/firewall gates.
 
         Never create missing containers, resume failed operations, or touch agent data.
         Docker's RestartPolicy is `no`; this is the sole boot restore path.
         """
+        boot_observation = startup or boot
+        def inspect_runtime(instance_id, identity=None):
+            if boot_observation:
+                return self._inspect(instance_id, read_only=True, identity=identity)
+            return self._inspect(instance_id)
         with self.lock:
+            if boot:
+                if getattr(self, '_boot_initialized', False):
+                    boot, recover_ids = False, set()
+                else:
+                    self._boot_initialized = True
+                    self._boot_candidates = {}
+                    self._boot_recovery_deadline = self.clock() + 180
+                    self._boot_recovery_status = 'collecting'
             migrating = set()
             migration = getattr(self, 'sidecar_migration', None)
             if migration is not None:
@@ -1226,11 +1384,11 @@ class RuntimeService:
                                if item.get('active') and item.get('desired_state') == 'running']
             firewall_ready = True
             firewall_instance_ids = set()
-            if desired_running:
+            if managed:
                 restore_firewall = getattr(self.engine, 'restore_firewall', None)
                 requires_firewall = any(
                     item.get('network_profile') != RuntimeStore.NETWORK_PROFILE_LEGACY
-                    for item in desired_running)
+                    for item in managed if item.get('active'))
                 if callable(restore_firewall):
                     try:
                         restored = restore_firewall()
@@ -1251,7 +1409,7 @@ class RuntimeService:
                     firewall_ready = False
 
             for instance in managed:
-                info = self._inspect(instance['id'])
+                info = inspect_runtime(instance['id'])
                 if not instance['active']:
                     if not self._absent(info):
                         raise ServiceError('runtime_unavailable', 503)
@@ -1265,7 +1423,7 @@ class RuntimeService:
                         and info.get('config_policy_version') != 1):
                     if info['state'] in {'running', 'restarting', 'paused'}:
                         self.engine.stop(instance['id'])
-                        info = self._inspect(instance['id'])
+                        info = inspect_runtime(instance['id'])
                         if info['state'] not in {'stopped', 'exited', 'created', 'failed'}:
                             raise ServiceError('runtime_unavailable', 503)
                     self.store.observe(instance['id'], info['state'], info.get('container_id'))
@@ -1277,7 +1435,7 @@ class RuntimeService:
                         networked and (not firewall_ready or instance['id'] not in firewall_instance_ids)):
                     if info['state'] in {'running', 'restarting', 'paused'}:
                         self.engine.stop(instance['id'])
-                        info = self._inspect(instance['id'])
+                        info = inspect_runtime(instance['id'])
                         if info['state'] not in {'stopped', 'exited', 'created', 'failed'}:
                             raise ServiceError('runtime_unavailable', 503)
                     state = instance['state'] if self._absent(info) else info['state']
@@ -1285,6 +1443,11 @@ class RuntimeService:
                     continue
 
                 if desired_state == 'running' and not self._absent(info):
+                    if (recover_ids is not None and instance['id'] not in recover_ids
+                            and info['state'] not in {'running', 'restarting', 'paused'}):
+                        self.store.observe(instance['id'], info['state'], info.get('container_id'))
+                        continue
+                    evidence = None
                     try:
                         evidence = self._storage(instance)
                         if info['state'] not in {'running', 'restarting', 'paused'}:
@@ -1294,9 +1457,17 @@ class RuntimeService:
                         if getattr(self, 'ollama_config', None) is not None:
                             self._require_ollama_policy(instance, evidence, info)
                     except ServiceError as error:
+                        if (boot and type(evidence) is dict
+                                and getattr(error, 'admission_reasons', ()) == ('cpu_window_incomplete',)
+                                and info['state'] in {'created', 'stopped', 'exited'}):
+                            try:
+                                self._defer_boot_candidate(instance, info, evidence)
+                            except Exception:
+                                print('Boot candidate identity/policy unverified for ' + instance['id'],
+                                      file=sys.stderr, flush=True)
                         if info['state'] in {'running', 'restarting', 'paused'}:
                             self.engine.stop(instance['id'])
-                            info = self._inspect(instance['id'])
+                            info = inspect_runtime(instance['id'])
                             if info['state'] not in {'stopped', 'exited', 'created', 'failed'}:
                                 raise ServiceError('runtime_unavailable', 503) from None
                         self.store.observe(instance['id'], info['state'], info.get('container_id'))
@@ -1305,19 +1476,39 @@ class RuntimeService:
                         continue
 
                     if info['state'] in {'stopped', 'exited', 'created'}:
+                        bound_ids = None
                         try:
-                            self.engine.start(instance['id'])
-                            info = self._inspect(instance['id'])
-                            if info['state'] != 'running':
+                            if boot:
+                                bound_ids = self._boot_identity(instance, info)
+                                self.engine.start_bound(instance['id'], bound_ids['gateway_id'],
+                                                        bound_ids['sidecar_id'])
+                            else:
+                                self.engine.start(instance['id'])
+                            info = inspect_runtime(instance['id'], bound_ids)
+                            if (info['state'] != 'running'
+                                    or (boot and bound_ids is not None
+                                        and info.get('container_id') != bound_ids['gateway_id'])):
                                 raise ServiceError('runtime_unavailable', 503)
                         except Exception:
+                            if boot:
+                                if bound_ids is not None:
+                                    try:
+                                        if self.engine.stop_bound(
+                                                bound_ids['gateway_id'], bound_ids['sidecar_id']) is not True:
+                                            raise ServiceError('runtime_unavailable', 503)
+                                    except Exception:
+                                        print('Initial boot containment unverified for ' + instance['id'],
+                                              file=sys.stderr, flush=True)
+                                print('Initial boot recovery blocked for ' + instance['id'],
+                                      file=sys.stderr, flush=True)
+                                continue
                             # A failed postcondition must not leave a networked
                             # Gateway/Sidecar active outside a verified recovery.
                             try:
-                                latest = self._inspect(instance['id'])
+                                latest = inspect_runtime(instance['id'])
                                 if latest['state'] in {'running', 'restarting', 'paused'}:
                                     self.engine.stop(instance['id'])
-                                    latest = self._inspect(instance['id'])
+                                    latest = inspect_runtime(instance['id'])
                                 if latest['state'] not in {'stopped', 'exited', 'created', 'failed'}:
                                     raise ServiceError('runtime_unavailable', 503)
                                 info = latest
@@ -1743,9 +1934,16 @@ def create_admin_handler(app, token):
 
 
 def _retry_recovery(controller, stop_event):
-    """Disabled: unrestricted reconciliation can restart post-boot crashes."""
-    print('Boot recovery retry disabled; blocked instances require manual action',
-          file=sys.stderr, flush=True)
+    """Tick only the consumed-once boot set; never repeat global reconcile()."""
+    controller.recover_boot_once_if_ready(stop_event)
+
+
+def _linux_boot_id():
+    with open('/proc/sys/kernel/random/boot_id', 'rb') as source:
+        value = source.read(38)
+    if re.fullmatch(rb'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\n?', value) is None:
+        raise ValueError('Linux boot identity unavailable')
+    return value.rstrip(b'\n').decode('ascii')
 
 
 def serve(config):
@@ -1830,7 +2028,8 @@ def serve(config):
         controller._sample()  # Reject explicit ceilings above physical totals.
         if any(used > maximum for used, maximum in zip(store.totals(), capacities)):
             raise ValueError('Existing reservations exceed configured ceilings')
-        controller.reconcile()
+        is_new_boot = store.claim_boot_recovery(_linux_boot_id())
+        controller.reconcile(boot=is_new_boot, recover_ids=None if is_new_boot else set(), startup=True)
         def prepare_socket(path):
             if not os.path.lexists(path):
                 return
@@ -1855,6 +2054,12 @@ def serve(config):
         prepare_socket(admin_socket_path)
 
         class UnixServer(socketserver.UnixStreamServer):
+            def service_actions(self):
+                # The main server drives recovery. The admin server inherits
+                # this class but must never run a second recovery scheduler.
+                if self is server:
+                    _retry_recovery(controller, recovery_stop)
+
             def get_request(self):
                 connection, address = super().get_request()
                 connection.settimeout(30)
@@ -1891,6 +2096,7 @@ def serve(config):
         print('Supervisor listening on private Unix sockets; CPU window warms for 60 seconds.', flush=True)
         server.serve_forever(poll_interval=0.5)
     finally:
+        recovery_stop.set()
         if admin_server:
             if admin_thread is not None and admin_thread.is_alive():
                 admin_server.shutdown()

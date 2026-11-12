@@ -391,6 +391,9 @@ def expected_ollama_ruleset(routes):
                     rules.append(_rule(family, 'forward', [
                         _match(_meta(side), item.bridge)], 'drop',
                         f'BEZR {item.instance_id} ollama bridge forward {direction} deny'))
+        # Match the adapter's canonical chain grouping and the base proxy manifest.
+        # Stable grouping changes no rule order within a packet-evaluation chain.
+        rules.sort(key=lambda item: item['chain'])
         tables[family] = {
             'table': {'family': family, 'name': TABLE_NAME, 'comment': TABLE_COMMENT},
             'chains': chains,

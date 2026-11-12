@@ -1,5 +1,12 @@
 # План дальнейшей разработки
 
+## Текущий приоритет: три P0 перед GPU-развёртыванием
+
+- Purge: локальная immutable/journal/retry реализация подключена; настоящая Linux/XFS приёмка на disposable dataset ещё нужна (`docs/PURGE_IMMUTABLE.md`).
+- Reboot: однократный recovery подключён к startup/server-loop с durable boot-ID claim, полными IDs пары, read-only boot-наблюдением и повторными gates после CPU warmup. Обычный runtime crash и restart Supervisor в том же boot не создают автостарта. Linux/systemd/Docker acceptance ещё не выполнена (`docs/REBOOT_RECOVERY.md`).
+- Ollama route acceptance: отдельные Linux/netns/Docker packet checks и opt-in orchestrator дорабатываются; выдача host-bound receipt до их реального успешного исполнения запрещена. Synthetic tests не являются route acceptance.
+- GPU-сервер, deployment, новые зависимости, system/firewall changes и повтор прежней Stage 3 серии не входят в текущую локальную работу. Broker остаётся отложенным до полной MVP-приёмки.
+
 ## Отправная точка
 
 - Репозиторий: `https://github.com/Tilteeed/------`.

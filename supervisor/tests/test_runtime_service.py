@@ -801,7 +801,7 @@ class SupervisorRestartRecoveryTests(unittest.TestCase):
                 XfsVolumes._clear_contents_path(path, actual.st_dev, actual.st_ino)
 
             with patch.object(volumes, '_preflight'), patch.object(volumes, '_database', fake_database), \
-                 patch.object(volumes, '_clear_contents', side_effect=fake_clear), \
+                 patch.object(volumes, '_clear_contents', side_effect=fake_clear), patch.object(volumes, '_purge_managed_config'), \
                  patch.object(volumes, '_canonical', return_value=fake_info), patch.object(XfsVolumes, '_sync_dir'), \
                  patch('supervisor.volumes.os.path.ismount', return_value=False), \
                  patch.object(volumes, '_fsxattr', side_effect=lambda _path: next(fsxattr)), \
@@ -1030,16 +1030,19 @@ class ProductionWiringTests(unittest.TestCase):
 
 
 class RecoveryRetryTests(unittest.TestCase):
-    def test_background_retry_is_disabled_for_safe_containment(self):
+    def test_background_tick_never_calls_global_reconcile(self):
         from supervisor.service import _retry_recovery
         class Controller:
             calls = 0
+            ticks = 0
             def reconcile(self): self.calls += 1
+            def recover_boot_once_if_ready(self, stop): self.ticks += 1
         class Stop:
-            def wait(self, seconds): return False
+            def wait(self, seconds): raise AssertionError('A server tick must not wait')
         controller = Controller()
         _retry_recovery(controller, Stop())
         self.assertEqual(controller.calls, 0)
+        self.assertEqual(controller.ticks, 1)
 
     def test_repeated_recovery_does_not_readmit_running_instance(self):
         from supervisor.service import RuntimeService, ServiceError
@@ -1065,21 +1068,21 @@ class RecoveryRetryTests(unittest.TestCase):
         self.assertEqual(service.engine.calls, [])
         self.assertEqual(instance['desired_state'], 'running')
 
-    def test_recovery_worker_retries_after_warmup_and_stops(self):
+    def test_recovery_tick_does_not_run_its_own_sleep_loop(self):
         from supervisor.service import _retry_recovery
         class Stop:
             def __init__(self): self.waits = []
             def wait(self, seconds):
                 self.waits.append(seconds)
-                return len(self.waits) == 4
+                raise AssertionError('No wait in recovery tick')
         class Controller:
-            def __init__(self): self.calls = 0
-            def reconcile(self):
-                self.calls += 1
-                if self.calls == 1: raise RuntimeError('transient')
+            def __init__(self): self.calls = 0; self.ticks = 0
+            def reconcile(self): self.calls += 1
+            def recover_boot_once_if_ready(self, stop): self.ticks += 1
         stop, controller = Stop(), Controller()
         _retry_recovery(controller, stop)
         self.assertEqual(controller.calls, 0)
+        self.assertEqual(controller.ticks, 1)
         self.assertEqual(stop.waits, [])
 
     def test_warmup_retry_restores_only_desired_running_after_firewall(self):
@@ -1125,13 +1128,15 @@ class RecoveryRetryTests(unittest.TestCase):
         self.assertEqual((running['desired_state'], running['state']), ('running', 'stopped'))
         self.assertEqual((stopped['desired_state'], stopped['state']), ('stopped', 'stopped'))
 
-    def test_recovery_worker_is_bounded_and_shutdown_interrupts_wait(self):
+    def test_recovery_tick_returns_without_creating_a_restart_worker(self):
         from supervisor.service import _retry_recovery
         class Controller:
             calls = 0
+            ticks = 0
             def reconcile(self): self.calls += 1
+            def recover_boot_once_if_ready(self, stop): self.ticks += 1
         class NeverStop:
-            def wait(self, seconds): return False
+            def wait(self, seconds): raise AssertionError('No waiting worker')
         controller = Controller()
         _retry_recovery(controller, NeverStop())
         self.assertEqual(controller.calls, 0)
@@ -1142,3 +1147,4 @@ class RecoveryRetryTests(unittest.TestCase):
         worker.join(timeout=1)
         self.assertFalse(worker.is_alive())
         self.assertEqual(controller.calls, 0)
+        self.assertEqual(controller.ticks, 2)

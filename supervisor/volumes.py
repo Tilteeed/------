@@ -402,6 +402,129 @@ class XfsVolumes:
         finally:
             os.close(fd)
 
+    def _purge_managed_config(self, db, root, root_record, instance_id, project_id):
+        """Unlock/unlink only the fixed managed inode, with durable retry identity.
+
+        Caller holds lifecycle + storage locks and has proved BOTH containers
+        absent. Privileged external Docker/filesystem mutation is excluded.
+        The journal is outside the user tree and survives partial deletion.
+        """
+        from .config_lock import is_immutable, set_immutable
+
+        _require(hasattr(os, 'O_DIRECTORY') and hasattr(os, 'O_NOFOLLOW')
+                 and hasattr(os, 'O_NONBLOCK'), 'dirfd_cleanup_unsupported')
+        saved = db.execute('SELECT * FROM volume_purge_configs WHERE instance_id=?',
+                           (instance_id,)).fetchone()
+        root_identity = (root_record['device'], root_record['inode'])
+        if saved is not None:
+            _require((saved['project_id'], saved['root_device'], saved['root_inode'])
+                     == (project_id, *root_identity), 'purge_config_identity_changed')
+        root_fd = state_fd = file_fd = None
+        try:
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            opened_root = os.fstat(root_fd)
+            _require(stat.S_ISDIR(opened_root.st_mode)
+                     and (opened_root.st_dev, opened_root.st_ino) == root_identity
+                     and opened_root.st_uid == 0
+                     and stat.S_IMODE(opened_root.st_mode) == 0o700, 'unsafe_directory')
+            mount_id = self._mount_id(root_fd)
+            state_key = (root / 'state').relative_to(self.mountpoint).as_posix()
+            state_record = db.execute('SELECT * FROM volume_directories WHERE path=?',
+                                      (state_key,)).fetchone()
+            try:
+                state_fd = os.open('state', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                   dir_fd=root_fd)
+            except FileNotFoundError:
+                if saved is not None:
+                    # A previous generic cleanup can already have removed state.
+                    os.fsync(root_fd)
+                    return
+                _require(state_record is None, 'directory_identity_changed')
+                parent_identity = (None, None)
+                kind, file_identity = 'absent', (None, None)
+            else:
+                parent = os.fstat(state_fd)
+                parent_identity = (parent.st_dev, parent.st_ino)
+                owner = (parent.st_uid, parent.st_gid)
+                parent_ready = state_record is not None and state_record['stage'] == 'ready'
+                parent_created = state_record is not None and state_record['stage'] == 'created'
+                _require(state_record is not None and stat.S_ISDIR(parent.st_mode)
+                         and parent_identity == (state_record['device'], state_record['inode'])
+                         and parent.st_dev == opened_root.st_dev
+                         and ((parent_ready and owner == (1000, 1000))
+                              or (parent_created and owner in ((0, 0), (1000, 1000))))
+                         and stat.S_IMODE(parent.st_mode) == 0o700
+                         and self._mount_id(state_fd) == mount_id, 'unsafe_config_parent')
+                if saved is not None:
+                    _require(parent_identity == (saved['parent_device'], saved['parent_inode']),
+                             'purge_config_identity_changed')
+                try:
+                    named = os.stat('openclaw.json', dir_fd=state_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    kind, file_identity = 'absent', (None, None)
+                else:
+                    _require(stat.S_ISREG(named.st_mode) and named.st_nlink == 1
+                             and named.st_dev == opened_root.st_dev, 'unsafe_managed_config')
+                    metadata = (named.st_uid, named.st_gid, stat.S_IMODE(named.st_mode))
+                    if metadata == (0, 1000, 0o440):
+                        _require(parent_ready, 'unsafe_config_parent')
+                        kind = 'managed'
+                    else:
+                        # Interrupted initialization has not yet installed the
+                        # protected mode/flag. It may be deleted normally, but
+                        # must NEVER gain permission to issue a flag-changing ioctl.
+                        _require(metadata in ((1000, 1000, 0o600), (0, 0, 0o600),
+                                              (0, 1000, 0o600)), 'unsafe_managed_config')
+                        kind = 'legacy'
+                    file_identity = (named.st_dev, named.st_ino)
+                    file_fd = os.open('openclaw.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                      dir_fd=state_fd)
+                    opened = os.fstat(file_fd)
+                    _require(stat.S_ISREG(opened.st_mode) and opened.st_nlink == 1
+                             and (opened.st_dev, opened.st_ino) == file_identity
+                             and (opened.st_uid, opened.st_gid, stat.S_IMODE(opened.st_mode)) == metadata
+                             and self._mount_id(file_fd) == mount_id, 'unsafe_managed_config')
+            if saved is None:
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    db.execute('INSERT INTO volume_purge_configs VALUES (?,?,?,?,?,?,?,?,?,?)',
+                               (instance_id, project_id, *root_identity, *parent_identity,
+                                kind, *file_identity, 'recorded'))
+                    db.commit()
+                except BaseException:
+                    db.rollback()
+                    raise
+            elif kind != 'absent':
+                _require(kind == saved['kind']
+                         and file_identity == (saved['file_device'], saved['file_inode']),
+                         'purge_config_identity_changed')
+            if kind != 'managed':
+                # Legacy/user files never receive a flag-changing ioctl.
+                # An absent entry on retry is legitimate after unlink/cleanup.
+                if state_fd is not None:
+                    os.fsync(state_fd)
+                return
+            def verify_named():
+                current = os.stat('openclaw.json', dir_fd=state_fd, follow_symlinks=False)
+                opened = os.fstat(file_fd)
+                _require(stat.S_ISREG(current.st_mode) and current.st_nlink == 1
+                         and (current.st_dev, current.st_ino) == file_identity
+                         and (opened.st_dev, opened.st_ino) == file_identity
+                         and (current.st_uid, current.st_gid, stat.S_IMODE(current.st_mode))
+                         == (0, 1000, 0o440), 'purge_config_identity_changed')
+            verify_named()
+            if is_immutable(file_fd):
+                set_immutable(file_fd, False)
+            _require(is_immutable(file_fd) is False, 'config_unlock_unverified')
+            os.fsync(file_fd)
+            verify_named()
+            os.unlink('openclaw.json', dir_fd=state_fd)
+            os.fsync(state_fd)
+        finally:
+            for fd in (file_fd, state_fd, root_fd):
+                if fd is not None:
+                    os.close(fd)
+
     @staticmethod
     def _quota_clear(rows):
         return all(row is None or row == (0, 0, 0) for row in rows)
@@ -415,8 +538,11 @@ class XfsVolumes:
     def purge(self, instance_id, disk_bytes, expected_project_id=None):
         """Delete only a journaled instance tree; keep its quota reserved on failure.
 
-        The caller must first prove that its Docker container is absent. The storage
-        DB's purging stages make every filesystem step retryable after a crash.
+        The caller must prove BOTH Gateway and Sidecar absent and hold the shared
+        lifecycle lock throughout purge. External root/Docker mutation is outside
+        that lock's trust boundary. The storage DB journals the managed config
+        inode before clearing only its immutable flag; partial purge is retryable,
+        not reversible. Never release the recorded quota on incomplete cleanup.
         """
         _arguments(instance_id, disk_bytes)
         if expected_project_id is not None:
@@ -430,6 +556,24 @@ class XfsVolumes:
             return {'purged': True, 'project_id': None}
         try:
             with self._database(create=False, writable=True) as db:
+                # Existing DB only; migrate under storage flock. No ioctl/tree
+                # mutation is permitted before the FULL-synchronous journal commit.
+                db.execute('PRAGMA synchronous=FULL')
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    db.execute('CREATE TABLE IF NOT EXISTS volume_purge_configs ('
+                               'instance_id TEXT PRIMARY KEY, project_id INTEGER NOT NULL, '
+                               'root_device INTEGER NOT NULL, root_inode INTEGER NOT NULL, '
+                               'parent_device INTEGER, parent_inode INTEGER, '
+                               "kind TEXT NOT NULL CHECK(kind IN ('managed','legacy','absent')), "
+                               'file_device INTEGER, file_inode INTEGER, stage TEXT NOT NULL)')
+                    db.execute('CREATE TABLE IF NOT EXISTS volume_purge_origins ('
+                               'instance_id TEXT PRIMARY KEY, project_id INTEGER NOT NULL, '
+                               'origin_stage TEXT NOT NULL)')
+                    db.commit()
+                except BaseException:
+                    db.rollback()
+                    raise
                 row = db.execute('SELECT * FROM volume_projects WHERE instance_id=?',
                                  (instance_id,)).fetchone()
                 root = self.instances / instance_id
@@ -447,9 +591,19 @@ class XfsVolumes:
                 _require(stage in ('reserved', 'assigned', 'ready', 'purging',
                                     'quota_cleared', 'quota_reset'), 'invalid_volume_state')
                 original_stage = stage
+                origin = db.execute('SELECT * FROM volume_purge_origins WHERE instance_id=?',
+                                    (instance_id,)).fetchone()
+                if origin is not None:
+                    _require(origin['project_id'] == project_id
+                             and origin['origin_stage'] in ('reserved', 'assigned', 'ready'),
+                             'purge_origin_mismatch')
+                was_reserved = (origin['origin_stage'] if origin is not None else stage) == 'reserved'
                 if stage not in ('purging', 'quota_cleared', 'quota_reset'):
                     db.execute('BEGIN IMMEDIATE')
                     try:
+                        if origin is None:
+                            db.execute('INSERT INTO volume_purge_origins VALUES (?,?,?)',
+                                       (instance_id, project_id, stage))
                         db.execute("UPDATE volume_projects SET stage='purging' WHERE instance_id=?",
                                    (instance_id,))
                         db.commit()
@@ -474,10 +628,17 @@ class XfsVolumes:
                     identity = self._fsxattr(root)
                     limits = self._limits(project_id)
                     if identity == (project_id, True):
-                        _require((self._quota_clear(limits) or self._quota_matches(limits, disk_bytes))
-                                 if original_stage == 'reserved'
+                        # A journaled reserved root may already consume an inode
+                        # after project assignment but before limit installation.
+                        # Allow zero LIMITS here, never zero usage by assumption;
+                        # usage must still be zero before final quota release.
+                        zero_limits = (len(limits) == 2 and all(
+                            item is None or item[1:] == (0, 0) for item in limits))
+                        _require((zero_limits or self._quota_matches(limits, disk_bytes))
+                                 if was_reserved
                                  else self._quota_matches(limits, disk_bytes),
                                  'quota_limit_mismatch')
+                        self._purge_managed_config(db, root, root_record, instance_id, project_id)
                         self._clear_contents(root, root_record['device'], root_record['inode'])
                         self._quota(f'project -C -p {root} {project_id}')
                         identity = self._fsxattr(root)
@@ -500,8 +661,8 @@ class XfsVolumes:
                         raise
                     os.rmdir(root)
                     self._sync_dir(root.parent)
-                elif original_stage == 'reserved':
-                    _require(root_record is None and self._quota_clear(self._limits(project_id)),
+                elif was_reserved and root_record is None:
+                    _require(self._quota_clear(self._limits(project_id)),
                              'unprepared_project_has_quota')
                     db.execute('BEGIN IMMEDIATE')
                     try:
@@ -526,6 +687,8 @@ class XfsVolumes:
                                (instance_id,))
                     db.execute('DELETE FROM volume_directories WHERE path=? OR path LIKE ?',
                                (root_key, root_key + '/%'))
+                    db.execute('DELETE FROM volume_purge_configs WHERE instance_id=?', (instance_id,))
+                    db.execute('DELETE FROM volume_purge_origins WHERE instance_id=?', (instance_id,))
                     db.execute('DELETE FROM volume_projects WHERE instance_id=?', (instance_id,))
                     db.commit()
                 except BaseException:

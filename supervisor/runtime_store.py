@@ -6,6 +6,7 @@ and pending creates keep their reservation. Removed instances retain disk foreve
 import json
 import os
 import secrets
+import re
 import sqlite3
 import threading
 import uuid
@@ -82,6 +83,29 @@ class RuntimeStore:
         except BaseException:
             self.db.close()
             raise
+
+    def claim_boot_recovery(self, boot_id):
+        """Durably consume a new Linux boot before any automatic Docker start.
+
+        First observation is a baseline, not proof of a reboot. Same-boot service
+        restarts and interrupted claims never enable automatic recovery again.
+        """
+        pattern = r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'
+        if type(boot_id) is not str or re.fullmatch(pattern, boot_id) is None:
+            raise StoreError('invalid_boot_identity')
+        with self.transaction():
+            self.db.execute('''CREATE TABLE IF NOT EXISTS boot_recovery (
+                id INTEGER PRIMARY KEY CHECK(id=1), boot_id TEXT NOT NULL)''')
+            old = self.db.execute('SELECT boot_id FROM boot_recovery WHERE id=1').fetchone()
+            if old is not None:
+                previous = old['boot_id']
+                if type(previous) is not str or re.fullmatch(pattern, previous) is None:
+                    raise StoreError('invalid_boot_identity')
+                if previous == boot_id:
+                    return False
+            self.db.execute('INSERT INTO boot_recovery(id,boot_id) VALUES(1,?) '
+                            'ON CONFLICT(id) DO UPDATE SET boot_id=excluded.boot_id', (boot_id,))
+            return old is not None
 
     def ollama_model_id(self):
         with self.lock:

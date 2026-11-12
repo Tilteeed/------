@@ -59,7 +59,7 @@ class ImmutablePurgeStorageTests(unittest.TestCase):
                  patch.object(volumes, '_fsxattr', return_value=(42, True)), \
                  patch.object(volumes, '_limits', return_value=((0, 0, 4), (0, 0, 1024))), \
                  patch.object(volumes, '_quota', side_effect=quota_commands.append), \
-                 patch.object(volumes, '_clear_contents', side_effect=PermissionError('immutable')):
+                 patch.object(volumes, '_clear_contents', side_effect=PermissionError('immutable')), patch.object(volumes, '_purge_managed_config'):
                 with self.assertRaisesRegex(PermissionError, 'immutable'):
                     volumes.purge(instance_id, 4096, expected_project_id=42)
             self.assertTrue(config.exists())

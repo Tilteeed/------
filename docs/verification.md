@@ -1,5 +1,15 @@
 # Проверенный уровень первой веб-части
 
+## Reboot recovery — текущая локальная доработка (2026-11-13)
+
+Подключены durable Linux boot-ID claim, одноразовый набор CPU-warmup кандидатов, строгий парный identity-bound Docker start/containment и server-loop tick без общего reconcile retry. Первый boot ID только устанавливает baseline; restart Supervisor в том же boot не разрешает запуск упавших контейнеров. Подробности и целевая Linux-приёмка — `docs/REBOOT_RECOVERY.md`.
+
+Независимое source review service/store не выявило блокеров при условии engine contract. Следующий engine/integration review обнаружил два транзитивных побочных эффекта обычного inspect; они исправлены. Повторное focused review (`deleg_e8daa8c6`) оставшихся блокеров в read-only observation/start/containment junction не нашло: boot-наблюдения не выполняют network repair/by-name stop, expected IDs передаются до и после bound start, false containment явно регистрируется. Это ограниченное source review соответствующего junction, не одобрение всей программы или настоящей Linux/Docker-приёмки.
+
+Локально прошли 128 целевых тестов (`test_boot_recovery`, `test_boot_epoch`, `test_identity_bound_start`, `test_runtime_service`, `test_docker_engine_network`) и 100 основных тестов; `compileall` и `git diff --check` — exit 0. Включён связанный service → настоящий DockerEngine код поверх **синтетического** Docker transport, а не только раздельные helper-тесты. Epoch проверяется с реальной временной SQLite и reopen. Два воспроизведённых интеграционных дефекта исправлены RED→GREEN: boot-inspect больше не repair-ит отсутствующий WebUI endpoint до admission и не вызывает by-name stop для replacement после bound start. Это не реальный reboot, XFS, Docker или packet acceptance. Полный Supervisor suite пока не принят: последний прогон route acceptance выявил один отказ соответствия Sidecar agent-подсети; после завершения исправления нужен финальный полный прогон.
+
+По явному напоминанию повторён `hermes verify --json`: `ok:false`, build `docker compose build` exit 1 — Docker CLI не найден. Test/boot/readiness-фазы рецепта не выполнялись. Повторять неизменённый recipe без новых предпосылок не нужно; Docker не устанавливался. Реальные Linux/network/firewall/GPU испытания и выдача route receipt не выполнялись.
+
 ## Локальная проверка текущих изменений
 
 - `python -m unittest discover -s tests -v`: **75 тестов, OK**. Pairing, owner-scoping, HTTPS-проверки и запреты прямых маршрутов проверялись тестовыми клиентами/fake Gateway RPC; это не live-проверка OpenClaw.
