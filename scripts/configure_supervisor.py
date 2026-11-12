@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import sys
+from urllib.parse import urlsplit
 
 # Permit execution from the project root without installing this project.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -20,6 +21,9 @@ from supervisor.firewall_acceptance import (
     build_firewall_acceptance_receipt, load_firewall_acceptance_receipt,
 )
 from supervisor.ollama_config import MODEL_NAMES, validate_ollama_config
+from supervisor.ollama_firewall import (
+    load_ollama_route_receipt, validate_ollama_route_inputs,
+)
 from supervisor.runtime_store import RuntimeStore
 from supervisor.probes import ProbeFailure, run_command
 
@@ -49,7 +53,9 @@ def build_ollama_policy(base_url, default_model_id, max_tokens,
     return asdict(validate_ollama_config(policy))
 
 
-def validate_network_activation(profile, domain, agent_pool, frontend_pool, state_dir):
+def validate_network_activation(profile, domain, agent_pool, frontend_pool, state_dir,
+                                ollama_policy=None, ollama_network_pool=None,
+                                ollama_egress_interface=None):
     if profile not in RuntimeStore.NETWORK_PROFILES:
         raise ValueError('Invalid default network profile')
     if (agent_pool is None) != (frontend_pool is None):
@@ -65,6 +71,24 @@ def validate_network_activation(profile, domain, agent_pool, frontend_pool, stat
             raise ValueError('agent_proxy_v1 requires a Control UI domain and both explicit pools')
         if not load_firewall_acceptance_receipt(state_dir, agent_pool, frontend_pool):
             raise ValueError('A matching host-bound Linux/Docker acceptance receipt is required')
+    if ollama_policy is None:
+        if ollama_network_pool is not None or ollama_egress_interface is not None:
+            raise ValueError('Ollama route settings require an enabled Ollama policy')
+        return
+    if profile != RuntimeStore.NETWORK_PROFILE_PROXY or agent_pool is None or frontend_pool is None:
+        raise ValueError('Direct Ollama route requires agent_proxy_v1 and explicit proxy pools')
+    if ollama_network_pool is None or ollama_egress_interface is None:
+        raise ValueError('Explicit Ollama egress pool and interface are required')
+    try:
+        endpoint = urlsplit(ollama_policy['base_url']).hostname
+        pool, interface = validate_ollama_route_inputs(
+            ollama_network_pool, ollama_egress_interface, endpoint,
+            protected_pools=(agent_pool, frontend_pool))
+    except (KeyError, TypeError, ValueError):
+        raise ValueError('Invalid isolated Ollama route settings') from None
+    if not load_ollama_route_receipt(
+            state_dir, agent_pool, frontend_pool, pool, endpoint, interface):
+        raise ValueError('A matching host-bound Ollama route acceptance receipt is required')
 
 
 def main(argv=None):
@@ -88,6 +112,10 @@ def main(argv=None):
     parser.add_argument('--ollama-context-tokens', type=amount, default=8192)
     parser.add_argument('--ollama-max-tokens', type=amount, default=None)
     parser.add_argument('--ollama-think', action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('--ollama-network-pool', default=None,
+                        help='Explicit RFC1918 /24-or-larger pool reserved for per-instance Ollama bridges')
+    parser.add_argument('--ollama-egress-interface', default=None,
+                        help='Exact Linux egress interface to the Ollama endpoint')
     parser.add_argument('--state-dir', default='/var/lib/personal-agent-supervisor')
     parser.add_argument('--socket-path', default='/run/personal-agent-supervisor/control.sock')
     parser.add_argument('--prepare-host-config', action='store_true')
@@ -109,7 +137,8 @@ def main(argv=None):
     try:
         validate_network_activation(
             args.network_profile_default, args.control_ui_domain,
-            args.agent_network_pool, args.frontend_network_pool, args.state_dir)
+            args.agent_network_pool, args.frontend_network_pool, args.state_dir,
+            ollama_policy, args.ollama_network_pool, args.ollama_egress_interface)
     except ValueError as error:
         parser.error(str(error))
     if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,255}', args.image) is None:
@@ -186,6 +215,8 @@ def main(argv=None):
             'agent_network_pool': args.agent_network_pool,
             'frontend_network_pool': args.frontend_network_pool,
             'ollama': ollama_policy,
+            'ollama_network_pool': args.ollama_network_pool,
+            'ollama_egress_interface': args.ollama_egress_interface,
         }
         descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(descriptor, 'w', encoding='utf-8') as target:

@@ -304,6 +304,45 @@ class FirewallAcceptanceReceiptTests(unittest.TestCase):
                 'agent_proxy_v1', 'agents.example.test', self.AGENT_POOL,
                 self.FRONTEND_POOL, '/var/lib/personal-agent-supervisor')
 
+    def test_configure_requires_route_receipt_before_enabling_ollama(self):
+        from scripts.configure_supervisor import validate_network_activation
+        policy = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b',
+            'context_tokens': 8192, 'max_tokens': 512, 'think': False,
+        }
+        with patch('scripts.configure_supervisor.load_firewall_acceptance_receipt',
+                   return_value=True), \
+             patch('scripts.configure_supervisor.load_ollama_route_receipt',
+                   return_value=False) as load_route:
+            with self.assertRaisesRegex(ValueError, 'Ollama route acceptance receipt'):
+                validate_network_activation(
+                    'agent_proxy_v1', 'agents.example.test', self.AGENT_POOL,
+                    self.FRONTEND_POOL, '/var/lib/personal-agent-supervisor',
+                    policy, '172.20.0.0/16', 'ens18')
+        load_route.assert_called_once_with(
+            '/var/lib/personal-agent-supervisor', self.AGENT_POOL, self.FRONTEND_POOL,
+            '172.20.0.0/16', '10.99.0.10', 'ens18')
+
+    def test_configure_accepts_ollama_only_with_matching_route_receipt(self):
+        from scripts.configure_supervisor import validate_network_activation
+        policy = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b',
+            'context_tokens': 8192, 'max_tokens': 512, 'think': False,
+        }
+        with patch('scripts.configure_supervisor.load_firewall_acceptance_receipt',
+                   return_value=True), \
+             patch('scripts.configure_supervisor.load_ollama_route_receipt',
+                   return_value=True) as load_route:
+            validate_network_activation(
+                'agent_proxy_v1', 'agents.example.test', self.AGENT_POOL,
+                self.FRONTEND_POOL, '/var/lib/personal-agent-supervisor',
+                policy, '172.20.0.0/16', 'ens18')
+        load_route.assert_called_once_with(
+            '/var/lib/personal-agent-supervisor', self.AGENT_POOL, self.FRONTEND_POOL,
+            '172.20.0.0/16', '10.99.0.10', 'ens18')
+
     def test_configure_keeps_legacy_default_independent_of_receipt(self):
         from scripts.configure_supervisor import validate_network_activation
         with patch('scripts.configure_supervisor.load_firewall_acceptance_receipt') as load_receipt:
@@ -331,6 +370,33 @@ class FirewallAcceptanceReceiptTests(unittest.TestCase):
         self.assertFalse(manager.can_apply)
         load_receipt.assert_called_once_with(
             config['state_dir'], self.AGENT_POOL, self.FRONTEND_POOL)
+
+    def test_runtime_ollama_firewall_uses_separate_route_receipt_and_table(self):
+        from supervisor.firewall import NftablesAdapter
+        from supervisor.ollama_firewall import TABLE_NAME
+        from supervisor.service import _runtime_ollama_firewall
+        config = {
+            'state_dir': '/var/lib/personal-agent-supervisor',
+            'agent_network_pool': self.AGENT_POOL,
+            'frontend_network_pool': self.FRONTEND_POOL,
+            'ollama_network_pool': '172.20.0.0/16',
+            'ollama_egress_interface': 'ens18',
+            'ollama': {
+                'base_url': 'http://10.99.0.10:11434',
+                'default_model_id': 'qwen3.5:9b',
+                'context_tokens': 8192, 'max_tokens': 512, 'think': False,
+            },
+        }
+        with patch('supervisor.ollama_firewall.load_ollama_route_receipt',
+                   return_value=False) as load_receipt:
+            manager = _runtime_ollama_firewall(config)
+        assert manager is not None
+        self.assertFalse(manager.can_apply)
+        self.assertIsInstance(manager.adapter, NftablesAdapter)
+        self.assertEqual(manager.adapter.table_name, TABLE_NAME)
+        load_receipt.assert_called_once_with(
+            config['state_dir'], self.AGENT_POOL, self.FRONTEND_POOL,
+            config['ollama_network_pool'], '10.99.0.10', 'ens18')
 
     def test_runtime_manager_enables_only_when_receipt_validation_succeeds(self):
         from supervisor.service import _runtime_firewall

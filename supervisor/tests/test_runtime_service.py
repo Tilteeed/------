@@ -1,6 +1,7 @@
 """One portable workflow smoke; no Docker, mounts, or host mutation."""
 import tempfile
 import unittest
+import threading
 from contextlib import ExitStack, closing
 from pathlib import Path
 
@@ -20,6 +21,15 @@ class DurableIntentSmoke(unittest.TestCase):
             with self.assertRaises(StoreError):
                 store.intent(changed, limits, (100, 100, 50))
             store.complete(first['id'], 'running', 'container')
+            running_instance = store.current('alice')
+            assert running_instance is not None
+            self.assertEqual(running_instance['desired_state'], 'running')
+            stop = dict(payload, action='stop', idempotency_key='stop')
+            stopped = store.intent(stop, limits, (100, 100, 50))
+            store.complete(stopped['id'], 'stopped', 'container')
+            stopped_instance = store.current('alice')
+            assert stopped_instance is not None
+            self.assertEqual(stopped_instance['desired_state'], 'stopped')
             remove = dict(payload, action='remove', idempotency_key='remove')
             operation = store.intent(remove, limits, (100, 100, 50))
             store.complete(operation['id'], 'removed')
@@ -83,7 +93,8 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             def inspect(self, instance_id):
                 return dict(state=self.state, gateway='unknown',
                             container_id='c' if self.state != 'absent' else None,
-                            **({'network_profile': self.network_profiles[-1] if self.network_profiles else 'legacy_none'}
+                            **({'network_profile': self.network_profiles[-1] if self.network_profiles else 'legacy_none',
+                                'config_policy_version': 1}
                                if self.state != 'absent' else {}))
             def create(self, instance_id, host_path, limits, token, *, network_profile='legacy_none'):
                 self.calls.append(('create', instance_id))
@@ -102,18 +113,10 @@ class ServiceWorkflowSmoke(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
             store = stack.enter_context(closing(RuntimeStore(Path(tmp) / 'runtime.sqlite3', profile.profile_version, fingerprint)))
             volumes, engine = Volumes(), Engine()
-            ollama_policy = {
-                'base_url': 'http://10.99.0.10:11434',
-                'default_model_id': 'qwen3.5:9b',
-                'context_tokens': 8192,
-                'max_tokens': 512,  # Synthetic test cap, not a production decision.
-                'think': False,
-            }
             initialized = []
             service = RuntimeService(profile, store, volumes, engine, Metrics(),
                                      capacities=(10**14, 1000000, 10**14), disk_floor_bytes=0,
-                                     clock=lambda: 100, initialize=lambda *args: initialized.append(args),
-                                     ollama_config=ollama_policy)
+                                     clock=lambda: 100, initialize=lambda *args: initialized.append(args))
             payload = dict(actor_id='alice', action='create', idempotency_key='key',
                            settings_revision=0, settings=dict(name='Agent', instructions='Hello'))
             with self.assertRaises(ServiceError):
@@ -126,7 +129,7 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             self.assertEqual(result['runtime']['instance_id'], instance_id)
             self.assertEqual(result['runtime']['network_profile'], 'legacy_none')
             self.assertEqual(engine.network_profiles[-1], 'legacy_none')
-            self.assertEqual(initialized[0][2], ollama_policy)
+            self.assertIsNone(initialized[0][2])
             engine.network_profiles[-1] = 'agent_internal_v1'
             with self.assertRaises(ServiceError):
                 service.me({'actor_id': 'alice'})
@@ -311,10 +314,12 @@ class SupervisorRestartRecoveryTests(unittest.TestCase):
                             disk_quota_verified=marker.is_file())
 
         class Engine:
-            def __init__(self, host_state):
+            def __init__(self, host_state, *, require_firewall=False):
                 self.host_state = host_state
                 self.network_profiles = {}
                 self.calls = []
+                self.require_firewall = require_firewall
+                self.firewall_ready = False
             def inspect(self, instance_id):
                 state = self.host_state.get(instance_id, 'absent')
                 return dict(state=state, gateway='unknown',
@@ -326,7 +331,13 @@ class SupervisorRestartRecoveryTests(unittest.TestCase):
                 self.network_profiles[instance_id] = network_profile
                 self.host_state[instance_id] = 'stopped'
                 return 'container-' + instance_id[:8]
+            def restore_firewall(self):
+                self.calls.append(('firewall_restore', None))
+                self.firewall_ready = True
+                return {'policy_count': 0, 'instance_ids': [], 'ready': True}
             def start(self, instance_id):
+                if self.require_firewall and not self.firewall_ready:
+                    raise AssertionError('network start preceded firewall read-back')
                 self.calls.append(('start', instance_id))
                 self.host_state[instance_id] = 'running'
             def stop(self, instance_id):
@@ -355,15 +366,19 @@ class SupervisorRestartRecoveryTests(unittest.TestCase):
                 instance_id = created['runtime']['instance_id']
                 self.assertEqual(created['runtime']['state'], 'running')
                 original_instance = store_before.instance(instance_id)
+                self.assertEqual(original_instance['desired_state'], 'running')
                 original_totals = store_before.totals()
                 original_container_id = original_instance['container_id']
             finally:
                 store_before.close()
 
+            # Docker RestartPolicy is `no`; after a host reboot the instance is
+            # observed stopped although the last successful intent was running.
+            host_state[instance_id] = 'stopped'
             store_after = RuntimeStore(db_path, profile.profile_version, fingerprint)
             try:
                 volumes_after = Volumes(root)
-                engine_after = Engine(host_state)
+                engine_after = Engine(host_state, require_firewall=True)
                 service_after = RuntimeService(profile, store_after, volumes_after, engine_after, Metrics(),
                     capacities=capacities, disk_floor_bytes=0, clock=lambda: 100,
                     initialize=lambda *_args: None)
@@ -372,10 +387,14 @@ class SupervisorRestartRecoveryTests(unittest.TestCase):
                 recovered = store_after.current('alice')
                 assert recovered is not None
                 self.assertEqual(view['runtime']['state'], 'running')
+                self.assertEqual(view['runtime']['desired_state'], 'running')
                 self.assertEqual(view['runtime']['instance_id'], instance_id)
                 self.assertEqual(recovered['container_id'], original_container_id)
+                self.assertEqual(recovered['desired_state'], 'running')
                 self.assertEqual(store_after.totals(), original_totals)
-                self.assertEqual(engine_after.calls, [], 'Reconciliation must inspect, not recreate or restart')
+                self.assertEqual(engine_after.calls, [
+                    ('firewall_restore', None), ('start', instance_id),
+                ], 'Recovery must verify firewall before starting, without recreating')
                 self.assertEqual(volumes_after.prepare_calls, 0, 'Reconciliation must not re-prepare existing storage')
                 self.assertGreater(volumes_after.verify_calls, 0)
                 self.assertEqual((root / instance_id / 'state' / 'workspace' / 'recovery-marker.txt')
@@ -385,9 +404,144 @@ class SupervisorRestartRecoveryTests(unittest.TestCase):
                     (instance_id,)).fetchone()[0], 1)
             finally:
                 store_after.close()
+    def test_reconcile_does_not_start_networked_instance_when_firewall_restore_fails(self):
+        from supervisor.service import RuntimeService
 
+        instance = {
+            'id': 'd' * 32, 'active': 1, 'state': 'stopped',
+            'desired_state': 'running', 'network_profile': 'agent_proxy_v1',
+        }
 
-class XfsPurgeTests(unittest.TestCase):
+        class Store:
+            def all_instances(self):
+                return [instance]
+            def observe(self, _instance_id, state, _container_id):
+                instance['state'] = state
+
+        class Engine:
+            def __init__(self):
+                self.calls = []
+            def restore_firewall(self):
+                self.calls.append('restore_firewall')
+                raise RuntimeError('synthetic firewall read-back failure')
+            def start(self, _instance_id):
+                self.calls.append('start')
+                raise AssertionError('network start must be gated')
+            def inspect(self, _instance_id):
+                return {'state': 'stopped', 'gateway': 'unknown',
+                        'container_id': 'container', 'network_profile': 'agent_proxy_v1'}
+
+        service = object.__new__(RuntimeService)
+        service.lock = threading.RLock()
+        service.store = Store()
+        service.engine = Engine()
+        service.sidecar_migration = None
+        service._inspect = lambda instance_id: service.engine.inspect(instance_id)
+
+        service.reconcile()
+
+        self.assertEqual(service.engine.calls, ['restore_firewall'])
+        self.assertEqual(instance['desired_state'], 'running')
+        self.assertEqual(instance['state'], 'stopped')
+
+    def test_reconcile_keeps_ollama_instance_stopped_when_route_receipt_is_unavailable(self):
+        from supervisor.service import RuntimeService
+
+        instance = {
+            'id': 'f' * 32, 'active': 1, 'state': 'stopped',
+            'desired_state': 'running', 'network_profile': 'agent_proxy_v1',
+        }
+
+        class Store:
+            def __init__(self):
+                self.observed = []
+            def all_instances(self):
+                return [instance]
+            def observe(self, instance_id, state, container_id):
+                self.observed.append((instance_id, state, container_id))
+                instance['state'] = state
+
+        class Engine:
+            def __init__(self):
+                self.calls = []
+            def restore_firewall(self):
+                self.calls.append('restore_firewall')
+                return {'policy_count': 0, 'instance_ids': [instance['id']], 'ready': True}
+            def inspect(self, instance_id):
+                return {'state': 'stopped', 'gateway': 'not_ready',
+                        'container_id': 'container', 'network_profile': 'agent_proxy_v1',
+                        'config_policy_version': 1}
+            def ensure_ollama_route(self, instance_id):
+                self.calls.append(('ensure_ollama_route', instance_id))
+                return {'ready': False}
+            def start(self, instance_id):
+                self.calls.append(('start', instance_id))
+                raise AssertionError('Gateway must not start without accepted route')
+
+        service = object.__new__(RuntimeService)
+        service.lock = threading.RLock()
+        service.store = Store()
+        service.engine = Engine()
+        service.sidecar_migration = None
+        service.ollama_config = {'default_model_id': 'qwen3.5:9b'}
+        service._inspect = lambda instance_id: service.engine.inspect(instance_id)
+        service.__dict__['_storage'] = lambda instance, *, prepare=False: {'disk_quota_verified': True}
+        service.__dict__['_admit'] = lambda *, quota, preparing=False, requested_disk_bytes=None, network_profile=None: None
+        service._ollama_policy_file_matches = lambda evidence: True
+
+        service.reconcile()
+
+        self.assertEqual(service.engine.calls, [
+            'restore_firewall', ('ensure_ollama_route', instance['id']),
+        ])
+        self.assertEqual(instance['desired_state'], 'running')
+        self.assertEqual(instance['state'], 'stopped')
+
+    def test_reconcile_stops_legacy_container_when_ollama_config_policy_is_unverified(self):
+        from supervisor.service import RuntimeService
+
+        instance = {
+            'id': 'e' * 32, 'active': 1, 'state': 'running',
+            'desired_state': 'running', 'network_profile': 'legacy_none',
+        }
+        observed = {'state': 'running', 'gateway': 'ready', 'container_id': 'container',
+                    'network_profile': 'legacy_none', 'config_policy_version': 0}
+
+        class Store:
+            def all_instances(self):
+                return [instance]
+            def observe(self, _instance_id, state, _container_id):
+                instance['state'] = state
+
+        class Engine:
+            def __init__(self):
+                self.calls = []
+            def restore_firewall(self):
+                self.calls.append('restore_firewall')
+                return {'policy_count': 0, 'instance_ids': [], 'ready': True}
+            def stop(self, _instance_id):
+                self.calls.append('stop')
+                observed['state'] = 'stopped'
+            def inspect(self, _instance_id):
+                return dict(observed)
+
+        service = object.__new__(RuntimeService)
+        service.lock = threading.RLock()
+        service.store = Store()
+        service.engine = Engine()
+        service.sidecar_migration = None
+        service.ollama_config = {
+            'base_url': 'http://10.99.0.10:11434', 'default_model_id': 'qwen3.5:9b',
+            'context_tokens': 8192, 'max_tokens': 512, 'think': False,
+        }
+        service._inspect = lambda instance_id: service.engine.inspect(instance_id)
+
+        service.reconcile()
+
+        self.assertEqual(service.engine.calls, ['restore_firewall', 'stop'])
+        self.assertEqual(instance['desired_state'], 'running')
+        self.assertEqual(instance['state'], 'stopped')
+
     def test_fd_cleanup_recurses_only_through_open_directory_descriptors(self):
         import stat
         from types import SimpleNamespace
@@ -610,6 +764,170 @@ class XfsPurgeTests(unittest.TestCase):
                 self.assertEqual(read_db.execute('SELECT count(*) FROM volume_directories').fetchone()[0], 0)
             self.assertTrue(any(command.startswith('project -C -p ') for command in quota_calls))
             self.assertTrue(any(command.startswith('limit -p bsoft=0 bhard=0') for command in quota_calls))
+class OllamaRouteGateTests(unittest.TestCase):
+    def test_model_policy_gate_requires_route_receipt_before_authorizing_start(self):
+        from types import SimpleNamespace
+        from supervisor.service import RuntimeService, ServiceError
+
+        service = object.__new__(RuntimeService)
+        service.ollama_config = {'default_model_id': 'qwen3.5:9b'}
+        calls = []
+        service.engine = SimpleNamespace(ensure_ollama_route=lambda instance_id: (
+            calls.append(instance_id) or {'ready': False}))
+        service._ollama_policy_file_matches = lambda _evidence: True
+        with self.assertRaises(ServiceError) as failure:
+            service._require_ollama_policy(
+                {'id': 'a' * 32}, {}, {'config_policy_version': 1, 'state': 'stopped'})
+        self.assertEqual(getattr(failure.exception, 'code', None), 'model_policy_unverified')
+        self.assertEqual(calls, ['a' * 32])
+
+
+class OllamaModelChangeTests(unittest.TestCase):
+    def test_admin_switch_updates_existing_config_and_preserves_instance_state(self):
+        import hashlib
+        import json
+        import os
+        from dataclasses import asdict
+        from contextlib import closing
+        from unittest.mock import patch
+        from supervisor.config import validate_profile
+        from supervisor.openclaw_config import build_gateway_config
+        from supervisor.ollama_config import ollama_policy_matches_config
+        from supervisor.runtime_store import RuntimeStore, canonical
+        from supervisor.service import RuntimeService, ServiceError
+
+        profile = validate_profile(dict(schema_version=1, profile_version='model-change', mode='lab',
+            storage=dict(backend='xfs_project_quota', mountpoint='/srv/agents',
+                         expected_uuid='12345678-1234-1234-1234-123456789abc'),
+            agent_limits=dict(ram_bytes=1024, cpu_millicores=100, pids_limit=32, disk_bytes=4096)))
+        fingerprint = hashlib.sha256(
+            json.dumps(asdict(profile), sort_keys=True, separators=(',', ':'),
+                       ensure_ascii=True).encode('ascii')).hexdigest()
+        old_policy = {'base_url': 'http://10.99.0.10:11434', 'default_model_id': 'qwen3.5:9b',
+                      'context_tokens': 8192, 'max_tokens': 512, 'think': False}
+        new_model = 'hf.co/DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF:Q4_K_M'
+
+        class Metrics:
+            def snapshot(self):
+                return dict(sampled_at=100, cpu_window_seconds=60, total_ram_bytes=10**14,
+                            available_ram_bytes=10**14, cpu_percent=0, free_disk_bytes=10**14,
+                            total_cpu_millicores=1000000, total_disk_bytes=10**14)
+
+        class Volumes:
+            def __init__(self, host_path):
+                self.host_path = host_path
+            def verify(self, instance_id, disk_bytes):
+                return {'host_path': self.host_path, 'project_id': 7,
+                        'disk_quota_verified': True}
+
+        class Engine:
+            def __init__(self):
+                self.state = 'running'
+                self.calls = []
+            def inspect(self, _instance_id):
+                return {'state': self.state, 'gateway': 'ready', 'container_id': 'c' * 64,
+                        'network_profile': 'legacy_none', 'config_policy_version': 1}
+            def stop(self, _instance_id):
+                self.calls.append('stop')
+                self.state = 'stopped'
+            def restore_firewall(self):
+                self.calls.append('restore_firewall')
+                return {'policy_count': 0, 'instance_ids': [], 'ready': True}
+            def ensure_ollama_route(self, instance_id):
+                self.calls.append('ensure_ollama_route')
+                return {'ready': True}
+            def start(self, _instance_id):
+                self.calls.append('start')
+                self.state = 'running'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / 'runtime.sqlite3'
+            with closing(RuntimeStore(db_path, profile.profile_version, fingerprint)) as store:
+                limits = profile.agent_limits
+                request = {'actor_id': 'alice', 'action': 'create', 'idempotency_key': 'create',
+                           'settings_revision': 1, 'settings': {'name': 'Agent', 'instructions': 'Hi'}}
+                operation = store.intent(request,
+                    (limits.ram_bytes, limits.cpu_millicores, limits.disk_bytes),
+                    (10**14, 1000000, 10**14))
+                instance_id = operation['instance_id']
+                host_path = Path(tmp) / instance_id
+                workspace = host_path / 'state' / 'workspace'
+                workspace.mkdir(parents=True)
+                marker = workspace / 'user-state.txt'
+                marker.write_text('PRESERVE_SYNTHETIC_STATE', encoding='utf-8')
+                evidence = {'host_path': str(host_path), 'project_id': 7,
+                            'disk_quota_verified': True}
+                store.complete(operation['id'], 'running', 'c' * 64)
+                store.storage_ready(instance_id, evidence)
+                store.initialized(instance_id)
+                self.assertEqual(store.instance(instance_id)['initialized'], 1)
+                self.assertIsNotNone(store.instance(instance_id)['storage'])
+                current_instance = {'id': instance_id, 'actor': 'alice',
+                                    'network_profile': 'legacy_none', 'gateway_token': 'T' * 43}
+                persisted_config = build_gateway_config(current_instance, ollama=old_policy)
+                state = {'config': persisted_config,
+                         'blob': (canonical(persisted_config) + '\n').encode('utf-8')}
+                engine = Engine()
+                service = RuntimeService(profile, store, Volumes(str(host_path)), engine, Metrics(),
+                    capacities=(10**14, 1000000, 10**14), disk_floor_bytes=0, clock=lambda: 100,
+                    ollama_config=old_policy)
+                self.assertEqual(store.ollama_model_id(), old_policy['default_model_id'])
+                self.assertEqual(service.ollama_config['default_model_id'], old_policy['default_model_id'])
+
+                def read_config(evidence, *, require_immutable, with_bytes=False):
+                    return (state['config'], state['blob']) if with_bytes else state['config']
+
+                def replace_config(_state_fd, expected, replacement, **_kwargs):
+                    self.assertEqual(state['blob'], expected)
+                    state['blob'] = replacement
+                    state['config'] = json.loads(replacement.decode('utf-8'))
+
+                service._read_managed_gateway_config = read_config
+                service._open_gateway_state_fd = lambda evidence: os.open(os.devnull, os.O_RDONLY)
+                with patch('supervisor.service.replace_locked_config_at', side_effect=replace_config):
+                    result = service.change_ollama_model({
+                        'expected_model_id': old_policy['default_model_id'],
+                        'new_model_id': new_model,
+                    })
+
+                self.assertEqual(result['updated_instances'], 1)
+                self.assertEqual(service.ollama_config['default_model_id'], new_model)
+                self.assertEqual(state['config']['models']['providers']['ollama']['models'][0]['id'], new_model)
+                self.assertTrue(ollama_policy_matches_config(state['config'], service.ollama_config))
+                self.assertEqual(result['model_id'], new_model)
+                self.assertEqual(store.ollama_model_id(), new_model)
+                current = store.current('alice')
+                assert current is not None
+                self.assertEqual(current['desired_state'], 'running')
+                self.assertEqual(current['container_id'], 'c' * 64)
+                self.assertEqual(engine.calls, [
+                    'stop', 'restore_firewall', 'ensure_ollama_route', 'start'])
+                self.assertEqual(marker.read_text(encoding='utf-8'), 'PRESERVE_SYNTHETIC_STATE')
+                self.assertEqual(state['config']['gateway'], persisted_config['gateway'])
+                self.assertEqual(state['config']['models']['providers']['ollama']['models'][0]['id'], new_model)
+                with closing(RuntimeStore(db_path, profile.profile_version, fingerprint)) as reopened:
+                    restarted = RuntimeService(profile, reopened, Volumes(str(host_path)),
+                        engine, Metrics(), capacities=(10**14, 1000000, 10**14),
+                        disk_floor_bytes=0, clock=lambda: 100, ollama_config=old_policy)
+                    assert restarted.ollama_config is not None
+                    self.assertEqual(restarted.ollama_config['default_model_id'], new_model)
+
+                with self.assertRaises(ServiceError) as stale:
+                    service.change_ollama_model({
+                        'expected_model_id': old_policy['default_model_id'],
+                        'new_model_id': old_policy['default_model_id'],
+                    })
+                self.assertEqual(getattr(stale.exception, 'code', None), 'admin_config_conflict')
+                unchanged = service.change_ollama_model({
+                    'expected_model_id': old_policy['default_model_id'],
+                    'new_model_id': new_model,
+                })
+                self.assertEqual(unchanged['status'], 'unchanged')
+                with self.assertRaises(ServiceError) as invalid:
+                    service.change_ollama_model({
+                        'expected_model_id': new_model, 'new_model_id': 'unsupported:model',
+                    })
+                self.assertEqual(getattr(invalid.exception, 'code', None), 'invalid_request')
 
 
 if __name__ == '__main__':

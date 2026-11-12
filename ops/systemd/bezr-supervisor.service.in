@@ -1,0 +1,23 @@
+# Template only: render and review all @...@ values before installation.
+# Do not enable this unit until the trusted runtime config and mount paths are verified.
+[Unit]
+Description=BEZR privileged Supervisor (firewall-first instance recovery)
+Requires=docker.service
+After=local-fs.target docker.service nftables.service
+RequiresMountsFor=@AGENT_DATA_MOUNTPOINT@
+ConditionPathExists=@RUNTIME_CONFIG_PATH@
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=@PROJECT_ROOT@
+UMask=0077
+ExecStart=@PYTHON_EXECUTABLE@ -m supervisor.service --config @RUNTIME_CONFIG_PATH@ --enable-host-runtime
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

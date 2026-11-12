@@ -3,7 +3,7 @@ import ipaddress
 import re
 from urllib.parse import urlsplit
 
-from .ollama_config import build_openclaw_ollama_config
+from .ollama_config import merge_ollama_policy_into_config
 
 
 _OWNER_RE = re.compile(r"[^\x00-\x20\x7f]{1,256}\Z")
@@ -45,7 +45,7 @@ def _validate_proxy_ip(value):
 def _with_ollama(config, ollama):
     if ollama is None:
         return config
-    return {**config, **build_openclaw_ollama_config(ollama)}
+    return merge_ollama_policy_into_config(config, ollama)
 
 
 def build_gateway_config(instance, *, ollama=None):

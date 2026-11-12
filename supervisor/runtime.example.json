@@ -12,5 +12,7 @@
   "control_ui_domain": null,
   "agent_network_pool": null,
   "frontend_network_pool": null,
-  "ollama": null
+  "ollama": null,
+  "ollama_network_pool": null,
+  "ollama_egress_interface": null
 }

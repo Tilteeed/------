@@ -12,6 +12,8 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+from .ollama_config import MODEL_NAMES
+
 
 class StoreError(Exception):
     def __init__(self, code):
@@ -43,7 +45,8 @@ class RuntimeStore:
                     "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
                 if tables:
                     columns = {row['name'] for row in self.db.execute('PRAGMA table_info(instances)')}
-                    if 'instances' not in tables or 'network_profile' not in columns:
+                    if ('instances' not in tables or 'admin_settings' not in tables
+                            or 'network_profile' not in columns or 'desired_state' not in columns):
                         raise StoreError('runtime_schema_migration_required')
             self.db.execute('PRAGMA journal_mode=WAL')
             self.db.execute('PRAGMA synchronous=FULL')
@@ -51,13 +54,18 @@ class RuntimeStore:
             self.db.execute('PRAGMA foreign_keys=ON')
             self.db.executescript('''
                 CREATE TABLE IF NOT EXISTS binding (id INTEGER PRIMARY KEY CHECK(id=1), version TEXT NOT NULL, fingerprint TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS admin_settings (
+                    key TEXT PRIMARY KEY CHECK(key='ollama_default_model_id'),
+                    value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS instances (
                     id TEXT PRIMARY KEY, actor TEXT NOT NULL, active INTEGER NOT NULL,
                     state TEXT NOT NULL, settings TEXT NOT NULL, revision INTEGER NOT NULL,
                     ram INTEGER NOT NULL, cpu INTEGER NOT NULL, disk INTEGER NOT NULL,
                     gateway_token TEXT NOT NULL, storage TEXT, container_id TEXT,
                     initialized INTEGER NOT NULL DEFAULT 0,
-                    network_profile TEXT NOT NULL DEFAULT 'legacy_none');
+                    network_profile TEXT NOT NULL DEFAULT 'legacy_none',
+                    desired_state TEXT NOT NULL DEFAULT 'stopped'
+                        CHECK(desired_state IN ('running','stopped')));
                 CREATE UNIQUE INDEX IF NOT EXISTS owner_active ON instances(actor) WHERE active=1;
                 CREATE TABLE IF NOT EXISTS operations (
                     id TEXT PRIMARY KEY, actor TEXT NOT NULL, key TEXT NOT NULL,
@@ -74,6 +82,52 @@ class RuntimeStore:
         except BaseException:
             self.db.close()
             raise
+
+    def ollama_model_id(self):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT value FROM admin_settings WHERE key='ollama_default_model_id'").fetchone()
+            if row is None:
+                return None
+            value = row['value']
+            if type(value) is not str or value not in MODEL_NAMES:
+                raise StoreError('admin_config_invalid')
+            return value
+
+    def seed_ollama_model_id(self, model_id):
+        if type(model_id) is not str or model_id not in MODEL_NAMES:
+            raise StoreError('invalid_admin_model')
+        with self.transaction():
+            self.db.execute(
+                "INSERT OR IGNORE INTO admin_settings(key,value) VALUES('ollama_default_model_id',?)",
+                (model_id,))
+            row = self.db.execute(
+                "SELECT value FROM admin_settings WHERE key='ollama_default_model_id'").fetchone()
+            value = row['value'] if row else None
+            if type(value) is not str or value not in MODEL_NAMES:
+                raise StoreError('admin_config_invalid')
+            return value
+
+    def update_ollama_model_id(self, expected_model_id, new_model_id):
+        if (type(expected_model_id) is not str or expected_model_id not in MODEL_NAMES
+                or type(new_model_id) is not str or new_model_id not in MODEL_NAMES):
+            raise StoreError('invalid_admin_model')
+        with self.transaction():
+            row = self.db.execute(
+                "SELECT value FROM admin_settings WHERE key='ollama_default_model_id'").fetchone()
+            if row is None:
+                raise StoreError('admin_config_uninitialized')
+            current = row['value']
+            if current == new_model_id:
+                return False
+            if current != expected_model_id:
+                raise StoreError('admin_config_conflict')
+            changed = self.db.execute(
+                "UPDATE admin_settings SET value=? WHERE key='ollama_default_model_id' AND value=?",
+                (new_model_id, expected_model_id)).rowcount
+            if changed != 1:
+                raise StoreError('admin_config_conflict')
+            return True
 
     @staticmethod
     def migrate_network_profile_schema(database_path, backup_path):
@@ -135,6 +189,97 @@ class RuntimeStore:
             migrated_rows = source.execute('SELECT COUNT(*) FROM instances').fetchone()[0]
             if (source.execute("SELECT COUNT(*) FROM instances WHERE network_profile!='legacy_none'").fetchone()[0]
                     != 0 or source.execute('PRAGMA integrity_check').fetchone()[0] != 'ok'):
+                raise StoreError('runtime_migration_unverified')
+            source.execute('COMMIT')
+            return {'legacy_rows': migrated_rows, 'backup_path': str(backup_path)}
+        except BaseException:
+            if source.in_transaction:
+                source.execute('ROLLBACK')
+            if backup_created and not backup_valid:
+                try:
+                    backup_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if destination is not None:
+                destination.close()
+            source.close()
+
+    @staticmethod
+    def migrate_desired_state_schema(database_path, backup_path):
+        """Back up and add persistent desired-state intent without touching runtime data."""
+        database_path, backup_path = Path(database_path), Path(backup_path)
+        if (database_path.is_symlink() or not database_path.is_file()
+                or backup_path.is_symlink() or backup_path.exists()
+                or not backup_path.parent.is_dir()
+                or database_path.resolve() == backup_path.resolve()):
+            raise StoreError('invalid_migration_path')
+
+        source = sqlite3.connect(str(database_path), isolation_level=None)
+        source.row_factory = sqlite3.Row
+        destination = None
+        backup_created = False
+        backup_valid = False
+        try:
+            tables = {row['name'] for row in source.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+            if tables != {'binding', 'instances', 'operations'}:
+                raise StoreError('runtime_schema_unsupported')
+            columns = {row['name'] for row in source.execute('PRAGMA table_info(instances)')}
+            if 'desired_state' in columns:
+                raise StoreError('runtime_schema_already_migrated')
+            required = {'id', 'actor', 'active', 'state', 'settings', 'revision', 'ram', 'cpu',
+                        'disk', 'gateway_token', 'storage', 'container_id', 'initialized',
+                        'network_profile'}
+            if not required <= columns:
+                raise StoreError('runtime_schema_unsupported')
+            data_version = source.execute('PRAGMA data_version').fetchone()[0]
+            counts = {name: source.execute(f'SELECT COUNT(*) FROM {name}').fetchone()[0]
+                      for name in ('binding', 'instances', 'operations')}
+
+            flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, 'O_BINARY', 0)
+            descriptor = os.open(str(backup_path), flags, 0o600)
+            os.close(descriptor)
+            backup_created = True
+            destination = sqlite3.connect(str(backup_path), isolation_level=None)
+            source.backup(destination)
+            if destination.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                raise StoreError('runtime_backup_unverified')
+            backup_counts = {name: destination.execute(f'SELECT COUNT(*) FROM {name}').fetchone()[0]
+                             for name in ('binding', 'instances', 'operations')}
+            if backup_counts != counts:
+                raise StoreError('runtime_backup_unverified')
+            destination.close()
+            destination = None
+            backup_valid = True
+
+            # Acquire the writer lock only after SQLite's backup API completes.
+            source.execute('BEGIN IMMEDIATE')
+            current_version = source.execute('PRAGMA data_version').fetchone()[0]
+            current_counts = {name: source.execute(f'SELECT COUNT(*) FROM {name}').fetchone()[0]
+                              for name in ('binding', 'instances', 'operations')}
+            current_tables = {row['name'] for row in source.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+            current_columns = {row['name'] for row in source.execute('PRAGMA table_info(instances)')}
+            if (current_version != data_version or current_counts != counts
+                    or current_tables != tables
+                    or 'desired_state' in current_columns or not required <= current_columns):
+                raise StoreError('runtime_migration_concurrent_write')
+            source.execute(
+                "ALTER TABLE instances ADD COLUMN desired_state TEXT NOT NULL DEFAULT 'stopped' "
+                "CHECK(desired_state IN ('running','stopped'))")
+            source.execute(
+                "CREATE TABLE admin_settings (key TEXT PRIMARY KEY "
+                "CHECK(key='ollama_default_model_id'), value TEXT NOT NULL)")
+            source.execute(
+                "UPDATE instances SET desired_state='running' "
+                "WHERE active=1 AND state IN ('running','paused','restarting')")
+            migrated_rows = source.execute('SELECT COUNT(*) FROM instances').fetchone()[0]
+            invalid = source.execute(
+                "SELECT COUNT(*) FROM instances WHERE desired_state NOT IN ('running','stopped') "
+                "OR (active=1 AND state IN ('running','paused','restarting') AND desired_state!='running')")
+            if invalid.fetchone()[0] != 0 or source.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
                 raise StoreError('runtime_migration_unverified')
             source.execute('COMMIT')
             return {'legacy_rows': migrated_rows, 'backup_path': str(backup_path)}
@@ -472,7 +617,7 @@ class RuntimeStore:
                 if checkpoint is None or checkpoint[0] != 0:
                     raise StoreError('purge_scrub_unverified')
                 with self.transaction():
-                    self.db.execute("UPDATE instances SET active=0,state='purged',ram=0,cpu=0,disk=0 WHERE id=?",
+                    self.db.execute("UPDATE instances SET active=0,state='purged',ram=0,cpu=0,disk=0,desired_state='stopped' WHERE id=?",
                                     (instance_id,))
                     self.db.execute("UPDATE operations SET status='completed',error=NULL WHERE id=?",
                                     (operation_id,))
@@ -480,11 +625,18 @@ class RuntimeStore:
 
             with self.transaction():
                 if state == 'removed':
-                    self.db.execute("UPDATE instances SET active=0,state='removed',ram=0,cpu=0,container_id=NULL WHERE id=?",
+                    self.db.execute("UPDATE instances SET active=0,state='removed',ram=0,cpu=0,container_id=NULL,desired_state='stopped' WHERE id=?",
                                     (instance_id,))
                 else:
-                    self.db.execute('UPDATE instances SET state=?,container_id=? WHERE id=? AND active=1',
-                                    (state, container_id, instance_id))
+                    action = operation['action']
+                    if action in {'create', 'start', 'restart', 'restore'}:
+                        desired_state = 'running'
+                    elif action == 'stop':
+                        desired_state = 'stopped'
+                    else:
+                        raise StoreError('invalid_transition')
+                    self.db.execute('UPDATE instances SET state=?,container_id=?,desired_state=? WHERE id=? AND active=1',
+                                    (state, container_id, desired_state, instance_id))
                 self.db.execute("UPDATE operations SET status='completed',error=NULL WHERE id=?",
                                 (operation_id,))
 

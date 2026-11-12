@@ -5,6 +5,7 @@ network route is separately enforced by the host firewall; this module only
 validates and serializes the provider policy.
 """
 from dataclasses import dataclass
+import copy
 import ipaddress
 from urllib.parse import urlsplit
 
@@ -74,10 +75,12 @@ def validate_ollama_config(value) -> OllamaConfig:
 def build_openclaw_ollama_config(value):
     """Build the pinned OpenClaw native provider config from trusted site policy."""
     config = validate_ollama_config(value)
+    model_ref = 'ollama/' + config.default_model_id
     models = [{
         'id': config.default_model_id,
         'name': MODEL_NAMES[config.default_model_id],
         'contextWindow': config.context_tokens,
+        'contextTokens': config.context_tokens,
         'maxTokens': config.max_tokens,
         'params': {
             'num_ctx': config.context_tokens,
@@ -86,6 +89,7 @@ def build_openclaw_ollama_config(value):
     }]
     return {
         'models': {
+            'mode': 'replace',
             'providers': {
                 'ollama': {
                     'baseUrl': config.base_url,
@@ -97,7 +101,62 @@ def build_openclaw_ollama_config(value):
         },
         'agents': {
             'defaults': {
-                'model': {'primary': 'ollama/' + config.default_model_id},
+                'model': {'primary': model_ref},
+                'modelPolicy': {'allow': [model_ref]},
             },
         },
+        'tools': {'deny': ['gateway', 'openclaw']},
+        'plugins': {'entries': {'ollama': {
+            'enabled': True,
+            'config': {
+                'discovery': {'enabled': False},
+                'nodeInference': {'enabled': False},
+            },
+        }}},
     }
+
+
+def merge_ollama_policy_into_config(current, policy):
+    """Replace managed model policy while retaining unrelated OpenClaw plugins."""
+    if type(current) is not dict:
+        raise ValueError('Existing Gateway config is invalid')
+    replacement = build_openclaw_ollama_config(policy)
+    updated = copy.deepcopy(current)
+    for key, value in replacement.items():
+        if key != 'plugins':
+            updated[key] = value
+
+    plugins = updated.get('plugins', {})
+    if type(plugins) is not dict:
+        raise ValueError('Existing OpenClaw plugin config is invalid')
+    entries = plugins.get('entries', {})
+    if type(entries) is not dict:
+        raise ValueError('Existing OpenClaw plugin entries are invalid')
+    entries['ollama'] = replacement['plugins']['entries']['ollama']
+    plugins['entries'] = entries
+    updated['plugins'] = plugins
+    return updated
+
+
+def ollama_policy_matches_config(current, value):
+    """Return whether the persisted Gateway model/tool policy is exactly selected."""
+    if type(current) is not dict:
+        return False
+    try:
+        expected = build_openclaw_ollama_config(value)
+    except (TypeError, ValueError):
+        return False
+    plugins = current.get('plugins')
+    entries = plugins.get('entries') if type(plugins) is dict else None
+    return (current.get('models') == expected['models']
+            and current.get('agents') == expected['agents']
+            and current.get('tools') == expected['tools']
+            and type(entries) is dict
+            and entries.get('ollama') == expected['plugins']['entries']['ollama'])
+
+
+def replace_ollama_policy_in_config(current, current_policy, new_policy):
+    """Replace only the exact managed policy subtrees, preserving Gateway identity state."""
+    if not ollama_policy_matches_config(current, current_policy):
+        raise ValueError('Existing Ollama policy differs from the administrator selection')
+    return merge_ollama_policy_into_config(current, new_policy)

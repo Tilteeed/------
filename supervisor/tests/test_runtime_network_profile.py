@@ -2,6 +2,7 @@
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from supervisor.runtime_store import RuntimeStore
@@ -39,6 +40,27 @@ def create_legacy_database(path, *, wal=False, keep_open=False):
 
 
 class RuntimeNetworkProfileTests(unittest.TestCase):
+    def test_admin_model_selection_is_seeded_once_and_updates_with_compare_and_swap(self):
+        from supervisor.runtime_store import StoreError
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'runtime.sqlite3'
+            first = 'qwen3.5:9b'
+            second = 'hf.co/DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF:Q4_K_M'
+            with closing(RuntimeStore(path, 'site-v1', 'a' * 64)) as store:
+                self.assertEqual(store.seed_ollama_model_id(first), first)
+                self.assertEqual(store.seed_ollama_model_id(second), first,
+                                 'runtime.json default must not overwrite an admin selection')
+                self.assertTrue(store.update_ollama_model_id(first, second))
+                self.assertFalse(store.update_ollama_model_id(second, second))
+                with self.assertRaises(StoreError) as conflict:
+                    store.update_ollama_model_id(first, first)
+                self.assertEqual(conflict.exception.code, 'admin_config_conflict')
+
+            with closing(RuntimeStore(path, 'site-v1', 'a' * 64)) as reopened:
+                self.assertEqual(reopened.ollama_model_id(), second)
+                with self.assertRaises(StoreError):
+                    reopened.update_ollama_model_id(second, 'unsupported:model')
+
     def test_old_database_is_not_mutated_implicitly(self):
         from supervisor.runtime_store import StoreError
         with tempfile.TemporaryDirectory() as tmp:
@@ -60,13 +82,16 @@ class RuntimeNetworkProfileTests(unittest.TestCase):
     def test_explicit_migration_creates_backup_and_preserves_retained_data(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'runtime.sqlite3'
-            backup = Path(tmp) / 'runtime-before-network-profile.sqlite3'
+            network_backup = Path(tmp) / 'runtime-before-network-profile.sqlite3'
+            desired_backup = Path(tmp) / 'runtime-before-desired-state.sqlite3'
             create_legacy_database(path)
-            result = RuntimeStore.migrate_network_profile_schema(path, backup)
+            RuntimeStore.migrate_network_profile_schema(path, network_backup)
+            result = RuntimeStore.migrate_desired_state_schema(path, desired_backup)
             self.assertEqual(result['legacy_rows'], 1)
-            self.assertTrue(backup.is_file())
+            self.assertTrue(network_backup.is_file())
+            self.assertTrue(desired_backup.is_file())
 
-            backup_db = sqlite3.connect(backup)
+            backup_db = sqlite3.connect(network_backup)
             try:
                 columns = {row[1] for row in backup_db.execute('PRAGMA table_info(instances)')}
                 self.assertNotIn('network_profile', columns)
@@ -82,6 +107,97 @@ class RuntimeNetworkProfileTests(unittest.TestCase):
                 self.assertEqual(row['disk'], 10)
                 self.assertEqual(row['settings'], '{"name":"Saved"}')
                 self.assertEqual(store.retained('alice')[0]['instance_id'], '1' * 32)
+            finally:
+                store.close()
+
+    def test_explicit_desired_state_migration_preserves_data_and_infers_only_known_running_state(self):
+        from supervisor.runtime_store import StoreError
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'runtime.sqlite3'
+            network_backup = Path(tmp) / 'runtime-before-network-profile.sqlite3'
+            desired_backup = Path(tmp) / 'runtime-before-desired-state.sqlite3'
+            create_legacy_database(path)
+            RuntimeStore.migrate_network_profile_schema(path, network_backup)
+            db = sqlite3.connect(path)
+            try:
+                db.execute("UPDATE instances SET active=1,state='running',ram=10,cpu=20 WHERE id=?",
+                           ('1' * 32,))
+                db.execute('''INSERT INTO instances
+                    (id,actor,active,state,settings,revision,ram,cpu,disk,gateway_token,
+                     storage,container_id,initialized,network_profile)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    ('2' * 32, 'bob', 1, 'stopped', '{"name":"Other"}', 3,
+                     30, 40, 50, 'token', '{"host_path":"/other"}', 'container-2',
+                     1, 'agent_internal_v1'))
+                db.commit()
+            finally:
+                db.close()
+
+            with self.assertRaises(StoreError) as caught:
+                RuntimeStore(path, 'site-v1', 'a' * 64)
+            self.assertEqual(caught.exception.code, 'runtime_schema_migration_required')
+            result = RuntimeStore.migrate_desired_state_schema(path, desired_backup)
+            self.assertEqual(result['legacy_rows'], 2)
+            self.assertTrue(desired_backup.is_file())
+
+            store = RuntimeStore(path, 'site-v1', 'a' * 64)
+            try:
+                running = store.instance('1' * 32)
+                stopped = store.instance('2' * 32)
+                self.assertEqual(running['desired_state'], 'running')
+                self.assertEqual(stopped['desired_state'], 'stopped')
+                self.assertEqual(stopped['network_profile'], 'agent_internal_v1')
+                self.assertEqual(stopped['settings'], '{"name":"Other"}')
+                self.assertEqual(stopped['storage'], '{"host_path":"/other"}')
+                self.assertEqual(stopped['container_id'], 'container-2')
+            finally:
+                store.close()
+
+    def test_desired_state_migration_cli_requires_explicit_apply_flag(self):
+        import contextlib
+        import io
+        from scripts.migrate_runtime_desired_state import main
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'runtime.sqlite3'
+            network_backup = Path(tmp) / 'runtime-before-network-profile.sqlite3'
+            desired_backup = Path(tmp) / 'runtime-before-desired-state.sqlite3'
+            create_legacy_database(path)
+            RuntimeStore.migrate_network_profile_schema(path, network_backup)
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    main(['--database', str(path), '--backup', str(desired_backup)])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertFalse(desired_backup.exists())
+            db = sqlite3.connect(path)
+            try:
+                columns = {row[1] for row in db.execute('PRAGMA table_info(instances)')}
+                self.assertNotIn('desired_state', columns)
+            finally:
+                db.close()
+
+    def test_desired_state_migration_cli_applies_only_with_explicit_flag(self):
+        import contextlib
+        import io
+        import json
+        from scripts.migrate_runtime_desired_state import main
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'runtime.sqlite3'
+            network_backup = Path(tmp) / 'runtime-before-network-profile.sqlite3'
+            desired_backup = Path(tmp) / 'runtime-before-desired-state.sqlite3'
+            create_legacy_database(path)
+            RuntimeStore.migrate_network_profile_schema(path, network_backup)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status = main(['--database', str(path), '--backup', str(desired_backup), '--apply'])
+            self.assertEqual(status, 0)
+            report = json.loads(output.getvalue())
+            self.assertEqual(report['status'], 'migrated')
+            self.assertEqual(report['legacy_rows'], 1)
+            self.assertEqual(Path(report['backup_path']), desired_backup)
+            self.assertTrue(desired_backup.is_file())
+            store = RuntimeStore(path, 'site-v1', 'a' * 64)
+            try:
+                self.assertEqual(store.instance('1' * 32)['desired_state'], 'stopped')
             finally:
                 store.close()
 

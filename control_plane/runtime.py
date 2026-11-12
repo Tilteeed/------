@@ -125,7 +125,7 @@ class SupervisorClient:
                 raise ValueError('Invalid supervisor response shape')
             # Deliberate response allowlist: no token, paths, environment or raw inspect.
             safe_runtime = {k: v for k, v in runtime.items() if k in (
-                'state', 'gateway', 'model', 'telegram', 'instance_id', 'container_id',
+                'state', 'desired_state', 'gateway', 'model', 'telegram', 'instance_id', 'container_id',
                 'settings_revision', 'operation_status', 'error_code', 'retained_data',
                 'network_profile',
                 'pending_create_key', 'pending_create_revision',

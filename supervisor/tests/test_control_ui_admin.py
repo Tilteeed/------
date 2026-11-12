@@ -13,7 +13,7 @@ from supervisor.service import (
 
 
 class ControlUiMaintenanceHandlerTests(unittest.TestCase):
-    def _request(self, handler_factory, path, payload):
+    def _request(self, handler_factory, path, payload, *, controller=None):
         class Controller:
             def me(self, _payload):
                 return {}
@@ -27,7 +27,8 @@ class ControlUiMaintenanceHandlerTests(unittest.TestCase):
             def manage_control_ui_sidecars(self, value):
                 return {'action': value['action'], 'status': 'ok'}
 
-        server = HTTPServer(('127.0.0.1', 0), handler_factory(Controller(), 'service-test-token'))
+        app = Controller() if controller is None else controller
+        server = HTTPServer(('127.0.0.1', 0), handler_factory(app, 'service-test-token'))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(server.server_close)
@@ -59,6 +60,39 @@ class ControlUiMaintenanceHandlerTests(unittest.TestCase):
                 create_admin_handler, '/v1/admin/control-ui/sidecars', {'action': 'plan'})
         self.assertEqual(status, 200)
         self.assertEqual(body, {'action': 'plan', 'status': 'ok'})
+
+    def test_model_change_endpoint_is_root_admin_only_and_not_public(self):
+        class OllamaController:
+            ollama_config = {'default_model_id': 'qwen3.5:9b'}
+            def me(self, _payload):
+                return {}
+            def action(self, _payload):
+                return {}
+            def replay(self, _payload):
+                return {}
+            def change_ollama_model(self, payload):
+                return {'status': 'updated', 'model_id': payload['new_model_id']}
+            def ollama_model_status(self):
+                return {'model_id': 'qwen3.5:9b'}
+
+        controller = OllamaController()
+        selected = 'hf.co/DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF:Q4_K_M'
+        payload = {'expected_model_id': 'qwen3.5:9b', 'new_model_id': selected}
+        with patch('supervisor.service._unix_peer_uid', return_value=0):
+            status, body = self._request(
+                create_admin_handler, '/v1/admin/ollama/model', {'action': 'status'}, controller=controller)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {'model_id': 'qwen3.5:9b'})
+        with patch('supervisor.service._unix_peer_uid', return_value=0):
+            status, body = self._request(
+                create_admin_handler, '/v1/admin/ollama/model', payload, controller=controller)
+        self.assertEqual(status, 200)
+        self.assertEqual(body['model_id'], selected)
+
+        status, body = self._request(
+            create_handler, '/v1/admin/ollama/model', payload, controller=controller)
+        self.assertEqual(status, 404)
+        self.assertEqual(body['code'], 'not_found')
 
     def test_peer_uid_helper_distinguishes_root_from_nonroot(self):
         class Peer:

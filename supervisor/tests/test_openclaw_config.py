@@ -1,6 +1,10 @@
+import copy
 import unittest
 
 from supervisor.openclaw_config import build_gateway_config
+from supervisor.ollama_config import (
+    ollama_policy_matches_config, replace_ollama_policy_in_config,
+)
 
 
 class GatewayConfigTests(unittest.TestCase):
@@ -101,9 +105,85 @@ class GatewayConfigTests(unittest.TestCase):
         models = provider['models']
         self.assertEqual([model['id'] for model in models], ['qwen3.5:9b'])
         self.assertEqual(built['agents']['defaults']['model']['primary'], 'ollama/qwen3.5:9b')
+        self.assertEqual(built['agents']['defaults']['modelPolicy']['allow'], ['ollama/qwen3.5:9b'])
+        self.assertEqual(built['tools']['deny'], ['gateway', 'openclaw'])
         self.assertEqual(models[0]['contextWindow'], 8192)
+        self.assertEqual(models[0]['contextTokens'], 8192)
         self.assertEqual(models[0]['maxTokens'], 512)
         self.assertEqual(models[0]['params'], {'num_ctx': 8192, 'think': False})
+
+    def test_ollama_catalog_is_static_and_discovery_tools_are_disabled_without_dropping_proxy_plugin(self):
+        instance = self.instance()
+        instance.update({
+            'sidecar_ip': '172.31.4.2',
+            'control_ui_origin': 'https://' + 'a' * 32 + '.agents.example.test',
+        })
+        policy = {
+            'base_url': 'http://10.99.0.10:11434', 'default_model_id': 'qwen3.5:9b',
+            'context_tokens': 8192, 'max_tokens': 512, 'think': False,
+        }
+
+        built: dict = build_gateway_config(instance, ollama=policy)
+
+        self.assertEqual(built['models']['mode'], 'replace')
+        self.assertEqual(built['plugins']['entries']['admin-http-rpc'], {'enabled': True})
+        ollama_plugin = built['plugins']['entries']['ollama']['config']
+        self.assertEqual(ollama_plugin['discovery'], {'enabled': False})
+        self.assertEqual(ollama_plugin['nodeInference'], {'enabled': False})
+        self.assertEqual(built['agents']['defaults']['modelPolicy']['allow'], ['ollama/qwen3.5:9b'])
+        self.assertEqual([item['id'] for item in built['models']['providers']['ollama']['models']],
+                         ['qwen3.5:9b'])
+
+    def test_ollama_policy_readback_requires_exact_selected_provider_and_tool_denials(self):
+        instance = self.instance('legacy_none')
+        policy = {
+            'base_url': 'http://10.99.0.10:11434', 'default_model_id': 'qwen3.5:9b',
+            'context_tokens': 8192, 'max_tokens': 512, 'think': False,
+        }
+        current: dict = build_gateway_config(instance, ollama=policy)
+        self.assertTrue(ollama_policy_matches_config(current, policy))
+
+        tampered_provider = copy.deepcopy(current)
+        tampered_provider['models']['providers']['other'] = {'models': [{'id': 'unapproved'}]}
+        self.assertFalse(ollama_policy_matches_config(tampered_provider, policy))
+
+        tampered_default = copy.deepcopy(current)
+        tampered_default['agents']['defaults']['model']['primary'] = 'ollama/unapproved'
+        self.assertFalse(ollama_policy_matches_config(tampered_default, policy))
+
+        tampered_tools = copy.deepcopy(current)
+        tampered_tools['tools']['deny'] = []
+        self.assertFalse(ollama_policy_matches_config(tampered_tools, policy))
+
+        tampered_plugin = copy.deepcopy(current)
+        tampered_plugin['plugins']['entries']['ollama']['config']['nodeInference']['enabled'] = True
+        self.assertFalse(ollama_policy_matches_config(tampered_plugin, policy))
+
+    def test_controlled_model_config_change_preserves_non_model_gateway_state(self):
+        old_policy = {
+            'base_url': 'http://10.99.0.10:11434', 'default_model_id': 'qwen3.5:9b',
+            'context_tokens': 8192, 'max_tokens': 512, 'think': False,
+        }
+        new_policy = {**old_policy, 'default_model_id':
+            'hf.co/DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF:Q4_K_M'}
+        current: dict = build_gateway_config(self.instance('legacy_none'), ollama=old_policy)
+        current['plugins']['entries']['local-extension'] = {
+            'enabled': True, 'config': {'marker': 'PRESERVE_SYNTHETIC_PLUGIN_CONFIG'},
+        }
+
+        updated = replace_ollama_policy_in_config(current, old_policy, new_policy)
+
+        self.assertEqual(updated['gateway'], current['gateway'])
+        self.assertEqual(updated['plugins']['entries']['local-extension'],
+                         current['plugins']['entries']['local-extension'])
+        self.assertEqual(updated['models']['providers']['ollama']['models'][0]['id'],
+                         new_policy['default_model_id'])
+        self.assertTrue(ollama_policy_matches_config(updated, new_policy))
+        self.assertFalse(ollama_policy_matches_config(updated, old_policy))
+        tampered = copy.deepcopy(current)
+        tampered['models']['providers']['extra'] = {'models': []}
+        with self.assertRaises(ValueError):
+            replace_ollama_policy_in_config(tampered, old_policy, new_policy)
 
     def test_admin_can_select_each_approved_model_without_exposing_the_other(self):
         instance = self.instance()

@@ -229,10 +229,22 @@ class RulesetAdapter(Protocol):
 class NftablesAdapter:
     """Atomic, table-scoped nft CLI adapter with exact JSON read-back."""
     def __init__(self, *, nft_binary='nft', runner: Callable | None = None,
-                 batch_runner: Callable | None = None):
+                 batch_runner: Callable | None = None, table_name=TABLE_NAME,
+                 table_comment=None):
         if type(nft_binary) is not str or not nft_binary or len(nft_binary) > 256:
             raise ValueError('Invalid nft executable')
+        comments = {
+            TABLE_NAME: TABLE_COMMENT,
+            'agent_ollama_v1': 'BEZR managed firewall agent_ollama_v1 v1',
+        }
+        if type(table_name) is not str or table_name not in comments:
+            raise ValueError('Unsupported managed nftables table')
+        expected_comment = comments[table_name]
+        if table_comment is not None and table_comment != expected_comment:
+            raise ValueError('Invalid managed nftables table comment')
         self.nft_binary = nft_binary
+        self.table_name = table_name
+        self.table_comment = expected_comment
         self.runner = runner or run_command
         self.batch_runner = batch_runner or self._run_batch
 
@@ -256,7 +268,7 @@ class NftablesAdapter:
             found = [item['table'] for item in items if type(item) is dict
                      and type(item.get('table')) is dict
                      and item['table'].get('family') == family
-                     and item['table'].get('name') == TABLE_NAME]
+                     and item['table'].get('name') == self.table_name]
             if len(found) > 1:
                 raise ValueError
             if not found:
@@ -264,7 +276,7 @@ class NftablesAdapter:
             listed_handle = found[0].get('handle')
             if type(listed_handle) is not int or listed_handle <= 0:
                 raise ValueError
-            detail = self._read_text((self.nft_binary, '-a', '-j', 'list', 'table', family, TABLE_NAME))
+            detail = self._read_text((self.nft_binary, '-a', '-j', 'list', 'table', family, self.table_name))
             manifest, handle = self._normalise_table(detail, family)
             if handle != listed_handle:
                 raise ValueError
@@ -328,11 +340,11 @@ class NftablesAdapter:
                     continue
                 if type(value) is not dict:
                     raise ValueError
-                if kind == 'table' and value.get('family') == family and value.get('name') == TABLE_NAME:
+                if kind == 'table' and value.get('family') == family and value.get('name') == self.table_name:
                     if table is not None:
                         raise ValueError
                     handle, table = value.get('handle'), self._without_handle(value)
-                elif value.get('family') == family and value.get('table') == TABLE_NAME:
+                elif value.get('family') == family and value.get('table') == self.table_name:
                     if kind == 'chain':
                         chains.append(self._without_handle(value))
                     elif kind == 'rule':
@@ -371,6 +383,10 @@ class NftablesAdapter:
                 return 'ip ' + item['field']
             if item['protocol'] == 'ether' and item['field'] == 'type':
                 return 'ether type'
+            if item['protocol'] == 'tcp' and item['field'] in {'dport', 'sport'}:
+                return 'tcp ' + item['field']
+        if key == 'ct' and type(item) is dict and set(item) == {'key'} and item['key'] == 'state':
+            return 'ct state'
         raise ValueError
 
     @classmethod
@@ -379,55 +395,72 @@ class NftablesAdapter:
             raise ValueError
         key, value = next(iter(expression.items()))
         if key == 'match' and type(value) is dict and set(value) == {'left', 'op', 'right'}:
-            right = value['right']
-            if value['op'] != '==' or type(right) is not str:
+            if value['op'] != '==':
                 raise ValueError
-            if right != 'arp':
+            lvalue = cls._render_lvalue(value['left'])
+            right = value['right']
+            if lvalue in {'ip saddr', 'ip daddr'}:
+                if type(right) is not str:
+                    raise ValueError
                 try:
-                    if str(ipaddress.IPv4Network(right, strict=True)) != right:
+                    network = ipaddress.IPv4Network(right, strict=True)
+                    if str(network) != right:
                         raise ValueError
-                except (TypeError, ValueError):
-                    try:
-                        if str(ipaddress.IPv4Address(right)) != right:
-                            raise ValueError
-                    except (TypeError, ValueError):
-                        if re.fullmatch(r'bz[af][0-9a-f]{12}', right) is None:
-                            raise ValueError
-            return f'{cls._render_lvalue(value["left"])} == {right}'
+                except ValueError:
+                    address = ipaddress.IPv4Address(right)
+                    if str(address) != right:
+                        raise ValueError
+            elif lvalue in {'meta iifname', 'meta oifname', 'meta ibrname', 'meta obrname'}:
+                if type(right) is not str or re.fullmatch(r'[A-Za-z0-9_.:-]{1,15}', right) is None:
+                    raise ValueError
+            elif lvalue == 'ether type':
+                if right != 'arp':
+                    raise ValueError
+            elif lvalue in {'tcp dport', 'tcp sport'}:
+                if type(right) is not int or not 1 <= right <= 65535:
+                    raise ValueError
+            elif lvalue == 'ct state':
+                if right != 'established':
+                    raise ValueError
+            else:
+                raise ValueError
+            return f'{lvalue} == {right}'
         if key in {'accept', 'drop'} and value is None:
             return key
         raise ValueError
 
-    @classmethod
-    def _render_batch(cls, ruleset, inventory):
+    def _render_batch(self, ruleset, inventory):
         lines = []
         for family in ('inet', 'bridge'):
             old = inventory.get(family)
             if old is not None:
                 lines.append(f'delete table {family} handle {old["handle"]}')
             table = ruleset['tables'][family]
-            if table['table'] != {'family': family, 'name': TABLE_NAME, 'comment': TABLE_COMMENT}:
+            expected_table = {'family': family, 'name': self.table_name,
+                              'comment': self.table_comment}
+            if table['table'] != expected_table:
                 raise ValueError
-            lines.append(f'create table {family} {TABLE_NAME} {{ comment "{TABLE_COMMENT}"; }}')
+            lines.append(f'create table {family} {self.table_name} '
+                         f'{{ comment "{self.table_comment}"; }}')
             for chain in table['chains']:
-                if (chain.get('family') != family or chain.get('table') != TABLE_NAME
+                if (chain.get('family') != family or chain.get('table') != self.table_name
                         or chain.get('type') != 'filter' or chain.get('policy') != 'accept'
                         or chain.get('hook') != chain.get('name')
                         or chain.get('name') not in {'input', 'output', 'forward'}
                         or type(chain.get('prio')) is not int
                         or re.fullmatch(r'BEZR [A-Za-z0-9 _-]+', chain.get('comment', '')) is None):
                     raise ValueError
-                lines.append(f'add chain {family} {TABLE_NAME} {chain["name"]} {{ '
+                lines.append(f'add chain {family} {self.table_name} {chain["name"]} {{ '
                              f'type filter hook {chain["hook"]} priority {chain["prio"]}; '
                              f'policy accept; comment "{chain["comment"]}"; }}')
             for rule in table['rules']:
-                if (rule.get('family') != family or rule.get('table') != TABLE_NAME
+                if (rule.get('family') != family or rule.get('table') != self.table_name
                         or rule.get('chain') not in {'input', 'output', 'forward'}
                         or re.fullmatch(r'BEZR [A-Za-z0-9 .:>_-]+', rule.get('comment', '')) is None
                         or type(rule.get('expr')) is not list or not rule['expr']):
                     raise ValueError
-                expr = ' '.join(cls._render_expr(item) for item in rule['expr'])
-                lines.append(f'add rule {family} {TABLE_NAME} {rule["chain"]} {expr} '
+                expr = ' '.join(self._render_expr(item) for item in rule['expr'])
+                lines.append(f'add rule {family} {self.table_name} {rule["chain"]} {expr} '
                              f'comment "{rule["comment"]}"')
         batch = '\n'.join(lines) + '\n'
         if len(batch.encode('utf-8')) > MAX_RULESET_BYTES:
@@ -445,7 +478,7 @@ class NftablesAdapter:
             for family, old in inventory.items():
                 if old is not None:
                     table = old['manifest']['tables'][family]['table']
-                    if table.get('comment') != TABLE_COMMENT:
+                    if table.get('comment') != self.table_comment:
                         raise FirewallError('Refusing to replace an unowned nftables table')
             self.batch_runner([self.nft_binary, '-f', '-'], self._render_batch(ruleset, inventory))
         except FirewallError:
@@ -460,7 +493,7 @@ class NftablesAdapter:
             if old is None:
                 continue
             table = old['manifest']['tables'][family]['table']
-            if table.get('comment') != TABLE_COMMENT:
+            if table.get('comment') != self.table_comment:
                 raise FirewallError('Refusing to remove an unowned nftables table')
             lines.append(f'delete table {family} handle {old["handle"]}')
         if lines:

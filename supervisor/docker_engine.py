@@ -24,6 +24,12 @@ from .config import AgentLimits
 from .firewall import (
     EndpointPair, FirewallManager, NftablesAdapter, NetworkPolicy, validate_networks,
 )
+from .ollama_config import validate_ollama_config
+from .ollama_firewall import (
+    TABLE_COMMENT as OLLAMA_TABLE_COMMENT, TABLE_NAME as OLLAMA_TABLE_NAME,
+    OllamaFirewallManager, OllamaRoutePolicy, validate_ollama_route_inputs,
+    validate_ollama_routes,
+)
 from .network_routes import HostIPv4Inventory, read_host_ipv4_networks
 
 
@@ -120,7 +126,9 @@ class DockerEngine:
 
     def __init__(self, image, engine_socket='/var/run/docker.sock', *,
                  agent_network_pool=None, frontend_network_pool=None,
-                 firewall=None, host_route_provider: Callable[[], HostIPv4Inventory] | None = None):
+                 ollama_network_pool=None, ollama_egress_interface=None,
+                 ollama_config=None, firewall=None, ollama_firewall=None,
+                 host_route_provider: Callable[[], HostIPv4Inventory] | None = None):
         if not isinstance(image, str) or not self._IMAGE.fullmatch(image):
             raise ValueError('An explicit immutable Docker image digest is required')
         if (not isinstance(engine_socket, str) or not engine_socket.startswith('/')
@@ -142,6 +150,31 @@ class DockerEngine:
             self.frontend_network_pool = None
         self.firewall = (firewall if firewall is not None else FirewallManager(
             NftablesAdapter(), semantics_validated=False))
+        route_configured = any(value is not None for value in (
+            ollama_network_pool, ollama_egress_interface, ollama_config, ollama_firewall))
+        if not route_configured:
+            self.ollama_config = None
+            self.ollama_network_pool = None
+            self.ollama_egress_interface = None
+            self.ollama_ip = None
+            self.ollama_firewall = None
+        else:
+            if (ollama_config is None or ollama_network_pool is None
+                    or ollama_egress_interface is None
+                    or self.agent_network_pool is None or self.frontend_network_pool is None):
+                raise ValueError('Ollama route requires an Ollama policy and all explicit network settings')
+            self.ollama_config = asdict(validate_ollama_config(ollama_config))
+            endpoint = urlsplit(self.ollama_config['base_url']).hostname
+            pool, interface = validate_ollama_route_inputs(
+                ollama_network_pool, ollama_egress_interface, endpoint,
+                protected_pools=(self.agent_network_pool, self.frontend_network_pool))
+            self.ollama_network_pool = pool
+            self.ollama_egress_interface = interface
+            self.ollama_ip = endpoint
+            self.ollama_firewall = (ollama_firewall if ollama_firewall is not None else
+                OllamaFirewallManager(NftablesAdapter(
+                    table_name=OLLAMA_TABLE_NAME, table_comment=OLLAMA_TABLE_COMMENT),
+                    semantics_validated=False))
         if host_route_provider is not None and not callable(host_route_provider):
             raise ValueError('Host route provider must be callable')
         self.host_route_provider = host_route_provider or read_host_ipv4_networks
@@ -333,6 +366,118 @@ class DockerEngine:
                 'sidecar_ip': ip(frontend_net, 3),
             },
         }
+
+    @classmethod
+    def _ollama_network_plan(cls, instance_id, ollama_network_pool, *,
+                             occupied_subnets=(), host_routes=(), endpoint_ip=None):
+        """Allocate an independent per-Gateway egress /29, avoiding every known route."""
+        instance_id = cls._instance(instance_id)
+        pool = cls._proxy_pool(ollama_network_pool)
+        try:
+            routes = tuple(ipaddress.IPv4Network(value, strict=True) for value in host_routes)
+            occupied = tuple(ipaddress.IPv4Network(value, strict=True)
+                             for value in occupied_subnets)
+            if endpoint_ip is not None:
+                endpoint = ipaddress.IPv4Address(endpoint_ip)
+                if str(endpoint) != endpoint_ip:
+                    raise ValueError
+                routes = (*routes, ipaddress.IPv4Network(f'{endpoint}/32'))
+        except (TypeError, ValueError):
+            raise ValueError('Invalid Ollama network route inventory') from None
+        if len(routes) > 4096 or len(occupied) > 4096:
+            raise ValueError('Ollama network inventory exceeds the safety limit')
+        conflicts = (*occupied, *routes)
+        for subnet in pool.subnets(new_prefix=29):
+            if any(subnet.overlaps(other) for other in conflicts):
+                continue
+            base = subnet.network_address
+            return {
+                'name': 'pa-ollama-' + instance_id,
+                'bridge': 'bzo' + instance_id[:12],
+                'subnet': str(subnet),
+                'gateway': str(base + 1),
+                'gateway_ip': str(base + 2),
+            }
+        raise DockerEngineError('No free Ollama route subnet remains in the configured pool')
+
+    @classmethod
+    def _ollama_network_payload(cls, instance_id, network):
+        instance_id = cls._instance(instance_id)
+        if type(network) is not dict or set(network) != {
+                'name', 'bridge', 'subnet', 'gateway', 'gateway_ip'}:
+            raise ValueError('Invalid Ollama network plan')
+        try:
+            subnet = ipaddress.IPv4Network(network['subnet'], strict=True)
+        except (ValueError, TypeError):
+            raise ValueError('Invalid Ollama network subnet') from None
+        if subnet.prefixlen != 29:
+            raise ValueError('Ollama egress networks must use /29 subnets')
+        base = subnet.network_address
+        expected = {
+            'name': 'pa-ollama-' + instance_id,
+            'bridge': 'bzo' + instance_id[:12],
+            'subnet': str(subnet),
+            'gateway': str(base + 1),
+            'gateway_ip': str(base + 2),
+        }
+        if network != expected:
+            raise ValueError('Ollama route plan identity or fixed address mismatch')
+        return {
+            'Name': expected['name'], 'Driver': 'bridge', 'Internal': False,
+            'Attachable': False, 'EnableIPv6': False,
+            'IPAM': {'Driver': 'default', 'Config': [
+                {'Subnet': expected['subnet'], 'Gateway': expected['gateway']}]},
+            'Options': {
+                'com.docker.network.bridge.name': expected['bridge'],
+                'com.docker.network.bridge.enable_ip_masquerade': 'true',
+                'com.docker.network.bridge.enable_icc': 'false',
+            },
+            'Labels': {
+                **cls._labels(instance_id),
+                cls.NETWORK_SCHEMA_LABEL: 'agent_ollama_v1',
+            },
+        }
+
+    @classmethod
+    def _ollama_network_from_observation(cls, instance_id, observed, pool):
+        instance_id = cls._instance(instance_id)
+        if type(observed) is not dict:
+            raise DockerEngineError('Invalid Ollama network observation')
+        try:
+            ipam = observed['IPAM']
+            configs = ipam['Config']
+            if (type(ipam) is not dict or ipam.get('Driver') != 'default'
+                    or type(configs) is not list or len(configs) != 1
+                    or type(configs[0]) is not dict
+                    or set(configs[0]) != {'Subnet', 'Gateway'}):
+                raise ValueError
+            subnet = ipaddress.IPv4Network(configs[0]['Subnet'], strict=True)
+            gateway = ipaddress.IPv4Address(configs[0]['Gateway'])
+            allowed_pool = cls._proxy_pool(pool)
+        except (KeyError, TypeError, ValueError):
+            raise DockerEngineError('Ollama network IPAM verification failed') from None
+        if subnet.prefixlen != 29 or not subnet.subnet_of(allowed_pool):
+            raise DockerEngineError('Ollama network subnet is outside the configured pool')
+        base = subnet.network_address
+        plan = {
+            'name': 'pa-ollama-' + instance_id,
+            'bridge': 'bzo' + instance_id[:12],
+            'subnet': str(subnet), 'gateway': str(base + 1),
+            'gateway_ip': str(base + 2),
+        }
+        expected = cls._ollama_network_payload(instance_id, plan)
+        try:
+            cls._object(observed.get('Id'))
+        except (DockerEngineError, TypeError):
+            raise DockerEngineError('Ollama network identity is invalid') from None
+        if (observed.get('Name') != expected['Name']
+                or observed.get('Driver') != 'bridge' or observed.get('Internal') is not False
+                or observed.get('Attachable') is not False or observed.get('EnableIPv6') is not False
+                or observed.get('Ingress') is not False or observed.get('Options') != expected['Options']
+                or observed.get('Labels') != expected['Labels']
+                or gateway != ipaddress.IPv4Address(base + 1)):
+            raise DockerEngineError('Ollama network configuration verification failed')
+        return plan
 
     @classmethod
     def _proxy_network_payload(cls, instance_id, network, *, role):
@@ -676,19 +821,25 @@ class DockerEngine:
 
     def proxy_network_policies(self):
         """Read every managed agent/frontend /29 pair for firewall readiness."""
-        if (type(self.agent_network_pool) is not str
-                or type(self.frontend_network_pool) is not str):
-            raise DockerEngineError('Proxy network pools are unavailable')
         rows = self._request('GET', '/networks')
         if type(rows) is not list or len(rows) > 4096:
             raise DockerEngineError('Docker network inventory is invalid')
-        grouped = {}
+        managed_rows = []
         for row in rows:
             if type(row) is not dict:
                 raise DockerEngineError('Docker network inventory is invalid')
             name = row.get('Name')
-            if type(name) is not str or not name.startswith(('pa-agent-', 'pa-front-')):
-                continue
+            if type(name) is not str:
+                raise DockerEngineError('Docker network inventory is invalid')
+            if name.startswith(('pa-agent-', 'pa-front-')):
+                managed_rows.append((row, name))
+        if not managed_rows:
+            return ()
+        if (type(self.agent_network_pool) is not str
+                or type(self.frontend_network_pool) is not str):
+            raise DockerEngineError('Proxy network pools are unavailable')
+        grouped = {}
+        for row, name in managed_rows:
             match = re.fullmatch(r'pa-(agent|front)-([0-9a-f]{32})', name)
             labels = row.get('Labels')
             if match is None or type(labels) is not dict:
@@ -718,6 +869,356 @@ class DockerEngine:
                 raise DockerEngineError('Proxy network pair is incomplete')
             policies.append(self._proxy_firewall_policy(instance_id, roles))
         return validate_networks(policies) if policies else ()
+
+    @staticmethod
+    def _assert_ollama_network_disjoint_from_host(plan, inventory):
+        if not isinstance(inventory, HostIPv4Inventory):
+            raise DockerEngineError('Host route inventory is invalid for Ollama egress')
+        subnet = ipaddress.IPv4Network(plan['subnet'], strict=True)
+        bridge = plan['bridge']
+        gateway = plan['gateway']
+        gateway_address_present = any(
+            address.ifname == bridge and address.local == gateway
+            and address.prefixlen == subnet.prefixlen
+            for address in inventory.addresses)
+        for address in inventory.addresses:
+            address_network = ipaddress.IPv4Network(address.network, strict=True)
+            if not address_network.overlaps(subnet):
+                continue
+            if (gateway_address_present and address.ifname == bridge
+                    and address.local == gateway and address.prefixlen == subnet.prefixlen):
+                continue
+            raise DockerEngineError('Ollama route subnet overlaps a foreign host address')
+
+        local_gateway_route = ipaddress.IPv4Network(f'{gateway}/32')
+        broadcast_routes = {
+            ipaddress.IPv4Network(f'{subnet.network_address}/32'),
+            ipaddress.IPv4Network(f'{subnet.broadcast_address}/32'),
+        }
+        connected_route_present = False
+        for route in inventory.routes:
+            route_network = ipaddress.IPv4Network(route.network, strict=True)
+            if not route_network.overlaps(subnet):
+                continue
+            if (not gateway_address_present or route.interface != bridge
+                    or route.protocol != 'kernel'
+                    or route.prefsrc not in (None, gateway)):
+                raise DockerEngineError('Ollama route subnet overlaps a foreign host route')
+            if (route_network == subnet and route.scope == 'link'
+                    and route.route_type in (None, 'unicast')):
+                connected_route_present = True
+                continue
+            if (route_network == local_gateway_route and route.route_type == 'local'
+                    and route.scope == 'host'):
+                continue
+            if (route_network in broadcast_routes and route.route_type == 'broadcast'
+                    and route.scope == 'link'):
+                continue
+            raise DockerEngineError('Ollama route subnet overlaps a foreign host route')
+        if not gateway_address_present or not connected_route_present:
+            raise DockerEngineError('Ollama bridge route ownership cannot be verified')
+
+    def ollama_route_policies(self):
+        """Read each dedicated egress bridge and rebuild its exact per-instance rule."""
+        rows = self._request('GET', '/networks')
+        if type(rows) is not list or len(rows) > 4096:
+            raise DockerEngineError('Docker network inventory is invalid')
+        managed = {}
+        for row in rows:
+            if type(row) is not dict:
+                raise DockerEngineError('Docker network inventory is invalid')
+            name = row.get('Name')
+            if type(name) is str and name.startswith('pa-ollama-'):
+                if name in managed:
+                    raise DockerEngineError('Ollama route network names are ambiguous')
+                managed[name] = row
+        if not managed:
+            return ()
+        if (self.ollama_config is None or type(self.ollama_network_pool) is not str
+                or type(self.ollama_egress_interface) is not str
+                or type(self.ollama_ip) is not str):
+            raise DockerEngineError('Unconfigured Ollama route network exists')
+        try:
+            host_inventory = self.host_route_provider()
+        except Exception:
+            raise DockerEngineError('Host route inventory is unavailable for Ollama egress') from None
+        if not isinstance(host_inventory, HostIPv4Inventory):
+            raise DockerEngineError('Host route inventory is invalid for Ollama egress')
+        policies = []
+        for name, row in sorted(managed.items()):
+            match = re.fullmatch(r'pa-ollama-([0-9a-f]{32})', name)
+            if match is None:
+                raise DockerEngineError('Unrecognized Ollama route network name')
+            instance_id = match.group(1)
+            labels = row.get('Labels')
+            expected_labels = {
+                **self._labels(instance_id),
+                self.NETWORK_SCHEMA_LABEL: 'agent_ollama_v1',
+            }
+            if type(labels) is not dict or labels != expected_labels:
+                raise DockerEngineError('Ollama route network ownership labels failed verification')
+            network_id = self._object(row.get('Id'))
+            observed = self._request('GET', '/networks/' + network_id)
+            plan = self._ollama_network_from_observation(
+                instance_id, observed, self.ollama_network_pool)
+            self._assert_ollama_network_disjoint_from_host(plan, host_inventory)
+            if observed.get('Id') != network_id or observed.get('Name') != name:
+                raise DockerEngineError('Ollama route network identity verification failed')
+            members = observed.get('Containers') or {}
+            if type(members) is not dict or len(members) > 1:
+                raise DockerEngineError('Ollama route network has unexpected participants')
+            if members:
+                container_id = self._object(next(iter(members)))
+                member = members[container_id]
+                gateway = self._find(instance_id)
+                if (gateway is None or self._object(gateway.get('Id')) != container_id
+                        or type(member) is not dict
+                        or member.get('IPv4Address') != plan['gateway_ip'] + '/29'):
+                    raise DockerEngineError('Ollama route network Gateway membership failed verification')
+                config = gateway.get('Config')
+                gateway_labels = config.get('Labels') if type(config) is dict else None
+                if (type(gateway_labels) is not dict
+                        or gateway_labels.get(self.MANAGED_LABEL) != 'true'
+                        or gateway_labels.get(self.INSTANCE_LABEL) != instance_id):
+                    raise DockerEngineError('Ollama route participant identity failed verification')
+            policies.append(OllamaRoutePolicy(
+                instance_id, plan['subnet'], plan['gateway'], plan['gateway_ip'],
+                self.ollama_ip, self.ollama_egress_interface))
+        return validate_ollama_routes(policies)
+
+    def ensure_ollama_route(self, instance_id):
+        """Attach a dedicated route only after its host-bound firewall receipt is valid."""
+        instance_id = self._instance(instance_id)
+        firewall = self.ollama_firewall
+        if (self.ollama_config is None or firewall is None
+                or getattr(firewall, 'can_apply', False) is not True):
+            raise DockerEngineError('Ollama egress route is not authorized')
+        gateway = self._find(instance_id)
+        if gateway is None:
+            raise DockerEngineError('Managed Gateway is absent for Ollama route preparation')
+        gateway_id = self._verify(instance_id, gateway)
+        labels = gateway.get('Config', {}).get('Labels', {})
+        try:
+            spec = json.loads(labels[self.SPEC_LABEL])
+        except Exception:
+            raise DockerEngineError('Managed Gateway policy is invalid') from None
+        if (type(spec) is not dict or spec.get('version') != 3
+                or spec.get('config_policy_version') != 1):
+            raise DockerEngineError('Ollama egress requires a verified proxy Gateway')
+
+        status = (gateway.get('State') or {}).get('Status')
+        networks = (gateway.get('NetworkSettings') or {}).get('Networks') or {}
+        if type(networks) is not dict:
+            raise DockerEngineError('Gateway network observation is invalid')
+        route_name = 'pa-ollama-' + instance_id
+        route_attached = route_name in networks
+        if status == 'running' and not route_attached:
+            raise DockerEngineError('A live Gateway cannot acquire an unverified Ollama route')
+
+        rows = self._request('GET', '/networks')
+        if type(rows) is not list or len(rows) > 4096:
+            raise DockerEngineError('Docker network inventory is invalid')
+        by_name = {}
+        occupied = []
+        for row in rows:
+            if type(row) is not dict:
+                raise DockerEngineError('Docker network inventory is invalid')
+            name = row.get('Name')
+            if type(name) is str:
+                if name in by_name:
+                    raise DockerEngineError('Docker network names are ambiguous')
+                by_name[name] = row
+            ipam = row.get('IPAM') or {}
+            if type(ipam) is not dict:
+                raise DockerEngineError('Docker network IPAM inventory is invalid')
+            configs = ipam.get('Config') or []
+            if type(configs) is not list:
+                raise DockerEngineError('Docker network IPAM inventory is invalid')
+            for config in configs:
+                if type(config) is not dict or type(config.get('Subnet')) is not str:
+                    raise DockerEngineError('Docker network subnet inventory is invalid')
+                try:
+                    subnet = ipaddress.IPv4Network(config['Subnet'], strict=True)
+                except ValueError:
+                    raise DockerEngineError('Docker network subnet inventory is invalid') from None
+                if str(subnet) != config['Subnet']:
+                    raise DockerEngineError('Docker network subnet inventory is invalid')
+                occupied.append(str(subnet))
+        try:
+            host_inventory = self.host_route_provider()
+            if not isinstance(host_inventory, HostIPv4Inventory):
+                raise ValueError
+        except Exception:
+            raise DockerEngineError('Host route inventory is unavailable for Ollama egress') from None
+
+        created = False
+        try:
+            existing = by_name.get(route_name)
+            if existing is None:
+                plan = self._ollama_network_plan(
+                    instance_id, self.ollama_network_pool,
+                    occupied_subnets=occupied, host_routes=host_inventory.networks,
+                    endpoint_ip=self.ollama_ip)
+                payload = self._ollama_network_payload(instance_id, plan)
+                result = self._request('POST', '/networks/create', payload, ok=(201,))
+                created = True
+                if type(result) is not dict:
+                    raise DockerEngineError('Invalid Ollama route network creation response')
+                network_id = self._object(result.get('Id'))
+            else:
+                network_id = self._object(existing.get('Id'))
+                observed = self._request('GET', '/networks/' + network_id)
+                plan = self._ollama_network_from_observation(
+                    instance_id, observed, self.ollama_network_pool)
+                if observed.get('Name') != route_name or observed.get('Id') != network_id:
+                    raise DockerEngineError('Existing Ollama route network identity changed')
+
+            observed = self._request('GET', '/networks/' + network_id)
+            verified_plan = self._ollama_network_from_observation(
+                instance_id, observed, self.ollama_network_pool)
+            if verified_plan != plan:
+                raise DockerEngineError('Ollama route network postcondition failed')
+            route_policies = self.ollama_route_policies()
+            policy = next((item for item in route_policies if item.instance_id == instance_id), None)
+            if policy is None:
+                raise DockerEngineError('Ollama route policy inventory is incomplete')
+            ready = getattr(firewall, 'ready', None)
+            apply = getattr(firewall, 'apply', None)
+            if not callable(ready) or not callable(apply):
+                raise DockerEngineError('Ollama route firewall manager is unavailable')
+            if ready(route_policies) is not True:
+                apply(route_policies)
+            if ready(route_policies) is not True:
+                raise DockerEngineError('Ollama route firewall read-back failed')
+
+            attached = self._ensure_container_network(
+                gateway_id, network_id, route_name, plan['gateway_ip'])
+            if type(attached) is not dict or attached.get('Id') != gateway_id:
+                raise DockerEngineError('Gateway Ollama route attachment failed')
+            final_policies = self.ollama_route_policies()
+            if policy not in final_policies or ready(final_policies) is not True:
+                raise DockerEngineError('Gateway Ollama route postcondition failed')
+            return {'ready': True, 'network_id': network_id, 'created': created}
+        except Exception:
+            if created:
+                try:
+                    self.remove_ollama_network(instance_id)
+                except Exception:
+                    raise DockerEngineError(
+                        'Ollama route setup failed and new network cleanup could not be verified') from None
+            # Existing per-instance IPAM is retained for safe retry; this method
+            # never starts the Gateway, and its lifecycle caller fails closed.
+            raise
+
+    def remove_ollama_network(self, instance_id):
+        """Purge one exact empty route network and reconcile its independent nft table."""
+        instance_id = self._instance(instance_id)
+        name = 'pa-ollama-' + instance_id
+        rows = self._request('GET', '/networks?' + urlencode(
+            {'filters': self._json({'name': [name]})}))
+        if type(rows) is not list or len(rows) > 1:
+            raise DockerEngineError('Ollama route network identity is ambiguous')
+        if not rows:
+            return False
+        if (self.ollama_config is None or self.ollama_firewall is None
+                or getattr(self.ollama_firewall, 'can_apply', False) is not True):
+            raise DockerEngineError('Ollama route cleanup is not authorized')
+        row = rows[0]
+        if type(row) is not dict:
+            raise DockerEngineError('Invalid Ollama route network observation')
+        network_id = self._object(row.get('Id'))
+        network = self._request('GET', '/networks/' + network_id)
+        plan = self._ollama_network_from_observation(
+            instance_id, network, self.ollama_network_pool)
+        expected_labels = {
+            **self._labels(instance_id),
+            self.NETWORK_SCHEMA_LABEL: 'agent_ollama_v1',
+        }
+        members = network.get('Containers')
+        if (network.get('Id') != network_id or network.get('Name') != name
+                or network.get('Labels') != expected_labels
+                or members not in ({}, None)):
+            raise DockerEngineError('Ollama route network is not safe to remove')
+        try:
+            host_inventory = self.host_route_provider()
+        except Exception:
+            raise DockerEngineError('Host route inventory is unavailable for Ollama cleanup') from None
+        self._assert_ollama_network_disjoint_from_host(plan, host_inventory)
+        gateway = self._find(instance_id)
+        if gateway is not None:
+            settings = gateway.get('NetworkSettings')
+            attached = settings.get('Networks') if type(settings) is dict else None
+            if type(attached) is not dict or name in attached:
+                raise DockerEngineError('Gateway still references the Ollama route network')
+        policies = self.ollama_route_policies()
+        if not any(item.instance_id == instance_id for item in policies):
+            raise DockerEngineError('Ollama route policy inventory is incomplete')
+        firewall = self.ollama_firewall
+        ready = getattr(firewall, 'ready', None)
+        apply = getattr(firewall, 'apply', None)
+        if not callable(ready) or not callable(apply):
+            raise DockerEngineError('Ollama route firewall manager is unavailable')
+        try:
+            if ready(policies) is not True:
+                apply(policies)
+            if ready(policies) is not True:
+                raise ValueError
+        except Exception:
+            raise DockerEngineError('Ollama route firewall pre-purge check failed') from None
+        self._request('DELETE', '/networks/' + network_id, ok=(204,))
+        remaining = self._request('GET', '/networks?' + urlencode(
+            {'filters': self._json({'name': [name]})}))
+        if type(remaining) is not list or remaining:
+            raise DockerEngineError('Ollama route network removal could not be verified')
+        remaining_policies = self.ollama_route_policies()
+        try:
+            if ready(remaining_policies) is not True:
+                apply(remaining_policies)
+            if ready(remaining_policies) is not True:
+                raise ValueError
+        except Exception:
+            raise DockerEngineError('Ollama route firewall cleanup could not be verified') from None
+        return True
+
+    def restore_firewall(self):
+        """Restore both exact receipt-gated policies before any boot recovery start."""
+        proxy_policies = self.proxy_network_policies()
+        route_policies = self.ollama_route_policies() if self.ollama_config is not None else ()
+        if not proxy_policies and not route_policies:
+            return {'policy_count': 0, 'instance_ids': [], 'ready': True}
+
+        if proxy_policies:
+            apply = getattr(self.firewall, 'apply', None)
+            ready = getattr(self.firewall, 'ready', None)
+            if (getattr(self.firewall, 'can_apply', False) is not True
+                    or not callable(apply) or not callable(ready)):
+                raise DockerEngineError('Host firewall restore is not authorized')
+            try:
+                if ready(proxy_policies) is not True:
+                    apply(proxy_policies)
+                if ready(proxy_policies) is not True:
+                    raise ValueError
+            except Exception:
+                raise DockerEngineError('Host firewall restore could not be verified') from None
+
+        if route_policies:
+            route_firewall = self.ollama_firewall
+            apply = getattr(route_firewall, 'apply', None)
+            ready = getattr(route_firewall, 'ready', None)
+            if (getattr(route_firewall, 'can_apply', False) is not True
+                    or not callable(apply) or not callable(ready)):
+                raise DockerEngineError('Ollama firewall restore is not authorized')
+            try:
+                if ready(route_policies) is not True:
+                    apply(route_policies)
+                if ready(route_policies) is not True:
+                    raise ValueError
+            except Exception:
+                raise DockerEngineError('Ollama firewall restore could not be verified') from None
+
+        instance_ids = sorted({policy.instance_id for policy in (*proxy_policies, *route_policies)})
+        return {'policy_count': len(proxy_policies) + len(route_policies),
+                'instance_ids': instance_ids, 'ready': True}
 
     def _proxy_firewall_policy(self, instance_id, plan):
         instance_id = self._instance(instance_id)
@@ -2214,11 +2715,15 @@ class DockerEngine:
         return asdict(limits)
 
     def _spec(self, host_path, limits, *, version=2, instance_id=None, proxy_network=None,
-              owner_id=None, control_ui_origin=None):
+              owner_id=None, control_ui_origin=None, config_policy_version=1):
         if type(version) is not int or version not in (1, 2, 3):
             raise ValueError('Unsupported managed container spec version')
+        if type(config_policy_version) is not int or config_policy_version not in (0, 1):
+            raise ValueError('Unsupported managed config policy version')
         spec = {'version': version, 'image': self.image,
                 'host_path': self._host_path(host_path), 'limits': self._limits(limits)}
+        if config_policy_version == 1:
+            spec['config_policy_version'] = 1
         if version == 3:
             instance_id = self._instance(instance_id)
             if type(proxy_network) is not dict:
@@ -2258,6 +2763,9 @@ class DockerEngine:
         elif (not isinstance(token, str) or not 1 <= len(token) <= 4096
                 or any(ord(c) < 33 or ord(c) > 126 for c in token)):
             raise ValueError('A nonempty bounded gateway token is required')
+        config_policy_version = spec.get('config_policy_version', 0)
+        if type(config_policy_version) is not int or config_policy_version not in (0, 1):
+            raise ValueError('Unsupported managed config policy version')
         environment = {}
         for item in image_info['Config'].get('Env') or []:
             if not isinstance(item, str) or '=' not in item:
@@ -2265,6 +2773,8 @@ class DockerEngine:
             key, value = item.split('=', 1)
             environment[key] = value
         environment.update(self._ENV)
+        if spec.get('config_policy_version', 0) == 1:
+            environment['OPENCLAW_CONFIG_READONLY'] = '1'
         if proxy_profile:
             environment.pop('OPENCLAW_GATEWAY_TOKEN', None)
         else:
@@ -2277,6 +2787,12 @@ class DockerEngine:
             {'Type': 'bind', 'Source': path + '/secrets', 'Target': '/home/node/.config/openclaw',
              'ReadOnly': False, 'BindOptions': {'Propagation': 'rprivate', 'CreateMountpoint': False}},
         ]
+        if spec.get('config_policy_version', 0) == 1:
+            mounts.insert(1, {
+                'Type': 'bind', 'Source': path + '/state/openclaw.json',
+                'Target': '/home/node/.openclaw/openclaw.json', 'ReadOnly': True,
+                'BindOptions': {'Propagation': 'rprivate', 'CreateMountpoint': False},
+            })
         if proxy_profile:
             assert isinstance(proxy_network, dict)
             network_mode = proxy_network['name']
@@ -2340,6 +2856,59 @@ class DockerEngine:
                  'RW': not m['ReadOnly'], 'Propagation': 'rprivate'}
                 for m in payload['HostConfig']['Mounts']]
 
+    def _verify_ollama_network_attachment(self, instance_id, container_id, observed):
+        """Verify that only the exact Gateway owns its dedicated Ollama endpoint."""
+        if (self.ollama_config is None or type(self.ollama_network_pool) is not str
+                or type(self.ollama_ip) is not str):
+            raise DockerEngineError('Ollama route is not configured')
+        name = 'pa-ollama-' + self._instance(instance_id)
+        rows = self._request('GET', '/networks?' + urlencode(
+            {'filters': self._json({'name': [name]})}))
+        if type(rows) is not list or len(rows) != 1 or type(rows[0]) is not dict:
+            raise DockerEngineError('Ollama route network is absent or ambiguous')
+        network_id = self._object(rows[0].get('Id'))
+        network = self._request('GET', '/networks/' + network_id)
+        plan = self._ollama_network_from_observation(
+            instance_id, network, self.ollama_network_pool)
+        expected_labels = {
+            **self._labels(instance_id),
+            self.NETWORK_SCHEMA_LABEL: 'agent_ollama_v1',
+        }
+        if (network.get('Id') != network_id or network.get('Name') != name
+                or network.get('Labels') != expected_labels):
+            raise DockerEngineError('Ollama route network ownership failed verification')
+        try:
+            status = self._verify_proxy_endpoint(
+                observed, name, network_id, plan['gateway_ip'])
+        except (ValueError, KeyError, TypeError):
+            raise DockerEngineError('Ollama Gateway endpoint failed verification') from None
+        raw_members = network.get('Containers')
+        members = {} if raw_members is None else raw_members
+        if type(members) is not dict or set(members) - {container_id}:
+            raise DockerEngineError('Ollama route network has unexpected participants')
+        if status == 'running' or status in self._LIVE_NOT_READY_CONTAINER_STATES:
+            if set(members) != {container_id}:
+                raise DockerEngineError('Live Gateway is missing from the Ollama route network')
+        elif status in self._CONFIG_ONLY_CONTAINER_STATES:
+            if set(members) not in (set(), {container_id}):
+                raise DockerEngineError('Created Gateway route membership is invalid')
+        else:
+            raise DockerEngineError('Gateway lifecycle is unsafe for Ollama route verification')
+        if container_id in members:
+            member = members[container_id]
+            if type(member) is not dict:
+                raise DockerEngineError('Ollama route endpoint metadata is invalid')
+            value = member.get('IPv4Address')
+            if type(value) is not str:
+                raise DockerEngineError('Ollama route endpoint address is invalid')
+            try:
+                actual = str(ipaddress.ip_interface(value).ip)
+            except ValueError:
+                raise DockerEngineError('Ollama route endpoint address is invalid') from None
+            if actual != plan['gateway_ip']:
+                raise DockerEngineError('Ollama route endpoint address changed')
+        return network_id, plan
+
     def _verify(self, instance_id, observed, expected_spec=None, expected_token=None):
         """Verify labels AND actual immutable image/mounts/resources/isolation."""
         try:
@@ -2350,7 +2919,12 @@ class DockerEngine:
             spec = json.loads(labels[self.SPEC_LABEL])
             if type(spec) is not dict or type(spec.get('version')) is not int:
                 raise ValueError
+            config_policy_version = spec.get('config_policy_version', 0)
+            if type(config_policy_version) is not int or config_policy_version not in (0, 1):
+                raise ValueError
             spec_keys = {'version', 'image', 'host_path', 'limits'}
+            if config_policy_version == 1:
+                spec_keys.add('config_policy_version')
             if spec['version'] == 3:
                 spec_keys.update({'proxy_network', 'owner_id', 'control_ui_origin'})
             elif spec['version'] not in (1, 2):
@@ -2361,7 +2935,8 @@ class DockerEngine:
                 spec['host_path'], AgentLimits(**spec['limits']), version=spec['version'],
                 instance_id=instance_id if spec['version'] == 3 else None,
                 proxy_network=spec.get('proxy_network'), owner_id=spec.get('owner_id'),
-                control_ui_origin=spec.get('control_ui_origin'))
+                control_ui_origin=spec.get('control_ui_origin'),
+                config_policy_version=config_policy_version)
             if spec != expected_spec:
                 raise ValueError
             if spec['image'] != self.image or (expected_spec is not None and spec != expected_spec):
@@ -2436,7 +3011,14 @@ class DockerEngine:
             else:
                 proxy_network = spec['proxy_network']
                 network_name = proxy_network['name']
-                if set(networks) != {network_name}:
+                route_name = 'pa-ollama-' + instance_id
+                expected_networks = {network_name}
+                if route_name in networks:
+                    if self.ollama_config is None:
+                        raise ValueError
+                    self._verify_ollama_network_attachment(instance_id, container_id, observed)
+                    expected_networks.add(route_name)
+                if set(networks) != expected_networks:
                     raise ValueError
                 attached = networks[network_name]
                 if type(attached) is not dict:
@@ -2707,12 +3289,15 @@ class DockerEngine:
         gateway = 'unknown'
         if health in ('healthy', 'unhealthy', 'starting'):
             gateway = 'ready' if state == 'running' and health == 'healthy' else 'not_ready'
-        spec_version = json.loads(observed['Config']['Labels'][self.SPEC_LABEL])['version']
+        spec = json.loads(observed['Config']['Labels'][self.SPEC_LABEL])
+        spec_version = spec['version']
+        config_policy_version = spec.get('config_policy_version', 0)
         network_profile = {1: self.NETWORK_PROFILE_LEGACY,
                            2: self.NETWORK_PROFILE_PRIVATE,
                            3: self.NETWORK_PROFILE_PROXY}[spec_version]
         result = {'state': state, 'gateway': gateway, 'container_id': container_id,
-                  'network_profile': network_profile}
+                  'network_profile': network_profile,
+                  'config_policy_version': config_policy_version}
         if spec_version == 3:
             spec = json.loads(observed['Config']['Labels'][self.SPEC_LABEL])
             target = self.control_ui_target(instance_id, spec['owner_id'])
@@ -2738,6 +3323,45 @@ class DockerEngine:
                     result['gateway'] = 'not_ready'
             result['proxy_state'] = 'ready' if target is not None else 'not_ready'
             result['proxy_identity'] = target['identity'] if target is not None else None
+        if self.ollama_config is not None:
+            route_ready = False
+            try:
+                route_name = 'pa-ollama-' + instance_id
+                network_map = (observed.get('NetworkSettings') or {}).get('Networks') or {}
+                policies = self.ollama_route_policies()
+                route_manager = self.ollama_firewall
+                route_ready = (
+                    type(network_map) is dict and route_name in network_map
+                    and any(item.instance_id == instance_id for item in policies)
+                    and route_manager is not None
+                    and callable(getattr(route_manager, 'ready', None))
+                    and route_manager.ready(policies) is True)
+            except Exception:
+                route_ready = False
+            result['ollama_route_state'] = 'ready' if route_ready else 'not_ready'
+            if not route_ready and state in {'running', 'paused', 'restarting'}:
+                if not self._stop_proxy_containers(instance_id):
+                    raise DockerEngineError(
+                        'Ollama route drift detected and Gateway stop could not be verified')
+                latest = self._find(instance_id)
+                if latest is None:
+                    result.update({'state': 'absent', 'gateway': 'unknown', 'container_id': None})
+                else:
+                    latest_state = latest.get('State') or {}
+                    latest_status = latest_state.get('Status') if type(latest_state) is dict else None
+                    if latest_status == 'created':
+                        result['state'] = 'created'
+                    elif (latest_status == 'exited' and latest_state.get('ExitCode') == 0
+                          and not latest_state.get('OOMKilled')):
+                        result['state'] = 'stopped'
+                    elif latest_status in {'exited', 'dead'}:
+                        result['state'] = 'failed'
+                    else:
+                        raise DockerEngineError('Gateway remained live after Ollama route stop')
+                    result['gateway'] = 'not_ready'
+                if 'proxy_state' in result:
+                    result['proxy_state'] = 'not_ready'
+                    result['proxy_identity'] = None
         return result
 
     def _action(self, instance_id, action):
@@ -2958,6 +3582,8 @@ class DockerEngine:
             if current is not None and (current[2].get('Containers') or {}):
                 raise DockerEngineError('Proxy network did not become empty')
         if not retain_networks:
+            if self.ollama_config is not None:
+                self.remove_ollama_network(instance_id)
             self.remove_proxy_networks(instance_id)
         return {'state': 'absent', 'gateway': 'unknown', 'container_id': None}
 
@@ -3016,6 +3642,8 @@ class DockerEngine:
                     'Per-agent firewall policy is not ready and proxy stop could not be verified')
             raise DockerEngineError('Per-agent firewall policy is not ready')
         try:
+            if self.ollama_config is not None:
+                self.ensure_ollama_route(instance_id)
             gateway_state = observed.get('State') or {}
             if gateway_state.get('Status') != 'running':
                 self._action(instance_id, 'start')

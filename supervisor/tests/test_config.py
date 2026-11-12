@@ -90,6 +90,47 @@ class ServiceConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_service_config(path)
 
+    def test_enabled_ollama_requires_separate_explicit_egress_network_and_interface(self):
+        from supervisor.service import load_service_config
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'runtime.json'
+            data = self.config()
+            data['ollama'] = {
+                'base_url': 'http://10.99.0.10:11434',
+                'default_model_id': 'qwen3.5:9b',
+                'context_tokens': 8192,
+                'max_tokens': 512,
+                'think': False,
+            }
+            data.update({
+                'network_profile_default': 'agent_proxy_v1',
+                'control_ui_domain': 'agents.example.test',
+                'agent_network_pool': '10.240.0.0/13',
+                'frontend_network_pool': '10.248.0.0/13',
+            })
+            path.write_text(json.dumps(data), encoding='utf-8')
+            with self.assertRaises(ValueError):
+                load_service_config(path)
+
+            data['ollama_network_pool'] = '172.20.0.0/16'
+            data['ollama_egress_interface'] = 'ens18'
+            path.write_text(json.dumps(data), encoding='utf-8')
+            enabled = load_service_config(path)
+            self.assertEqual(enabled['ollama_network_pool'], '172.20.0.0/16')
+            self.assertEqual(enabled['ollama_egress_interface'], 'ens18')
+
+            for invalid_pool, invalid_interface in (
+                ('10.240.0.0/13', 'ens18'),
+                ('10.250.0.0/16', 'ens18;drop'),
+                ('10.99.0.0/16', 'ens18'),
+                ('192.0.2.0/24', 'ens18'),
+            ):
+                data['ollama_network_pool'] = invalid_pool
+                data['ollama_egress_interface'] = invalid_interface
+                path.write_text(json.dumps(data), encoding='utf-8')
+                with self.subTest(pool=invalid_pool, interface=invalid_interface), self.assertRaises(ValueError):
+                    load_service_config(path)
+
     def test_ollama_policy_is_optional_and_closed(self):
         from supervisor.service import load_service_config
         with tempfile.TemporaryDirectory() as tmp:
@@ -108,6 +149,14 @@ class ServiceConfigTests(unittest.TestCase):
                 'think': False,
             }
             data['ollama'] = policy
+            data.update({
+                'network_profile_default': 'agent_proxy_v1',
+                'control_ui_domain': 'agents.example.test',
+                'agent_network_pool': '10.240.0.0/13',
+                'frontend_network_pool': '10.248.0.0/13',
+                'ollama_network_pool': '172.20.0.0/16',
+                'ollama_egress_interface': 'ens18',
+            })
             path.write_text(json.dumps(data), encoding='utf-8')
             enabled = load_service_config(path)
             self.assertEqual(enabled['ollama'], policy)

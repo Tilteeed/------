@@ -24,12 +24,20 @@ import sys
 import threading
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from .config import load_profile, _unique_object, _reject_constant
+from .config_lock import (
+    initialize_config_fd, is_immutable, read_managed_config_fd,
+    replace_locked_config_at, verify_config_fd,
+)
 from .metrics import HostMetrics, MetricsUnavailable
 from .openclaw_config import build_gateway_config
-from .ollama_config import validate_ollama_config
+from .ollama_config import (
+    MODEL_NAMES, ollama_policy_matches_config,
+    replace_ollama_policy_in_config, validate_ollama_config,
+)
+from .ollama_firewall import validate_ollama_route_inputs
 from .policy import evaluate_admission
 from .runtime_store import RuntimeStore, StoreError, canonical
 from .workspace_files import RetainedWorkspace, WorkspaceFileError
@@ -72,6 +80,11 @@ MESSAGES = {
     'purge_scrub_unverified': 'Purge cleanup is pending; retry using the original operation key.',
     'profile_drift': 'Deployment profile differs from the durable binding.',
     'unsafe_initialization': 'Initial private runtime files could not be verified.',
+    'model_policy_unverified': 'Administrator model policy could not be verified.',
+    'invalid_admin_model': 'Unsupported administrator-selected model.',
+    'admin_config_uninitialized': 'Administrator model selection is not initialized.',
+    'admin_config_conflict': 'Administrator model selection changed; reload and retry.',
+    'admin_config_invalid': 'Administrator model selection failed integrity checks.',
     'internal_error': 'Service operation failed.',
     'invalid_file_path': 'Invalid workspace path.',
     'file_not_found': 'Workspace file not found.',
@@ -184,6 +197,59 @@ def _initial_file(parent_fd, name, data):
         os.close(fd)
 
 
+def _initial_managed_config_at(parent_fd, data, *, require_immutable):
+    """Create or harden only the fixed Gateway config path before container creation."""
+    if (type(parent_fd) is not int or parent_fd < 0 or type(data) is not bytes
+            or not 1 <= len(data) <= 65536 or type(require_immutable) is not bool):
+        raise ServiceError('unsafe_initialization', 503)
+    nofollow = getattr(os, 'O_NOFOLLOW', None)
+    if type(nofollow) is not int:
+        raise ServiceError('unsafe_initialization', 503)
+    name = 'openclaw.json'
+    fd = None
+    try:
+        try:
+            fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow,
+                         0o600, dir_fd=parent_fd)
+        except FileExistsError:
+            fd = os.open(name, os.O_RDONLY | nofollow, dir_fd=parent_fd)
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_size != len(data)):
+                raise ServiceError('unsafe_initialization', 503)
+            with os.fdopen(os.dup(fd), 'rb') as stream:
+                existing = stream.read(65537)
+            if existing != data:
+                raise ServiceError('unsafe_initialization', 503)
+            metadata = (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode))
+            if metadata == (0, 1000, 0o440):
+                if not require_immutable:
+                    verify_config_fd(fd, data, require_immutable=False)
+                    return
+                if is_immutable(fd) is True:
+                    verify_config_fd(fd, data, require_immutable=True)
+                    return
+            elif metadata != (1000, 1000, 0o600):
+                raise ServiceError('unsafe_initialization', 503)
+            identity = (info.st_dev, info.st_ino)
+            os.close(fd)
+            fd = None
+            fd = os.open(name, os.O_RDWR | nofollow, dir_fd=parent_fd)
+            writable_info = os.fstat(fd)
+            if (writable_info.st_dev, writable_info.st_ino) != identity:
+                raise ServiceError('unsafe_initialization', 503)
+        initialize_config_fd(fd, data, require_immutable=require_immutable)
+        os.fsync(parent_fd)
+        verify_config_fd(fd, data, require_immutable=require_immutable)
+    except ServiceError:
+        raise
+    except Exception:
+        raise ServiceError('unsafe_initialization', 503) from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def initialize_files(instance, evidence, ollama_config=None):
     """Fixed filenames only. Existing initialized agent files are never overwritten."""
     root_fd = os.open(evidence['host_path'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -196,7 +262,9 @@ def initialize_files(instance, evidence, ollama_config=None):
             config = build_gateway_config(instance, ollama=ollama_config)
         except ValueError:
             raise ServiceError('unsafe_initialization', 503) from None
-        _initial_file(state_fd, 'openclaw.json', (canonical(config) + '\n').encode('utf-8'))
+        config_blob = (canonical(config) + '\n').encode('utf-8')
+        _initial_managed_config_at(
+            state_fd, config_blob, require_immutable=ollama_config is not None)
         # A torn initial write must not silently permit a container to start.
         fd = os.open('openclaw.json', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=state_fd)
         with os.fdopen(fd, 'rb') as stream:
@@ -258,6 +326,13 @@ class RuntimeService:
         self.frontend_network_pool = frontend_network_pool
         self.ollama_config = (None if ollama_config is None else
                               asdict(validate_ollama_config(ollama_config)))
+        if self.ollama_config is not None:
+            selected_model = self.store.ollama_model_id()
+            if selected_model is None:
+                selected_model = self.store.seed_ollama_model_id(
+                    self.ollama_config['default_model_id'])
+            self.ollama_config = {**self.ollama_config,
+                                  'default_model_id': selected_model}
         self.lock = threading.RLock()
         self.sidecar_migration: Any = None
 
@@ -307,6 +382,9 @@ class RuntimeService:
             if not self._absent(info):
                 if actual_profile not in RuntimeStore.NETWORK_PROFILES:
                     raise ValueError()
+                config_policy_version = info.get('config_policy_version', 0)
+                if type(config_policy_version) is not int or config_policy_version not in (0, 1):
+                    raise ValueError()
                 if expected_profile is not None and actual_profile != expected_profile:
                     raise ValueError()
             return info
@@ -340,9 +418,101 @@ class RuntimeService:
             print('Storage guard: ' + code, file=sys.stderr, flush=True)
             raise ServiceError('storage_unavailable', 503) from None
 
+    def _read_managed_gateway_config(self, evidence, *, require_immutable, with_bytes=False):
+        if (type(with_bytes) is not bool or type(evidence) is not dict
+                or type(evidence.get('host_path')) is not str):
+            return None
+        nofollow, directory = getattr(os, 'O_NOFOLLOW', None), getattr(os, 'O_DIRECTORY', None)
+        if type(nofollow) is not int or type(directory) is not int:
+            return None
+        root_fd = state_fd = config_fd = None
+        try:
+            root_fd = os.open(evidence['host_path'], os.O_RDONLY | directory | nofollow)
+            state_fd = os.open('state', os.O_RDONLY | directory | nofollow, dir_fd=root_fd)
+            state_info = os.fstat(state_fd)
+            if (not stat.S_ISDIR(state_info.st_mode) or state_info.st_uid != 1000
+                    or state_info.st_gid != 1000 or stat.S_IMODE(state_info.st_mode) != 0o700):
+                return None
+            config_fd = os.open('openclaw.json', os.O_RDONLY | nofollow, dir_fd=state_fd)
+            _info, blob = read_managed_config_fd(
+                config_fd, require_immutable=require_immutable)
+            current = decode_json(blob)
+            if type(current) is not dict:
+                return None
+            return (current, blob) if with_bytes else current
+        except Exception:
+            return None
+        finally:
+            for fd in (config_fd, state_fd, root_fd):
+                if fd is not None:
+                    os.close(fd)
+
+    def _open_gateway_state_fd(self, evidence):
+        if type(evidence) is not dict or type(evidence.get('host_path')) is not str:
+            raise ServiceError('storage_unavailable', 503)
+        nofollow, directory = getattr(os, 'O_NOFOLLOW', None), getattr(os, 'O_DIRECTORY', None)
+        if type(nofollow) is not int or type(directory) is not int:
+            raise ServiceError('unsafe_initialization', 503)
+        root_fd = state_fd = None
+        try:
+            root_fd = os.open(evidence['host_path'], os.O_RDONLY | directory | nofollow)
+            state_fd = os.open('state', os.O_RDONLY | directory | nofollow, dir_fd=root_fd)
+            info = os.fstat(state_fd)
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 1000 or info.st_gid != 1000
+                    or stat.S_IMODE(info.st_mode) != 0o700):
+                raise ServiceError('unsafe_initialization', 503)
+            result = state_fd
+            state_fd = None
+            return result
+        except ServiceError:
+            raise
+        except Exception:
+            raise ServiceError('unsafe_initialization', 503) from None
+        finally:
+            if state_fd is not None:
+                os.close(state_fd)
+            if root_fd is not None:
+                os.close(root_fd)
+
+    def _ollama_policy_file_matches(self, evidence):
+        """Require the exact selected provider and tool policy in immutable config."""
+        if self.ollama_config is None:
+            return True
+        current = self._read_managed_gateway_config(evidence, require_immutable=True)
+        return current is not None and ollama_policy_matches_config(current, self.ollama_config)
+
+    def _require_ollama_policy(self, instance, evidence, info):
+        if self.ollama_config is None:
+            return
+        verified = (type(info) is dict and info.get('config_policy_version') == 1
+                    and self._ollama_policy_file_matches(evidence))
+        if verified:
+            ensure_route = getattr(self.engine, 'ensure_ollama_route', None)
+            try:
+                route = ensure_route(instance['id']) if callable(ensure_route) else None
+                verified = type(route) is dict and route.get('ready') is True
+            except Exception:
+                verified = False
+        if verified:
+            return
+        if type(info) is dict and info.get('state') in {'running', 'restarting', 'paused'}:
+            try:
+                self.engine.stop(instance['id'])
+                latest = self._inspect(instance['id'])
+                if latest['state'] not in {'stopped', 'exited', 'created', 'failed'}:
+                    raise ServiceError('runtime_unavailable', 503)
+                self.store.observe(instance['id'], latest['state'], latest.get('container_id'))
+            except ServiceError:
+                raise
+            except Exception:
+                raise ServiceError('runtime_unavailable', 503) from None
+        raise ServiceError('model_policy_unverified', 503)
+
     def _view(self, instance=None, operation=None, info=None):
         state = instance['state'] if instance else 'not_created'
-        runtime = dict(state=state, gateway='not_connected', model='not_connected',
+        runtime = dict(state=state,
+                       desired_state=(instance.get('desired_state', 'stopped') if instance else 'stopped'),
+                       gateway='not_connected', model='not_connected',
                        telegram='not_connected', instance_id=instance['id'] if instance else None,
                        settings_revision=instance['revision'] if instance else None)
         if info and instance and instance['active']:
@@ -581,6 +751,7 @@ class RuntimeService:
                     self._admit(quota=evidence['disk_quota_verified'],
                                 requested_disk_bytes=0 if action == 'restore' else None,
                                 network_profile=instance['network_profile'])
+                    self._require_ollama_policy(instance, evidence, info)
                     if info['state'] != 'running':
                         self.engine.start(instance_id)
                 elif action == 'start':
@@ -589,6 +760,7 @@ class RuntimeService:
                         raise ServiceError('runtime_unavailable', 503)
                     self._admit(quota=evidence['disk_quota_verified'],
                                 network_profile=instance['network_profile'])
+                    self._require_ollama_policy(instance, evidence, info)
                     if info['state'] != 'running':
                         self.engine.start(instance_id)
                 elif action == 'restart':
@@ -597,6 +769,7 @@ class RuntimeService:
                         raise ServiceError('runtime_unavailable', 503)
                     self._admit(quota=evidence['disk_quota_verified'],
                                 network_profile=instance['network_profile'])
+                    self._require_ollama_policy(instance, evidence, info)
                     self.engine.restart(instance_id)
                 elif action == 'stop':
                     if not self._absent(info) and info['state'] not in {'stopped', 'exited', 'created'}:
@@ -757,6 +930,183 @@ class RuntimeService:
         except Exception:
             raise ServiceError('runtime_unavailable', 503) from None
 
+    def ollama_model_status(self):
+        if self.ollama_config is None:
+            raise ServiceError('runtime_unavailable', 503)
+        try:
+            model_id = self.store.ollama_model_id()
+        except StoreError as error:
+            raise ServiceError(error.code, 503) from None
+        if model_id is None:
+            raise ServiceError('admin_config_uninitialized', 503)
+        return {'model_id': model_id}
+
+    def change_ollama_model(self, payload):
+        """Root-only model switch; rewrite locked config and retain every data volume."""
+        if (type(payload) is not dict or set(payload) != {'expected_model_id', 'new_model_id'}
+                or type(payload.get('expected_model_id')) is not str
+                or payload['expected_model_id'] not in MODEL_NAMES
+                or type(payload.get('new_model_id')) is not str
+                or payload['new_model_id'] not in MODEL_NAMES):
+            raise ServiceError('invalid_request', 400)
+        with self.lock:
+            if self.ollama_config is None:
+                raise ServiceError('runtime_unavailable', 503)
+            migration = getattr(self, 'sidecar_migration', None)
+            if migration is not None:
+                try:
+                    if migration.status().get('status') in {'in_progress', 'needs_attention'}:
+                        raise ServiceError('maintenance_in_progress', 503)
+                except ServiceError:
+                    raise
+                except Exception:
+                    raise ServiceError('runtime_unavailable', 503) from None
+
+            try:
+                current_id = self.store.ollama_model_id()
+            except StoreError as error:
+                raise ServiceError(error.code, 503) from None
+            if current_id is None:
+                raise ServiceError('admin_config_uninitialized', 503)
+            new_id = payload['new_model_id']
+            if new_id == current_id:
+                return {'status': 'unchanged', 'model_id': current_id,
+                        'updated_instances': 0, 'restart_pending': 0}
+            if payload['expected_model_id'] != current_id:
+                raise ServiceError('admin_config_conflict', 409)
+
+            old_policy = dict(self.ollama_config)
+            try:
+                new_policy = asdict(validate_ollama_config(
+                    {**old_policy, 'default_model_id': new_id}))
+            except ValueError:
+                raise ServiceError('invalid_admin_model', 400) from None
+
+            plans = []
+            for instance in self.store.all_instances():
+                if (not instance.get('initialized') or not instance.get('storage')
+                        or instance.get('state') == 'purged'):
+                    continue
+                info = self._inspect(instance['id'])
+                if instance['active']:
+                    if (not self._absent(info)
+                            and info.get('config_policy_version') != 1):
+                        raise ServiceError('model_policy_unverified', 503)
+                elif not self._absent(info):
+                    raise ServiceError('runtime_unavailable', 503)
+                evidence = self._storage(instance)
+                saved = self._read_managed_gateway_config(
+                    evidence, require_immutable=False, with_bytes=True)
+                if type(saved) is not tuple or len(saved) != 2:
+                    raise ServiceError('model_policy_unverified', 503)
+                current_config, old_blob = saved
+                if ollama_policy_matches_config(current_config, old_policy):
+                    updated_config = replace_ollama_policy_in_config(
+                        current_config, old_policy, new_policy)
+                    new_blob = (canonical(updated_config) + '\n').encode('utf-8')
+                elif ollama_policy_matches_config(current_config, new_policy):
+                    # Retry after a crash can finish files already switched before DB CAS.
+                    new_blob = old_blob
+                else:
+                    raise ServiceError('model_policy_unverified', 503)
+                plans.append({
+                    'instance': instance, 'info': info, 'evidence': evidence,
+                    'old_blob': old_blob, 'new_blob': new_blob,
+                    'needs_update': old_blob != new_blob,
+                })
+
+            try:
+                for plan in plans:
+                    instance, info = plan['instance'], plan['info']
+                    if instance['active'] and info['state'] in {'running', 'restarting', 'paused'}:
+                        self.engine.stop(instance['id'])
+                        stopped = self._inspect(instance['id'])
+                        if stopped['state'] not in {'stopped', 'exited', 'created', 'failed'}:
+                            raise ServiceError('runtime_unavailable', 503)
+                        self.store.observe(instance['id'], stopped['state'],
+                                           stopped.get('container_id'))
+                        plan['info'] = stopped
+            except Exception as stop_error:
+                try:
+                    self.reconcile()
+                except Exception:
+                    pass
+                if isinstance(stop_error, ServiceError):
+                    raise stop_error
+                raise ServiceError('runtime_unavailable', 503) from None
+
+            attempted = []
+            try:
+                for plan in plans:
+                    if not plan['needs_update']:
+                        continue
+                    attempted.append(plan)
+                    state_fd = self._open_gateway_state_fd(plan['evidence'])
+                    try:
+                        replace_locked_config_at(
+                            state_fd, plan['old_blob'], plan['new_blob'])
+                    finally:
+                        os.close(state_fd)
+                self.store.update_ollama_model_id(current_id, new_id)
+                if self.store.ollama_model_id() != new_id:
+                    raise StoreError('admin_config_conflict')
+            except Exception as error:
+                rollback_failed = False
+                for plan in reversed(attempted):
+                    try:
+                        saved = self._read_managed_gateway_config(
+                            plan['evidence'], require_immutable=False, with_bytes=True)
+                        if type(saved) is not tuple or len(saved) != 2:
+                            rollback_failed = True
+                            continue
+                        _current_config, current_blob = saved
+                        if current_blob == plan['old_blob']:
+                            continue
+                        if current_blob != plan['new_blob']:
+                            rollback_failed = True
+                            continue
+                        state_fd = self._open_gateway_state_fd(plan['evidence'])
+                        try:
+                            replace_locked_config_at(
+                                state_fd, plan['new_blob'], plan['old_blob'])
+                        finally:
+                            os.close(state_fd)
+                    except Exception:
+                        rollback_failed = True
+                if not rollback_failed:
+                    try:
+                        self.reconcile()
+                    except Exception:
+                        pass
+                if rollback_failed:
+                    raise ServiceError('model_policy_unverified', 503) from None
+                if isinstance(error, ServiceError):
+                    raise error
+                if isinstance(error, StoreError):
+                    code = error.code if error.code in MESSAGES else 'admin_config_conflict'
+                    raise ServiceError(code, 409) from None
+                raise ServiceError('runtime_unavailable', 503) from None
+
+            self.ollama_config = new_policy
+            try:
+                self.reconcile()
+            except Exception:
+                # The selection and per-instance files are committed; recovery remains gated.
+                pass
+            restart_pending = 0
+            for plan in plans:
+                instance = plan['instance']
+                if instance['active'] and instance.get('desired_state') == 'running':
+                    try:
+                        if self._inspect(instance['id'])['state'] != 'running':
+                            restart_pending += 1
+                    except Exception:
+                        restart_pending += 1
+            return {'status': 'updated', 'previous_model_id': current_id,
+                    'model_id': new_id,
+                    'updated_instances': sum(1 for item in plans if item['needs_update']),
+                    'restart_pending': restart_pending}
+
     def control_ui_target(self, payload):
         """Return an owner-bound sidecar target only after live Docker verification."""
         if type(payload) is not dict or set(payload) != {'actor_id', 'instance_id'}:
@@ -828,9 +1178,10 @@ class RuntimeService:
         return unavailable
 
     def reconcile(self):
-        """Inspect known IDs; verified proxy inspection may reattach the WebUI frontend endpoint.
+        """Restore only persisted running intent after storage/resource/firewall gates.
 
-        Never create/start queued or failed intents, remove containers, or touch agent data.
+        Never create missing containers, resume failed operations, or touch agent data.
+        Docker's RestartPolicy is `no`; this is the sole boot restore path.
         """
         with self.lock:
             migrating = set()
@@ -840,22 +1191,111 @@ class RuntimeService:
                     migrating = migration.in_progress_instances()
                 except Exception:
                     raise ServiceError('runtime_unavailable', 503) from None
-            for instance in self.store.all_instances():
-                if instance['id'] in migrating:
-                    continue
+
+            instances = self.store.all_instances()
+            managed = [item for item in instances if item['id'] not in migrating]
+            desired_running = [item for item in managed
+                               if item.get('active') and item.get('desired_state') == 'running']
+            firewall_ready = True
+            firewall_instance_ids = set()
+            if desired_running:
+                restore_firewall = getattr(self.engine, 'restore_firewall', None)
+                requires_firewall = any(
+                    item.get('network_profile') != RuntimeStore.NETWORK_PROFILE_LEGACY
+                    for item in desired_running)
+                if callable(restore_firewall):
+                    try:
+                        restored = restore_firewall()
+                        instance_ids = (restored.get('instance_ids')
+                                        if type(restored) is dict else None)
+                        if (type(restored) is not dict or restored.get('ready') is not True
+                                or type(instance_ids) is not list or len(instance_ids) > 4096
+                                or any(type(value) is not str
+                                       or _CONTROL_UI_INSTANCE_RE.fullmatch(value) is None
+                                       for value in instance_ids)
+                                or len(set(instance_ids)) != len(instance_ids)):
+                            firewall_ready = False
+                        else:
+                            firewall_instance_ids = set(instance_ids)
+                    except Exception:
+                        firewall_ready = False
+                elif requires_firewall:
+                    firewall_ready = False
+
+            for instance in managed:
                 info = self._inspect(instance['id'])
                 if not instance['active']:
                     if not self._absent(info):
                         raise ServiceError('runtime_unavailable', 503)
                     continue
-                if info['state'] in {'running', 'restarting', 'paused'}:
-                    try:
-                        self._storage(instance)
-                    except ServiceError:
+
+                desired_state = instance.get('desired_state', 'stopped')
+                if desired_state not in {'running', 'stopped'}:
+                    raise ServiceError('runtime_unavailable', 503)
+                if (getattr(self, 'ollama_config', None) is not None
+                        and not self._absent(info)
+                        and info.get('config_policy_version') != 1):
+                    if info['state'] in {'running', 'restarting', 'paused'}:
                         self.engine.stop(instance['id'])
                         info = self._inspect(instance['id'])
                         if info['state'] not in {'stopped', 'exited', 'created', 'failed'}:
-                            raise ServiceError('runtime_unavailable', 503) from None
+                            raise ServiceError('runtime_unavailable', 503)
+                    self.store.observe(instance['id'], info['state'], info.get('container_id'))
+                    print('Boot recovery blocked for ' + instance['id'] + ': model_policy_unverified',
+                          file=sys.stderr, flush=True)
+                    continue
+                networked = instance.get('network_profile') != RuntimeStore.NETWORK_PROFILE_LEGACY
+                if desired_state == 'stopped' or (
+                        networked and (not firewall_ready or instance['id'] not in firewall_instance_ids)):
+                    if info['state'] in {'running', 'restarting', 'paused'}:
+                        self.engine.stop(instance['id'])
+                        info = self._inspect(instance['id'])
+                        if info['state'] not in {'stopped', 'exited', 'created', 'failed'}:
+                            raise ServiceError('runtime_unavailable', 503)
+                    state = instance['state'] if self._absent(info) else info['state']
+                    self.store.observe(instance['id'], state, info.get('container_id'))
+                    continue
+
+                if desired_state == 'running' and not self._absent(info):
+                    try:
+                        evidence = self._storage(instance)
+                        self._admit(quota=evidence['disk_quota_verified'],
+                                    requested_disk_bytes=0,
+                                    network_profile=instance['network_profile'])
+                        if getattr(self, 'ollama_config', None) is not None:
+                            self._require_ollama_policy(instance, evidence, info)
+                    except ServiceError as error:
+                        if info['state'] in {'running', 'restarting', 'paused'}:
+                            self.engine.stop(instance['id'])
+                            info = self._inspect(instance['id'])
+                            if info['state'] not in {'stopped', 'exited', 'created', 'failed'}:
+                                raise ServiceError('runtime_unavailable', 503) from None
+                        self.store.observe(instance['id'], info['state'], info.get('container_id'))
+                        print('Boot recovery blocked for ' + instance['id'] + ': ' + error.code,
+                              file=sys.stderr, flush=True)
+                        continue
+
+                    if info['state'] in {'stopped', 'exited', 'created'}:
+                        try:
+                            self.engine.start(instance['id'])
+                            info = self._inspect(instance['id'])
+                            if info['state'] != 'running':
+                                raise ServiceError('runtime_unavailable', 503)
+                        except Exception:
+                            # A failed postcondition must not leave a networked
+                            # Gateway/Sidecar active outside a verified recovery.
+                            try:
+                                latest = self._inspect(instance['id'])
+                                if latest['state'] in {'running', 'restarting', 'paused'}:
+                                    self.engine.stop(instance['id'])
+                                    latest = self._inspect(instance['id'])
+                                if latest['state'] not in {'stopped', 'exited', 'created', 'failed'}:
+                                    raise ServiceError('runtime_unavailable', 503)
+                                info = latest
+                            except Exception:
+                                raise ServiceError('runtime_unavailable', 503) from None
+                            print('Boot recovery blocked for ' + instance['id'] + ': runtime_start_failed',
+                                  file=sys.stderr, flush=True)
                 state = instance['state'] if self._absent(info) else info['state']
                 self.store.observe(instance['id'], state, info.get('container_id'))
 
@@ -868,6 +1308,25 @@ def _runtime_firewall(config):
         config['state_dir'], config.get('agent_network_pool'),
         config.get('frontend_network_pool'))
     return FirewallManager(NftablesAdapter(), semantics_validated=accepted)
+
+
+def _runtime_ollama_firewall(config):
+    """Use a distinct host-bound route receipt/table; absent receipt stays closed."""
+    if config.get('ollama') is None:
+        return None
+    from .firewall import NftablesAdapter
+    from .ollama_firewall import (
+        TABLE_COMMENT, TABLE_NAME, OllamaFirewallManager,
+        load_ollama_route_receipt,
+    )
+    endpoint = urlsplit(config['ollama']['base_url']).hostname
+    accepted = load_ollama_route_receipt(
+        config['state_dir'], config.get('agent_network_pool'),
+        config.get('frontend_network_pool'), config.get('ollama_network_pool'),
+        endpoint, config.get('ollama_egress_interface'))
+    return OllamaFirewallManager(
+        NftablesAdapter(table_name=TABLE_NAME, table_comment=TABLE_COMMENT),
+        semantics_validated=accepted)
 
 
 class RuntimeApplication(RuntimeService):
@@ -889,7 +1348,11 @@ class RuntimeApplication(RuntimeService):
             engine = DockerEngine(
                 config['image'], agent_network_pool=config.get('agent_network_pool'),
                 frontend_network_pool=config.get('frontend_network_pool'),
-                firewall=_runtime_firewall(config))
+                ollama_network_pool=config.get('ollama_network_pool'),
+                ollama_egress_interface=config.get('ollama_egress_interface'),
+                ollama_config=config.get('ollama'),
+                firewall=_runtime_firewall(config),
+                ollama_firewall=_runtime_ollama_firewall(config))
         if metrics is None:
             metrics = HostMetrics(profile.storage.mountpoint, clock=clock)
         super().__init__(profile, store, volumes, engine, metrics,
@@ -919,6 +1382,8 @@ CONFIG_KEY_SETS = (
     BASE_CONFIG_KEYS | {'ollama'}, CONFIG_KEYS | {'ollama'},
     CONFIG_KEYS_WITH_DOMAIN | {'ollama'}, CONFIG_KEYS_WITH_NETWORKS | {'ollama'},
 )
+CONFIG_KEY_SETS = CONFIG_KEY_SETS + tuple(
+    keys | {'ollama_network_pool', 'ollama_egress_interface'} for keys in CONFIG_KEY_SETS)
 _CONTROL_UI_DOMAIN_LABEL = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z')
 
 
@@ -937,6 +1402,29 @@ def _network_pool(value):
     return network
 
 
+def _validate_ollama_network(config):
+    pool_value = config['ollama_network_pool']
+    interface = config['ollama_egress_interface']
+    if config['ollama'] is None:
+        if pool_value is not None or interface is not None:
+            raise ValueError('Ollama route settings require an enabled Ollama policy')
+        return
+    if (config['network_profile_default'] != RuntimeStore.NETWORK_PROFILE_PROXY
+            or config['agent_network_pool'] is None
+            or config['frontend_network_pool'] is None
+            or pool_value is None or interface is None):
+        raise ValueError('Ollama requires agent_proxy_v1 and explicit isolated egress network settings')
+    try:
+        endpoint = urlsplit(config['ollama']['base_url']).hostname
+        pool, interface = validate_ollama_route_inputs(
+            pool_value, interface, endpoint,
+            protected_pools=(config['agent_network_pool'], config['frontend_network_pool']))
+    except (TypeError, ValueError):
+        raise ValueError('Invalid Ollama egress route settings') from None
+    config['ollama_network_pool'] = pool
+    config['ollama_egress_interface'] = interface
+
+
 def load_service_config(path):
     with open(path, 'rb') as stream:
         blob = stream.read(65537)
@@ -951,6 +1439,8 @@ def load_service_config(path):
     config.setdefault('agent_network_pool', None)
     config.setdefault('frontend_network_pool', None)
     config.setdefault('ollama', None)
+    config.setdefault('ollama_network_pool', None)
+    config.setdefault('ollama_egress_interface', None)
     if config['ollama'] is not None:
         config['ollama'] = asdict(validate_ollama_config(config['ollama']))
     if (type(config['network_profile_default']) is not str
@@ -976,6 +1466,7 @@ def load_service_config(path):
             raise ValueError('Control UI domain required for proxy profile')
         if raw_agent_pool is None:
             raise ValueError('Control UI network pools required for proxy profile')
+    _validate_ollama_network(config)
     for key in ('profile_path', 'state_dir', 'socket_path', 'token_file'):
         value = config[key]
         if (type(value) is not str or len(value) > 4096 or not value.startswith('/')
@@ -1126,7 +1617,14 @@ class APIHandler(BaseHTTPRequestHandler):
             if self.admin_only:
                 if _unix_peer_uid(self.request) != 0:
                     raise ServiceError('unauthorized', 403)
-                allowed_paths = {'/v1/admin/control-ui/sidecars'}
+                controller = getattr(self, 'controller', None)
+                if controller is None:
+                    raise ServiceError('runtime_unavailable', 503)
+                allowed_paths = set()
+                if callable(getattr(controller, 'manage_control_ui_sidecars', None)):
+                    allowed_paths.add('/v1/admin/control-ui/sidecars')
+                if getattr(controller, 'ollama_config', None) is not None:
+                    allowed_paths.add('/v1/admin/ollama/model')
             else:
                 allowed_paths = {'/v1/me', '/v1/actions', '/v1/replay',
                                  '/v1/retained/workspace', '/v1/control-ui/target'}
@@ -1147,7 +1645,18 @@ class APIHandler(BaseHTTPRequestHandler):
             controller = self.controller
             dispatch = {'/v1/me': controller.me, '/v1/actions': controller.action,
                         '/v1/replay': controller.replay}
-            if self.path == '/v1/admin/control-ui/sidecars':
+            if self.path == '/v1/admin/ollama/model':
+                if payload == {'action': 'status'}:
+                    operation = getattr(controller, 'ollama_model_status', None)
+                    if not callable(operation):
+                        raise ServiceError('runtime_unavailable', 503)
+                    self._json(200, operation())
+                else:
+                    operation = getattr(controller, 'change_ollama_model', None)
+                    if not callable(operation):
+                        raise ServiceError('runtime_unavailable', 503)
+                    self._json(200, operation(payload))
+            elif self.path == '/v1/admin/control-ui/sidecars':
                 operation = getattr(controller, 'manage_control_ui_sidecars', None)
                 if not callable(operation):
                     raise ServiceError('runtime_unavailable', 503)
@@ -1326,7 +1835,7 @@ def serve(config):
         bound_identity = (info.st_dev, info.st_ino)
         server.controller, server.service_secret = controller, secret
 
-        if controller.sidecar_migration is not None:
+        if controller.sidecar_migration is not None or controller.ollama_config is not None:
             admin_server = ThreadedAdminServer(
                 str(admin_socket_path), create_admin_handler(controller, secret))
             os.chown(admin_socket_path, 0, 0)

@@ -7,6 +7,7 @@ import secrets
 import stat
 import unittest
 from contextlib import ExitStack
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 from urllib.parse import parse_qs
@@ -14,13 +15,584 @@ from urllib.parse import parse_qs
 from supervisor.config import AgentLimits
 from supervisor.docker_engine import DockerEngine, DockerEngineError
 from supervisor.firewall import FirewallManager, NftablesAdapter
-from supervisor.network_routes import HostIPv4Inventory, parse_ipv4_networks
+from supervisor.network_routes import (
+    HostIPv4Inventory, IPv4InterfaceAddress, IPv4Route, parse_ipv4_networks,
+)
+
+
+def synthetic_ollama_host_inventory(plan, extra_routes=()):
+    subnet = ipaddress.IPv4Network(plan['subnet'])
+    bridge, gateway = plan['bridge'], plan['gateway']
+    routes = (
+        IPv4Route(plan['subnet'], bridge, 'unicast', 'kernel', 'link', gateway),
+        IPv4Route(f'{gateway}/32', bridge, 'local', 'kernel', 'host', gateway),
+        IPv4Route(f'{subnet.network_address}/32', bridge, 'broadcast', 'kernel', 'link', gateway),
+        IPv4Route(f'{subnet.broadcast_address}/32', bridge, 'broadcast', 'kernel', 'link', gateway),
+        *extra_routes,
+    )
+    addresses = (IPv4InterfaceAddress(bridge, gateway, subnet.prefixlen),)
+    return HostIPv4Inventory(routes, addresses)
 
 
 class DockerEngineNetworkTests(unittest.TestCase):
     @staticmethod
     def _sidecar_image_info(image_id, env=()):
         return {'Id': image_id, 'Config': {'Env': list(env)}}
+
+    def test_ollama_egress_bridge_is_per_instance_external_but_gateway_only(self):
+        instance_id = '7' * 32
+        plan = DockerEngine._ollama_network_plan(
+            instance_id, '172.20.0.0/16',
+            occupied_subnets=('172.20.0.0/29',),
+            host_routes=('172.20.0.8/29',))
+        expected = {
+            'name': 'pa-ollama-' + instance_id,
+            'bridge': 'bzo' + instance_id[:12],
+            'subnet': '172.20.0.16/29',
+            'gateway': '172.20.0.17',
+            'gateway_ip': '172.20.0.18',
+        }
+        self.assertEqual(plan, expected)
+
+        payload = DockerEngine._ollama_network_payload(instance_id, plan)
+
+        self.assertIs(payload['Internal'], False)
+        self.assertIs(payload['Attachable'], False)
+        self.assertIs(payload['EnableIPv6'], False)
+        self.assertEqual(payload['IPAM']['Config'], [
+            {'Subnet': expected['subnet'], 'Gateway': expected['gateway']}])
+        self.assertEqual(payload['Options'], {
+            'com.docker.network.bridge.name': expected['bridge'],
+            'com.docker.network.bridge.enable_ip_masquerade': 'true',
+            'com.docker.network.bridge.enable_icc': 'false',
+        })
+        self.assertEqual(payload['Labels'][DockerEngine.NETWORK_SCHEMA_LABEL], 'agent_ollama_v1')
+        observed = {**payload, 'Id': 'c' * 64, 'Ingress': False, 'Containers': {}}
+        self.assertEqual(
+            DockerEngine._ollama_network_from_observation(
+                instance_id, observed, '172.20.0.0/16'), plan)
+        altered = copy.deepcopy(plan)
+        altered['gateway_ip'] = '172.20.0.19'
+        with self.assertRaises(ValueError):
+            DockerEngine._ollama_network_payload(instance_id, altered)
+
+    def test_ollama_route_engine_requires_explicit_disjoint_pool_and_stays_fail_closed(self):
+        config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b',
+            'context_tokens': 8192,
+            'max_tokens': 512,
+            'think': False,
+        }
+        engine = DockerEngine(
+            'sha256:' + 'a' * 64,
+            agent_network_pool='10.240.0.0/13',
+            frontend_network_pool='10.248.0.0/13',
+            ollama_network_pool='172.20.0.0/16',
+            ollama_egress_interface='ens18',
+            ollama_config=config)
+        self.assertEqual(engine.ollama_network_pool, '172.20.0.0/16')
+        self.assertEqual(engine.ollama_egress_interface, 'ens18')
+        assert engine.ollama_firewall is not None
+        self.assertFalse(engine.ollama_firewall.can_apply)
+        with self.assertRaises(ValueError):
+            DockerEngine(
+                'sha256:' + 'a' * 64,
+                agent_network_pool='10.240.0.0/13',
+                frontend_network_pool='10.248.0.0/13',
+                ollama_network_pool='10.240.0.0/13',
+                ollama_egress_interface='ens18', ollama_config=config)
+
+    def test_ollama_route_policy_inventory_verifies_per_instance_network_identity(self):
+        config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b',
+            'context_tokens': 8192,
+            'max_tokens': 512,
+            'think': False,
+        }
+        engine = DockerEngine(
+            'sha256:' + 'a' * 64,
+            agent_network_pool='10.240.0.0/13',
+            frontend_network_pool='10.248.0.0/13',
+            ollama_network_pool='172.20.0.0/16',
+            ollama_egress_interface='ens18',
+            ollama_config=config)
+        instance_id = '8' * 32
+        plan = DockerEngine._ollama_network_plan(instance_id, engine.ollama_network_pool)
+        payload = DockerEngine._ollama_network_payload(instance_id, plan)
+        network = {**payload, 'Id': 'd' * 64, 'Ingress': False, 'Containers': {}}
+        engine.host_route_provider = lambda: synthetic_ollama_host_inventory(plan)
+        engine._request = lambda method, path, payload=None, *, ok=(200,): (
+            [{'Id': network['Id'], 'Name': network['Name'], 'IPAM': network['IPAM'],
+              'Labels': network['Labels']}]
+            if method == 'GET' and path == '/networks' else
+            network if method == 'GET' and path == '/networks/' + network['Id'] else
+            (_ for _ in ()).throw(AssertionError((method, path))))
+
+        policies = engine.ollama_route_policies()
+
+        self.assertEqual(len(policies), 1)
+        self.assertEqual(policies[0].instance_id, instance_id)
+        self.assertEqual(policies[0].subnet, plan['subnet'])
+        self.assertEqual(policies[0].gateway_ip, plan['gateway_ip'])
+        self.assertEqual(policies[0].ollama_ip, '10.99.0.10')
+        self.assertEqual(policies[0].egress_interface, 'ens18')
+
+    def test_ollama_attachment_verification_accepts_only_exact_configured_endpoint(self):
+        config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b', 'context_tokens': 8192,
+            'max_tokens': 512, 'think': False,
+        }
+        engine = DockerEngine(
+            'sha256:' + 'a' * 64, agent_network_pool='10.240.0.0/13',
+            frontend_network_pool='10.248.0.0/13',
+            ollama_network_pool='172.20.0.0/16',
+            ollama_egress_interface='ens18', ollama_config=config)
+        instance_id, container_id, network_id = '3' * 32, 'a' * 64, 'b' * 64
+        plan = engine._ollama_network_plan(instance_id, engine.ollama_network_pool)
+        payload = engine._ollama_network_payload(instance_id, plan)
+        network = {**payload, 'Id': network_id, 'Ingress': False, 'Containers': {}}
+        container = {
+            'State': {'Status': 'created'},
+            'NetworkSettings': {'Networks': {plan['name']: {
+                'NetworkID': '', 'IPAddress': '',
+                'IPAMConfig': {'IPv4Address': plan['gateway_ip']},
+            }}},
+        }
+        engine._request = lambda method, path, payload=None, *, ok=(200,): (
+            [{'Id': network_id}] if method == 'GET' and path.startswith('/networks?filters=') else
+            network if method == 'GET' and path == '/networks/' + network_id else
+            (_ for _ in ()).throw(AssertionError((method, path))))
+
+        self.assertEqual(engine._verify_ollama_network_attachment(
+            instance_id, container_id, container), (network_id, plan))
+        container['NetworkSettings']['Networks'][plan['name']]['IPAMConfig']['IPv4Address'] = '172.20.0.99'
+        with self.assertRaises(DockerEngineError):
+            engine._verify_ollama_network_attachment(instance_id, container_id, container)
+
+    def test_ollama_route_preparation_is_blocked_before_docker_without_receipt(self):
+        config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b',
+            'context_tokens': 8192,
+            'max_tokens': 512,
+            'think': False,
+        }
+        engine = DockerEngine(
+            'sha256:' + 'a' * 64,
+            agent_network_pool='10.240.0.0/13',
+            frontend_network_pool='10.248.0.0/13',
+            ollama_network_pool='172.20.0.0/16',
+            ollama_egress_interface='ens18',
+            ollama_config=config)
+        engine._request = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError('Docker must not be contacted before route acceptance'))
+
+        with self.assertRaises(DockerEngineError):
+            engine.ensure_ollama_route('8' * 32)
+
+    def test_ollama_route_inventory_rejects_foreign_overlapping_host_route(self):
+        config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b', 'context_tokens': 8192,
+            'max_tokens': 512, 'think': False,
+        }
+        engine = DockerEngine(
+            'sha256:' + 'a' * 64, agent_network_pool='10.240.0.0/13',
+            frontend_network_pool='10.248.0.0/13',
+            ollama_network_pool='172.20.0.0/16',
+            ollama_egress_interface='ens18', ollama_config=config)
+        instance_id = '6' * 32
+        plan = engine._ollama_network_plan(instance_id, engine.ollama_network_pool)
+        payload = engine._ollama_network_payload(instance_id, plan)
+        network = {**payload, 'Id': 'd' * 64, 'Ingress': False, 'Containers': {}}
+        foreign_route = IPv4Route(
+            plan['subnet'], 'br-foreign', 'unicast', 'kernel', 'link', plan['gateway'])
+        engine.host_route_provider = lambda: synthetic_ollama_host_inventory(
+            plan, extra_routes=(foreign_route,))
+        engine._request = lambda method, path, payload=None, *, ok=(200,): (
+            [{'Id': network['Id'], 'Name': network['Name'], 'IPAM': network['IPAM'],
+              'Labels': network['Labels']}]
+            if method == 'GET' and path == '/networks' else
+            network if method == 'GET' and path == '/networks/' + network['Id'] else
+            (_ for _ in ()).throw(AssertionError((method, path))))
+
+        with self.assertRaises(DockerEngineError):
+            engine.ollama_route_policies()
+
+    def test_ollama_route_is_firewall_ready_before_gateway_network_connect(self):
+        config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b', 'context_tokens': 8192,
+            'max_tokens': 512, 'think': False,
+        }
+        instance_id = '5' * 32
+        gateway_id, network_id = 'a' * 64, 'b' * 64
+        events = []
+
+        class RouteFirewall:
+            can_apply = True
+            def __init__(self):
+                self.active = False
+                self.events = events
+            def ready(self, policies):
+                self.events.append(('firewall', 'ready', tuple(policies)))
+                return self.active
+            def apply(self, policies):
+                self.events.append(('firewall', 'apply', tuple(policies)))
+                self.active = True
+
+        firewall = RouteFirewall()
+        host_inventory_state = {'inventory': HostIPv4Inventory((), ())}
+        engine = DockerEngine(
+            'sha256:' + 'a' * 64, agent_network_pool='10.240.0.0/13',
+            frontend_network_pool='10.248.0.0/13',
+            ollama_network_pool='172.20.0.0/16',
+            ollama_egress_interface='ens18', ollama_config=config,
+            ollama_firewall=firewall,
+            host_route_provider=lambda: host_inventory_state['inventory'])
+        engine.__dict__['_find'] = lambda instance_id: {
+            'Id': gateway_id,
+            'Config': {'Labels': {
+                **engine._labels(instance_id),
+                engine.SPEC_LABEL: json.dumps({'version': 3, 'config_policy_version': 1}),
+            }},
+            'State': {'Status': 'created'},
+            'NetworkSettings': {'Networks': {}},
+        }
+        engine._verify = lambda *_args, **_kwargs: gateway_id
+        network_state: dict[str, Any] = {'created': None}
+
+        def request(method, path, payload=None, *, ok=(200,)):
+            events.append(('docker', method, path, copy.deepcopy(payload)))
+            if method == 'GET' and path == '/networks':
+                network = network_state['created']
+                return [] if network is None else [{
+                    'Id': network_id, 'Name': network['Name'],
+                    'IPAM': network['IPAM'], 'Labels': network['Labels'],
+                }]
+            if method == 'POST' and path == '/networks/create':
+                assert payload is not None
+                network_state['created'] = {
+                    **payload, 'Id': network_id, 'Ingress': False, 'Containers': {},
+                }
+                config = payload['IPAM']['Config'][0]
+                host_inventory_state['inventory'] = synthetic_ollama_host_inventory({
+                    'subnet': config['Subnet'],
+                    'gateway': config['Gateway'],
+                    'bridge': payload['Options']['com.docker.network.bridge.name'],
+                })
+                return {'Id': network_id}
+            if method == 'GET' and path == '/networks/' + network_id:
+                return network_state['created']
+            raise AssertionError((method, path))
+
+        def attach(container_id, actual_network_id, network_name, ipv4):
+            events.append(('connect', container_id, actual_network_id, network_name, ipv4))
+            network_state['created']['Containers'][gateway_id] = {
+                'Name': 'pa-' + instance_id,
+                'EndpointID': 'f' * 64, 'MacAddress': '02:42:ac:11:00:02',
+                'IPv4Address': ipv4 + '/29', 'IPv6Address': '',
+            }
+            engine.__dict__['_find'] = lambda instance_id: {
+                'Id': gateway_id,
+                'Config': {'Labels': {
+                    **engine._labels(instance_id),
+                    engine.SPEC_LABEL: json.dumps({'version': 3, 'config_policy_version': 1}),
+                }},
+                'State': {'Status': 'created'},
+                'NetworkSettings': {'Networks': {network_name: {
+                    'NetworkID': actual_network_id, 'IPAddress': ipv4,
+                    'IPAMConfig': {'IPv4Address': ipv4},
+                }}},
+            }
+            return engine._find(instance_id)
+
+        engine._request = request
+        engine.__dict__['_ensure_container_network'] = attach
+
+        result = engine.ensure_ollama_route(instance_id)
+
+        self.assertTrue(result['ready'])
+        create_event = next(event for event in events if event[1:3] == ('POST', '/networks/create'))
+        connect_index = next(index for index, event in enumerate(events) if event[0] == 'connect')
+        apply_index = next(index for index, event in enumerate(events)
+                           if event[:2] == ('firewall', 'apply'))
+        self.assertFalse(create_event[3]['Internal'])
+        self.assertLess(apply_index, connect_index)
+        self.assertEqual(len(events[-1][2]), 1)
+
+    def test_failed_gateway_attach_rolls_back_new_empty_route_and_firewall_rules(self):
+        from supervisor.ollama_firewall import OllamaRoutePolicy
+
+        config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b', 'context_tokens': 8192,
+            'max_tokens': 512, 'think': False,
+        }
+        instance_id, gateway_id, network_id = '1' * 32, 'a' * 64, 'b' * 64
+
+        class RouteFirewall:
+            can_apply = True
+            def __init__(self):
+                self.applied = None
+            def ready(self, policies):
+                return self.applied == tuple(policies)
+            def apply(self, policies):
+                self.applied = tuple(policies)
+
+        firewall = RouteFirewall()
+        host_state: dict[str, Any] = {'inventory': HostIPv4Inventory((), ())}
+        network_state: dict[str, Any] = {'network': None}
+        events = []
+        engine = DockerEngine(
+            'sha256:' + 'a' * 64, agent_network_pool='10.240.0.0/13',
+            frontend_network_pool='10.248.0.0/13',
+            ollama_network_pool='172.20.0.0/16',
+            ollama_egress_interface='ens18', ollama_config=config,
+            ollama_firewall=firewall,
+            host_route_provider=lambda: host_state['inventory'])
+        plan = engine._ollama_network_plan(instance_id, engine.ollama_network_pool)
+        policy = OllamaRoutePolicy(
+            instance_id, plan['subnet'], plan['gateway'], plan['gateway_ip'],
+            '10.99.0.10', 'ens18')
+        gateway = {
+            'Id': gateway_id,
+            'Config': {'Labels': {
+                **engine._labels(instance_id),
+                engine.SPEC_LABEL: json.dumps({'version': 3, 'config_policy_version': 1}),
+            }},
+            'State': {'Status': 'created'},
+            'NetworkSettings': {'Networks': {}},
+        }
+        engine.__dict__['_find'] = lambda instance_id: gateway
+        engine.__dict__['_verify'] = lambda instance_id, observed, expected_spec=None, expected_token=None: gateway_id
+        engine.__dict__['ollama_route_policies'] = lambda: (
+            (policy,) if network_state['network'] is not None else ())
+
+        def request(method, path, payload=None, *, ok=(200,)):
+            events.append((method, path))
+            if method == 'GET' and path == '/networks':
+                current = network_state['network']
+                return [] if current is None else [{
+                    'Id': network_id, 'Name': current['Name'],
+                    'IPAM': current['IPAM'], 'Labels': current['Labels'],
+                }]
+            if method == 'POST' and path == '/networks/create':
+                assert payload is not None
+                network_state['network'] = {
+                    **payload, 'Id': network_id, 'Ingress': False, 'Containers': {},
+                }
+                ipam = payload['IPAM']['Config'][0]
+                host_state['inventory'] = synthetic_ollama_host_inventory({
+                    'subnet': ipam['Subnet'], 'gateway': ipam['Gateway'],
+                    'bridge': payload['Options']['com.docker.network.bridge.name'],
+                })
+                return {'Id': network_id}
+            if method == 'GET' and path.startswith('/networks?filters='):
+                return [] if network_state['network'] is None else [{'Id': network_id}]
+            if method == 'GET' and path == '/networks/' + network_id:
+                return network_state['network']
+            if method == 'DELETE' and path == '/networks/' + network_id:
+                network_state['network'] = None
+                return None
+            raise AssertionError((method, path))
+
+        def fail_attach(container_id, actual_network_id, network_name, ipv4):
+            raise DockerEngineError('synthetic attach failure')
+
+        engine._request = request
+        engine.__dict__['_ensure_container_network'] = fail_attach
+
+        with self.assertRaises(DockerEngineError):
+            engine.ensure_ollama_route(instance_id)
+
+        self.assertIsNone(network_state['network'])
+        self.assertEqual(firewall.applied, ())
+        self.assertIn(('DELETE', '/networks/' + network_id), events)
+
+    def test_existing_route_attach_failure_preserves_network_but_keeps_gateway_stopped(self):
+        from supervisor.ollama_firewall import OllamaRoutePolicy
+
+        config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b', 'context_tokens': 8192,
+            'max_tokens': 512, 'think': False,
+        }
+        instance_id, gateway_id, network_id = '6' * 32, 'a' * 64, 'b' * 64
+
+        class RouteFirewall:
+            can_apply = True
+            def __init__(self, policy):
+                self.applied = (policy,)
+            def ready(self, policies):
+                return self.applied == tuple(policies)
+            def apply(self, policies):
+                self.applied = tuple(policies)
+
+        engine = DockerEngine(
+            'sha256:' + 'a' * 64, agent_network_pool='10.240.0.0/13',
+            frontend_network_pool='10.248.0.0/13',
+            ollama_network_pool='172.20.0.0/16',
+            ollama_egress_interface='ens18', ollama_config=config)
+        plan = engine._ollama_network_plan(instance_id, engine.ollama_network_pool)
+        policy = OllamaRoutePolicy(
+            instance_id, plan['subnet'], plan['gateway'], plan['gateway_ip'],
+            '10.99.0.10', 'ens18')
+        firewall = RouteFirewall(policy)
+        engine.ollama_firewall = firewall
+        engine.host_route_provider = lambda: synthetic_ollama_host_inventory(plan)
+        network_payload = engine._ollama_network_payload(instance_id, plan)
+        network: dict[str, Any] = {
+            **network_payload, 'Id': network_id, 'Ingress': False, 'Containers': {},
+        }
+        gateway = {
+            'Id': gateway_id,
+            'Config': {'Labels': {
+                **engine._labels(instance_id),
+                engine.SPEC_LABEL: json.dumps({'version': 3, 'config_policy_version': 1}),
+            }},
+            'State': {'Status': 'created'},
+            'NetworkSettings': {'Networks': {}},
+        }
+        engine.__dict__['_find'] = lambda instance_id: gateway
+        engine.__dict__['_find_proxy_sidecar'] = lambda instance_id: None
+        engine.__dict__['_verify'] = lambda instance_id, observed, expected_spec=None, expected_token=None: gateway_id
+        engine.__dict__['_proxy_firewall_ready'] = lambda instance_id, gateway_spec: True
+        calls = []
+
+        def request(method, path, payload=None, *, ok=(200,)):
+            calls.append((method, path))
+            if method == 'GET' and path == '/networks':
+                return [{'Id': network_id, 'Name': network['Name'],
+                         'IPAM': network['IPAM'], 'Labels': network['Labels']}]
+            if method == 'GET' and path == '/networks/' + network_id:
+                return network
+            raise AssertionError((method, path))
+
+        def attach_then_lose_response(container_id, actual_network_id, network_name, ipv4):
+            network['Containers'][gateway_id] = {'IPv4Address': ipv4 + '/29'}
+            gateway['NetworkSettings']['Networks'][network_name] = {
+                'NetworkID': actual_network_id, 'IPAddress': ipv4,
+                'IPAMConfig': {'IPv4Address': ipv4},
+            }
+            raise DockerEngineError('synthetic lost network-connect response')
+
+        engine._request = request
+        engine.__dict__['_ensure_container_network'] = attach_then_lose_response
+
+        with self.assertRaises(DockerEngineError):
+            engine.start(instance_id)
+
+        self.assertEqual(gateway['State']['Status'], 'created')
+        self.assertEqual(network['Containers'][gateway_id]['IPv4Address'],
+                         plan['gateway_ip'] + '/29')
+        self.assertNotIn(('DELETE', '/networks/' + network_id), calls)
+        self.assertFalse(any(path.endswith('/start') for _, path in calls))
+        self.assertEqual(firewall.applied, (policy,))
+
+    def test_purge_route_network_removes_only_empty_bridge_and_rebuilds_firewall(self):
+        config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b', 'context_tokens': 8192,
+            'max_tokens': 512, 'think': False,
+        }
+        instance_id, network_id = '2' * 32, 'c' * 64
+
+        class RouteFirewall:
+            can_apply = True
+            def __init__(self):
+                self.applied = None
+                self.calls = []
+            def ready(self, policies):
+                self.calls.append(('ready', tuple(policies)))
+                return self.applied == tuple(policies)
+            def apply(self, policies):
+                self.calls.append(('apply', tuple(policies)))
+                self.applied = tuple(policies)
+
+        firewall = RouteFirewall()
+        engine = DockerEngine(
+            'sha256:' + 'a' * 64, agent_network_pool='10.240.0.0/13',
+            frontend_network_pool='10.248.0.0/13',
+            ollama_network_pool='172.20.0.0/16',
+            ollama_egress_interface='ens18', ollama_config=config,
+            ollama_firewall=firewall,
+            host_route_provider=lambda: synthetic_ollama_host_inventory(plan))
+        plan = engine._ollama_network_plan(instance_id, engine.ollama_network_pool)
+        payload = engine._ollama_network_payload(instance_id, plan)
+        network_state: dict[str, Any] = {'network': {
+            **payload, 'Id': network_id, 'Ingress': False, 'Containers': {},
+        }}
+        events = []
+
+        def request(method, path, payload=None, *, ok=(200,)):
+            events.append((method, path))
+            if method == 'GET' and path.startswith('/networks?filters='):
+                current = network_state['network']
+                return [] if current is None else [{'Id': network_id}]
+            if method == 'GET' and path == '/networks/' + network_id:
+                return network_state['network']
+            if method == 'GET' and path == '/networks':
+                current = network_state['network']
+                return [] if current is None else [{
+                    'Id': network_id, 'Name': current['Name'],
+                    'IPAM': current['IPAM'], 'Labels': current['Labels'],
+                }]
+            if method == 'DELETE' and path == '/networks/' + network_id:
+                network_state['network'] = None
+                return None
+            raise AssertionError((method, path))
+
+        engine._request = request
+        engine._find = lambda instance_id: None
+
+        self.assertTrue(engine.remove_ollama_network(instance_id))
+        self.assertIn(('DELETE', '/networks/' + network_id), events)
+        self.assertEqual(firewall.applied, ())
+        self.assertEqual(firewall.calls[-1], ('ready', ()))
+
+    def test_ollama_route_creation_rejects_unparseable_docker_ipam_inventory(self):
+        config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b', 'context_tokens': 8192,
+            'max_tokens': 512, 'think': False,
+        }
+        instance_id, gateway_id = '9' * 32, 'a' * 64
+        firewall = SimpleNamespace(can_apply=True)
+        engine = DockerEngine(
+            'sha256:' + 'a' * 64, agent_network_pool='10.240.0.0/13',
+            frontend_network_pool='10.248.0.0/13',
+            ollama_network_pool='172.20.0.0/16',
+            ollama_egress_interface='ens18', ollama_config=config,
+            ollama_firewall=firewall,
+            host_route_provider=lambda: HostIPv4Inventory((), ()))
+        instance_id_for_gateway = instance_id
+        engine.__dict__['_find'] = lambda instance_id: {
+            'Id': gateway_id,
+            'Config': {'Labels': {
+                **engine._labels(instance_id_for_gateway),
+                engine.SPEC_LABEL: json.dumps({'version': 3, 'config_policy_version': 1}),
+            }},
+            'State': {'Status': 'created'},
+            'NetworkSettings': {'Networks': {}},
+        }
+        engine.__dict__['_verify'] = lambda instance_id, observed, expected_spec=None, expected_token=None: gateway_id
+        calls = []
+        def request(method, path, payload=None, *, ok=(200,)):
+            calls.append((method, path))
+            if method == 'GET' and path == '/networks':
+                return [{'Id': 'b' * 64, 'Name': 'foreign',
+                         'IPAM': {'Config': [{'Subnet': None}]}}]
+            raise AssertionError((method, path))
+        engine._request = request
+
+        with self.assertRaises(DockerEngineError):
+            engine.ensure_ollama_route(instance_id)
+
+        self.assertFalse(any(path == '/networks/create' for _, path in calls))
 
     def test_proxy_network_engine_requires_both_nonoverlapping_admin_pools(self):
         image = 'sha256:' + 'a' * 64
@@ -54,6 +626,102 @@ class DockerEngineNetworkTests(unittest.TestCase):
             (_ for _ in ()).throw(AssertionError((method, path))))
         policies = engine.proxy_network_policies()
         self.assertEqual(policies, (engine._proxy_firewall_policy(instance_id, plan),))
+
+    def test_boot_firewall_restore_applies_and_verifies_the_exact_proxy_inventory(self):
+        class Firewall:
+            can_apply = True
+            def __init__(self):
+                self.applied = None
+                self.calls = []
+            def apply(self, policies):
+                self.calls.append(('apply', policies))
+                self.applied = policies
+            def ready(self, policies):
+                self.calls.append(('ready', policies))
+                return self.applied == policies
+
+        firewall = Firewall()
+        engine = DockerEngine('sha256:' + 'a' * 64, firewall=firewall)
+        policies = (SimpleNamespace(instance_id='1' * 32), SimpleNamespace(instance_id='2' * 32))
+        engine.proxy_network_policies = lambda: policies
+
+        result = engine.restore_firewall()
+
+        self.assertEqual(result, {
+            'policy_count': 2, 'instance_ids': ['1' * 32, '2' * 32], 'ready': True,
+        })
+        self.assertEqual(firewall.calls, [
+            ('ready', policies), ('apply', policies), ('ready', policies),
+        ])
+
+    def test_boot_firewall_restore_applies_receipt_gated_ollama_route_inventory(self):
+        from supervisor.ollama_firewall import OllamaRoutePolicy
+
+        class RouteFirewall:
+            can_apply = True
+            def __init__(self):
+                self.applied = None
+                self.calls = []
+            def apply(self, policies):
+                self.calls.append(('apply', policies))
+                self.applied = policies
+            def ready(self, policies):
+                self.calls.append(('ready', policies))
+                return self.applied == policies
+
+        config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b', 'context_tokens': 8192,
+            'max_tokens': 512, 'think': False,
+        }
+        route_firewall = RouteFirewall()
+        engine = DockerEngine(
+            'sha256:' + 'a' * 64, agent_network_pool='10.240.0.0/13',
+            frontend_network_pool='10.248.0.0/13',
+            ollama_network_pool='172.20.0.0/16',
+            ollama_egress_interface='ens18', ollama_config=config,
+            ollama_firewall=route_firewall)
+        policy = OllamaRoutePolicy(
+            '1' * 32, '172.20.0.0/29', '172.20.0.1', '172.20.0.2',
+            '10.99.0.10', 'ens18')
+        engine.__dict__['proxy_network_policies'] = lambda: ()
+        engine.__dict__['ollama_route_policies'] = lambda: (policy,)
+
+        result = engine.restore_firewall()
+
+        self.assertEqual(result, {
+            'policy_count': 1, 'instance_ids': ['1' * 32], 'ready': True,
+        })
+        self.assertEqual(route_firewall.calls, [
+            ('ready', (policy,)), ('apply', (policy,)), ('ready', (policy,)),
+        ])
+
+    def test_boot_firewall_restore_does_not_mutate_rules_when_no_proxy_networks_exist(self):
+        class Firewall:
+            can_apply = True
+            def apply(self, _policies):
+                raise AssertionError('empty boot inventory must not remove managed rules')
+            def ready(self, _policies):
+                raise AssertionError('empty boot inventory does not need firewall read-back')
+
+        engine = DockerEngine('sha256:' + 'a' * 64, firewall=Firewall())
+        engine.proxy_network_policies = lambda: ()
+        self.assertEqual(engine.restore_firewall(), {
+            'policy_count': 0, 'instance_ids': [], 'ready': True,
+        })
+
+    def test_boot_firewall_restore_fails_closed_without_receipt_gate(self):
+        class Firewall:
+            can_apply = False
+            def apply(self, _policies):
+                raise AssertionError('unvalidated firewall must not be written')
+            def ready(self, _policies):
+                return False
+
+        engine = DockerEngine('sha256:' + 'a' * 64, firewall=Firewall())
+        engine.proxy_network_policies = lambda: ('verified-policy',)
+        with self.assertRaises(DockerEngineError):
+            engine.restore_firewall()
 
     def test_proxy_network_policy_inventory_rejects_partial_instance_networks(self):
         engine = DockerEngine('sha256:' + 'a' * 64,
@@ -670,6 +1338,75 @@ class DockerEngineNetworkTests(unittest.TestCase):
         with self.assertRaises(DockerEngineError):
             engine._verify(instance_id, observed, spec)
 
+    def test_proxy_gateway_verify_allows_only_receipt_route_as_second_network(self):
+        config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b',
+            'context_tokens': 8192,
+            'max_tokens': 512,
+            'think': False,
+        }
+        engine = DockerEngine(
+            'sha256:' + 'a' * 64, agent_network_pool='10.244.0.0/24',
+            frontend_network_pool='10.245.0.0/24',
+            ollama_network_pool='172.20.0.0/16',
+            ollama_egress_interface='ens18', ollama_config=config)
+        instance_id = '9' * 32
+        gateway_id, sidecar_id = 'a' * 64, 'b' * 64
+        limits = AgentLimits(ram_bytes=2**30, cpu_millicores=1000,
+                             pids_limit=256, disk_bytes=10 * 1024**3)
+        plan = engine._proxy_network_plan(
+            instance_id, agent_network_pool=engine.agent_network_pool,
+            frontend_network_pool=engine.frontend_network_pool)
+        route_plan = engine._ollama_network_plan(instance_id, engine.ollama_network_pool)
+        route_network_id = 'c' * 64
+        spec = engine._spec('/srv/agent-data/' + instance_id, limits, version=3,
+                            instance_id=instance_id, proxy_network=plan['agent'],
+                            owner_id='owner-9',
+                            control_ui_origin=f'https://{instance_id}.agents.example.test')
+        image_info = {'Id': engine.image,
+                      'Config': {'Env': [], 'Entrypoint': [], 'WorkingDir': ''}}
+        payload = engine._payload(instance_id, spec, None, image_info,
+                                  proxy_network=plan['agent'])
+        digest = engine._hash(engine._projection(
+            payload, payload['HostConfig'], engine._expected_mounts(payload), image_info['Id']))
+        payload['Labels'].update({engine.SPEC_LABEL: engine._json(spec),
+                                  engine.CONFIG_LABEL: digest})
+        attached = {'NetworkID': 'd' * 64, 'IPAddress': plan['agent']['gateway_ip'],
+                    'IPAMConfig': {'IPv4Address': plan['agent']['gateway_ip']}}
+        route_attached = {
+            'NetworkID': route_network_id, 'IPAddress': route_plan['gateway_ip'],
+            'IPAMConfig': {'IPv4Address': route_plan['gateway_ip']},
+        }
+        observed = {
+            'Id': gateway_id, 'Image': image_info['Id'],
+            'Config': {key: copy.deepcopy(payload[key]) for key in (
+                'Image', 'User', 'Cmd', 'Env', 'Entrypoint', 'WorkingDir',
+                'Healthcheck', 'StopTimeout', 'Labels', 'Tty', 'OpenStdin', 'StdinOnce')},
+            'HostConfig': copy.deepcopy(payload['HostConfig']),
+            'Mounts': engine._expected_mounts(payload),
+            'NetworkSettings': {'Ports': {}, 'Networks': {
+                plan['agent']['name']: attached,
+                'pa-ollama-' + instance_id: route_attached,
+            }},
+            'State': {'Status': 'created'},
+        }
+        engine._image_info = lambda: image_info
+        engine._proxy_network_id = lambda *_args, **_kwargs: 'd' * 64
+        engine.__dict__['_find_proxy_sidecar'] = lambda instance_id: {'Id': sidecar_id}
+        membership_calls = []
+        engine._verify_proxy_network_membership = lambda *args, **kwargs: (
+            membership_calls.append((args, kwargs)) or {})
+        route_checks = []
+        engine.__dict__['_verify_ollama_network_attachment'] = lambda instance_id, container_id, observed: (
+            route_checks.append((instance_id, container_id, observed)) or (route_network_id, route_plan))
+
+        self.assertEqual(engine._verify(instance_id, observed, spec), gateway_id)
+        self.assertEqual(len(route_checks), 1)
+        observed['NetworkSettings']['Networks']['unapproved'] = {}
+        with self.assertRaises(DockerEngineError):
+            engine._verify(instance_id, observed, spec)
+
     def test_proxy_network_membership_allows_created_endpoint_without_runtime_member(self):
         engine = DockerEngine('sha256:' + 'a' * 64,
                               agent_network_pool='10.244.0.0/24',
@@ -1044,6 +1781,96 @@ class DockerEngineNetworkTests(unittest.TestCase):
             engine.start(instance_id)
         self.assertFalse(any(path.endswith('/start') for _, path in calls))
 
+    def test_ollama_route_readiness_is_required_before_gateway_start(self):
+        config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b', 'context_tokens': 8192,
+            'max_tokens': 512, 'think': False,
+        }
+        engine = DockerEngine(
+            'sha256:' + 'a' * 64, agent_network_pool='10.244.0.0/24',
+            frontend_network_pool='10.245.0.0/24',
+            ollama_network_pool='172.20.0.0/16',
+            ollama_egress_interface='ens18', ollama_config=config)
+        instance_id = 'e' * 32
+        limits = AgentLimits(ram_bytes=2**30, cpu_millicores=1000,
+                             pids_limit=256, disk_bytes=10 * 1024**3)
+        plan = engine._proxy_network_plan(
+            instance_id, agent_network_pool=engine.agent_network_pool,
+            frontend_network_pool=engine.frontend_network_pool)
+        spec = engine._spec('/srv/agent-data/' + instance_id, limits, version=3,
+                            instance_id=instance_id, proxy_network=plan['agent'],
+                            owner_id='owner-e',
+                            control_ui_origin=f'https://{instance_id}.agents.example.test')
+        gateway_id, sidecar_id = 'a' * 64, 'b' * 64
+        gateway = {'Id': gateway_id, 'Config': {'Labels': {
+            **engine._labels(instance_id), engine.SPEC_LABEL: engine._json(spec)}},
+            'State': {'Status': 'created'}}
+        engine.__dict__['_find'] = lambda instance_id: gateway
+        engine.__dict__['_verify'] = lambda instance_id, observed, expected_spec=None, expected_token=None: gateway_id
+        engine.__dict__['_find_proxy_sidecar'] = lambda instance_id: {
+            'Id': sidecar_id, 'State': {'Status': 'created'}}
+        engine.__dict__['_proxy_firewall_ready'] = lambda instance_id, gateway_spec: True
+        calls = []
+        engine._request = lambda method, path, payload=None, *, ok=(200,): calls.append(path)
+
+        with self.assertRaises(DockerEngineError):
+            engine.start(instance_id)
+
+        self.assertFalse(any(path.endswith('/start') for path in calls))
+        self.assertFalse(any(path == '/networks/create' for path in calls))
+
+    def test_inspect_stops_gateway_when_ollama_firewall_readback_is_not_ready(self):
+        from supervisor.ollama_firewall import OllamaRoutePolicy
+        config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b', 'context_tokens': 8192,
+            'max_tokens': 512, 'think': False,
+        }
+        instance_id = '4' * 32
+
+        class RouteFirewall:
+            can_apply = False
+            def ready(self, _policies):
+                return False
+
+        engine = DockerEngine(
+            'sha256:' + 'a' * 64, agent_network_pool='10.244.0.0/24',
+            frontend_network_pool='10.245.0.0/24',
+            ollama_network_pool='172.20.0.0/16',
+            ollama_egress_interface='ens18', ollama_config=config,
+            ollama_firewall=RouteFirewall())
+        limits = AgentLimits(ram_bytes=2**30, cpu_millicores=1000,
+                             pids_limit=256, disk_bytes=10 * 1024**3)
+        plan = engine._proxy_network_plan(
+            instance_id, agent_network_pool=engine.agent_network_pool,
+            frontend_network_pool=engine.frontend_network_pool)
+        spec = engine._spec('/srv/agent-data/' + instance_id, limits, version=3,
+                            instance_id=instance_id, proxy_network=plan['agent'],
+                            owner_id='owner-4',
+                            control_ui_origin=f'https://{instance_id}.agents.example.test')
+        gateway_id = 'a' * 64
+        gateway = {'Id': gateway_id, 'Config': {'Labels': {
+            engine.SPEC_LABEL: json.dumps(spec)}},
+            'State': {'Status': 'running', 'Health': {'Status': 'healthy'}}}
+        engine.__dict__['_find'] = lambda instance_id: gateway
+        engine.__dict__['_verify'] = lambda instance_id, observed, expected_spec=None, expected_token=None: gateway_id
+        engine.__dict__['control_ui_target'] = lambda instance_id, owner_id: {'identity': {}}
+        engine.__dict__['_proxy_firewall_ready'] = lambda instance_id, gateway_spec: True
+        policy = OllamaRoutePolicy(
+            instance_id, '172.20.0.0/29', '172.20.0.1', '172.20.0.2',
+            '10.99.0.10', 'ens18')
+        engine.__dict__['ollama_route_policies'] = lambda: (policy,)
+        def stop(instance_id):
+            gateway['State'].update({'Status': 'exited', 'ExitCode': 0, 'OOMKilled': False})
+            return True
+        engine.__dict__['_stop_proxy_containers'] = stop
+
+        result = engine.inspect(instance_id)
+
+        self.assertEqual(result['state'], 'stopped')
+        self.assertEqual(result['ollama_route_state'], 'not_ready')
+
     def test_proxy_start_stops_gateway_and_sidecar_after_live_check_failure(self):
         engine = DockerEngine('sha256:' + 'a' * 64,
                               agent_network_pool='10.244.0.0/24',
@@ -1196,12 +2023,20 @@ class DockerEngineNetworkTests(unittest.TestCase):
     def test_proxy_remove_retains_ipam_unless_purge_is_requested(self):
         instance_id = '7' * 32
         gateway_id, sidecar_id = '8' * 64, '9' * 64
+        ollama_config = {
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b', 'context_tokens': 8192,
+            'max_tokens': 512, 'think': False,
+        }
         def make_engine():
-            engine = DockerEngine('sha256:' + 'a' * 64,
-                                  agent_network_pool='10.240.0.0/24',
-                                  frontend_network_pool='10.241.0.0/24')
+            engine = DockerEngine(
+                'sha256:' + 'a' * 64,
+                agent_network_pool='10.240.0.0/24',
+                frontend_network_pool='10.241.0.0/24',
+                ollama_network_pool='172.20.0.0/16',
+                ollama_egress_interface='ens18', ollama_config=ollama_config)
             state: dict[str, Any] = {'gateway': {'Id': gateway_id}, 'sidecar': {'Id': sidecar_id}}
-            deleted, detached, purged = [], [], []
+            deleted, detached, purged, cleanup = [], [], [], []
             engine._find = lambda instance_id: state['gateway']
             engine._verify = lambda instance_id, observed, expected_spec=None, expected_token=None: gateway_id
             engine._find_proxy_sidecar = lambda instance_id: state['sidecar']
@@ -1214,16 +2049,25 @@ class DockerEngineNetworkTests(unittest.TestCase):
             engine._delete_container = delete
             engine._disconnect_control_plane_from_frontend = lambda instance_id: detached.append(instance_id)
             engine._existing_proxy_network = lambda instance_id, role: None
-            engine.remove_proxy_networks = lambda instance_id: purged.append(instance_id)
-            return engine, deleted, detached, purged
-        retained, deleted, detached, purged = make_engine()
+            engine.__dict__['remove_ollama_network'] = lambda instance_id: (
+                cleanup.append(('ollama_route', instance_id)) or True)
+            def remove_proxy_networks(instance_id):
+                purged.append(instance_id)
+                cleanup.append(('proxy_networks', instance_id))
+            engine.remove_proxy_networks = remove_proxy_networks
+            return engine, deleted, detached, purged, cleanup
+        retained, deleted, detached, purged, retained_cleanup = make_engine()
         retained._remove_proxy_resources(instance_id, retain_networks=True)
         self.assertEqual(set(deleted), {gateway_id, sidecar_id})
         self.assertEqual(detached, [instance_id])
         self.assertEqual(purged, [])
-        purged_engine, _, _, purged_calls = make_engine()
+        self.assertEqual(retained_cleanup, [])
+        purged_engine, _, _, purged_calls, cleanup = make_engine()
         purged_engine._remove_proxy_resources(instance_id, retain_networks=False)
         self.assertEqual(purged_calls, [instance_id])
+        self.assertEqual(cleanup, [
+            ('ollama_route', instance_id), ('proxy_networks', instance_id),
+        ])
 
     def test_proxy_sidecar_payload_unsets_inherited_non_allowlisted_image_environment(self):
         engine = DockerEngine('sha256:' + 'a' * 64)
@@ -1599,6 +2443,28 @@ class DockerEngineNetworkTests(unittest.TestCase):
                 agent_network_pool=engine.agent_network_pool,
                 frontend_network_pool=engine.frontend_network_pool)
 
+    def test_gateway_config_is_read_only_mounted_and_config_read_only_mode_enabled(self):
+        engine = DockerEngine('sha256:' + 'a' * 64)
+        instance_id = '9' * 32
+        limits = AgentLimits(ram_bytes=2**30, cpu_millicores=1000,
+                             pids_limit=256, disk_bytes=10 * 1024**3)
+        image_info = {
+            'Id': 'sha256:' + 'a' * 64,
+            'Config': {'Env': ['OPENCLAW_CONFIG_READONLY=0'], 'Entrypoint': [], 'WorkingDir': ''},
+        }
+        spec = engine._spec('/srv/agent-data/' + instance_id, limits, version=1)
+        self.assertEqual(spec['config_policy_version'], 1)
+
+        payload = engine._payload(instance_id, spec, 'legacy-gateway-token', image_info)
+
+        config_mount = next(mount for mount in payload['HostConfig']['Mounts']
+                            if mount['Target'] == '/home/node/.openclaw/openclaw.json')
+        self.assertEqual(config_mount['Source'], '/srv/agent-data/' + instance_id + '/state/openclaw.json')
+        self.assertIs(config_mount['ReadOnly'], True)
+        self.assertIs(config_mount['BindOptions']['CreateMountpoint'], False)
+        env = dict(item.split('=', 1) for item in payload['Env'])
+        self.assertEqual(env['OPENCLAW_CONFIG_READONLY'], '1')
+
     def test_legacy_none_spec_remains_verifiable_without_implicit_migration(self):
         engine = DockerEngine('sha256:' + 'a' * 64)
         instance_id = 'e' * 32
@@ -1610,8 +2476,13 @@ class DockerEngineNetworkTests(unittest.TestCase):
         image_info = {'Id': image_id,
                       'Config': {'Env': [], 'Entrypoint': [], 'WorkingDir': ''}}
         engine._image_info = lambda: image_info
-        spec = engine._spec('/srv/agent-data/' + instance_id, limits, version=1)
+        spec = engine._spec('/srv/agent-data/' + instance_id, limits, version=1,
+                            config_policy_version=0)
         payload = engine._payload(instance_id, spec, token, image_info)
+        self.assertNotIn('config_policy_version', spec)
+        self.assertNotIn('OPENCLAW_CONFIG_READONLY=1', payload['Env'])
+        self.assertNotIn('/home/node/.openclaw/openclaw.json',
+                         [mount['Target'] for mount in payload['HostConfig']['Mounts']])
         expected = engine._projection(payload, payload['HostConfig'],
                                       engine._expected_mounts(payload), image_id)
         payload['Labels'].update({engine.SPEC_LABEL: engine._json(spec),
