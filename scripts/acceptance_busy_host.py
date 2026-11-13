@@ -445,12 +445,16 @@ def _systemd_readwrite_workspace_mount(plan, ops, mounts, entry):
     run_options = set(run_a[5].split(','))
     run_super_options = set(run_z[2].split(','))
     mount_options = set(a[5].split(','))
+    # ProtectSystem=strict makes /run read-only per mount; ReadWritePaths
+    # restores write access on this self-bind. All other mount flags must match.
     _need(
         run_a[3] == '/' and run_z[0] == 'tmpfs' and
-        'rw' in run_options and 'rw' in run_super_options and
+        'ro' in run_options and 'rw' not in run_options and
+        'rw' in run_super_options and 'ro' not in run_super_options and
         a[1] == run_a[0] and a[2] == run_a[2] and
         a[3] == '/' + plan.unit[:-8] and a[4] == plan.workspace and
-        mount_options == run_options and 'rw' in mount_options and 'ro' not in mount_options and
+        'rw' in mount_options and 'ro' not in mount_options and
+        (mount_options - {'ro', 'rw'}) == (run_options - {'ro', 'rw'}) and
         z[0] == run_z[0] and z[1] == run_z[1] and z[2] == run_z[2],
         'workspace mount is not the expected systemd ReadWritePaths bind',
     )

@@ -84,8 +84,8 @@ class SyntheticLinux:
                 '91 90 0:6 / /dev/pts rw - devpts devpts rw\n'
                 '92 1 0:7 / /tmp rw - tmpfs inherited rw\n'
                 '93 1 0:8 / /var/tmp rw - tmpfs inherited rw\n'
-                '94 1 0:30 / /run rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=67108864,mode=755\n'
-                f'95 94 0:30 /{plan.unit[:-8]} {plan.workspace} rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=67108864,mode=755\n'
+                '94 1 0:30 / /run ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=67108864,mode=755\n'
+                f'95 94 0:30 /{plan.unit[:-8]} {plan.workspace} rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=67108864,mode=755\n'
             ),
         }
         self.namespaces = {('self', 'mnt'): 'mnt:[2]', ('1', 'mnt'): 'mnt:[1]',
@@ -248,11 +248,11 @@ class SyntheticLinux:
         raise AssertionError('unexpected synthetic command: ' + repr(argv))
 
 
-def fixture():
+def fixture(unit='acceptance-' + 'a' * 32 + '.service'):
     h = helper()
     b = h.ApprovedBudget(25, 268435456, 0, 64, 60, 5, 67108864, 1024,
                         h.IOLimit('/dev/vda', 252, 0, 1048576, 1048576, 100, 100))
-    p = h.JobPlan('acceptance-' + 'a' * 32 + '.service', b)
+    p = h.JobPlan(unit, b)
     return h, p, SyntheticLinux(h, p)
 
 
@@ -361,6 +361,27 @@ class VisibleMountAdapterTests(unittest.TestCase):
 
 
 class ChildInspectionTests(unittest.TestCase):
+    def test_workspace_self_bind_accepts_gpu_server_mountinfo_readwrite_exception(self):
+        unit_name = 'acceptance-c9ef84a2bd7cc67c2e0f72463b77756c.service'
+        h, p, ops = fixture(unit_name)
+        workspace = p.workspace
+        run_mount = (
+            '882 876 0:25 / /run ro,nosuid,nodev,noexec,relatime shared:353 master:5 '
+            '- tmpfs tmpfs rw,size=13187376k,mode=755,inode64')
+        workspace_mount = (
+            f'916 882 0:25 /{p.unit[:-8]} {workspace} rw,nosuid,nodev,noexec,relatime '
+            'shared:358 master:5 - tmpfs tmpfs rw,size=13187376k,mode=755,inode64')
+        retained = [line for line in ops.files['/proc/self/mountinfo'].splitlines()
+                    if line.split()[4] not in ('/run', workspace)]
+        ops.files['/proc/self/mountinfo'] = '\n'.join(retained + [run_mount, workspace_mount]) + '\n'
+        ops.visible_ids.update({'/run': '882', workspace: '916'})
+
+        observed = h.inspect_owned_job(p, ops=ops)
+
+        self.assertEqual(observed.workspace_identity, (9, ops.stats[workspace].st_ino))
+        self.assertFalse(ops.writes)
+        self.assertFalse(any(command[0] == 'mount' for command in ops.commands))
+
     def test_reads_exact_identity_kernel_limits_and_device_bpf_before_mutation(self):
         h, p, ops = fixture()
         observed = h.inspect_owned_job(p, ops=ops)
@@ -390,6 +411,16 @@ class ChildInspectionTests(unittest.TestCase):
                     h.prepare_owned_job(p, ops=ops)
                 self.assertFalse(ops.writes)
                 self.assertFalse(any(command[0] == 'mount' for command in ops.commands))
+
+        h, p, ops = fixture()
+        lines = ops.files['/proc/self/mountinfo'].splitlines()
+        index = next(i for i, line in enumerate(lines) if line.startswith('94 '))
+        lines[index] = lines[index].replace(' /run ro,', ' /run rw,', 1)
+        ops.files['/proc/self/mountinfo'] = '\n'.join(lines) + '\n'
+        with self.assertRaisesRegex(h.Rejected, 'ReadWritePaths bind'):
+            h.prepare_owned_job(p, ops=ops)
+        self.assertFalse(ops.writes)
+        self.assertFalse(any(command[0] == 'mount' for command in ops.commands))
 
         h, p, ops = fixture()
         ops.files['/proc/self/mountinfo'] += (
