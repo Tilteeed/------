@@ -438,6 +438,32 @@ def _visible_mount(path, ops, *, mounts=None):
     return rows[0]
 
 
+def _systemd_readwrite_workspace_mount(plan, ops, mounts, entry):
+    """Prove the pre-existing mount is systemd's ReadWritePaths self-bind."""
+    a, z = entry
+    run_a, run_z = _visible_mount('/run', ops, mounts=mounts)
+    run_options = set(run_a[5].split(','))
+    run_super_options = set(run_z[2].split(','))
+    mount_options = set(a[5].split(','))
+    _need(
+        run_a[3] == '/' and run_z[0] == 'tmpfs' and
+        'rw' in run_options and 'rw' in run_super_options and
+        a[1] == run_a[0] and a[2] == run_a[2] and
+        a[3] == '/' + plan.unit[:-8] and a[4] == plan.workspace and
+        mount_options == run_options and 'rw' in mount_options and 'ro' not in mount_options and
+        z[0] == run_z[0] and z[1] == run_z[1] and z[2] == run_z[2],
+        'workspace mount is not the expected systemd ReadWritePaths bind',
+    )
+    return a[0]
+
+
+def _systemd_readwrite_workspace_mount_id(plan, ops, *, mounts=None):
+    mounts = _mounts(ops) if mounts is None else mounts
+    rows = [(a, z) for a, z in mounts if a[4] == plan.workspace]
+    _need(len(rows) == 1, 'unexpected workspace mount stack before preparation')
+    return _systemd_readwrite_workspace_mount(plan, ops, mounts, rows[0])
+
+
 def _kernel_limits(plan, ops):
     cg, b, io = '/sys/fs/cgroup' + plan.cgroup, plan.budget, plan.budget.io
     _need(ops.read(cg + '/cpu.max').split() == [str(b.cpu_quota_percent * 1000), '100000'],
@@ -500,7 +526,10 @@ def inspect_owned_job(plan: JobPlan, *, ops=None) -> OwnedJob:
     _device_proof(plan, ops)
     workspace = _secure_directory(ops, plan.workspace)
     _need(stat.S_IMODE(workspace.st_mode) == 0o700 and not ops.listdir(plan.workspace), 'workspace must be fresh private empty directory')
-    _need(not any(a[4] == plan.workspace for a, _ in _mounts(ops)), 'workspace already mounted')
+    mounts = _mounts(ops)
+    _need(not any(a[4].startswith(plan.workspace + '/') for a, _ in mounts),
+          'nested workspace mount present')
+    _systemd_readwrite_workspace_mount_id(plan, ops, mounts=mounts)
     return OwnedJob(ops.invocation_id, cg, _identity(cgstat), _identity(workspace), ops.pid)
 
 
@@ -528,7 +557,15 @@ def _workspace_mount(plan, ops):
     mounts = _mounts(ops)
     _need(not any(field.startswith(('shared:', 'master:')) for a, _ in mounts for field in a[6:]),
           'mount propagation is not private')
+    _need(not any(a[4].startswith(plan.workspace + '/') for a, _ in mounts),
+          'nested workspace mount present')
     a, z = _visible_mount(plan.workspace, ops, mounts=mounts)
+    workspace_rows = [(row_a, row_z) for row_a, row_z in mounts if row_a[4] == plan.workspace]
+    _need(len(workspace_rows) == 2, 'unexpected workspace mount stack after preparation')
+    underlay = [(row_a, row_z) for row_a, row_z in workspace_rows if row_a[0] != a[0]]
+    _need(len(underlay) == 1, 'workspace bind underlay is missing or ambiguous')
+    _systemd_readwrite_workspace_mount(plan, ops, mounts, underlay[0])
+    _need(a[1] == underlay[0][0][0], 'bounded workspace tmpfs is not directly over the systemd bind')
     _need(a[3] == '/' and z[0] == 'tmpfs' and z[1] == plan.unit[:-8] and
           {'rw', 'nodev', 'nosuid'} <= set(a[5].split(',')), 'private tmpfs mount proof missing')
     vfs = ops.statvfs(plan.workspace)
@@ -567,6 +604,7 @@ def prepare_owned_job(plan: JobPlan, *, ops=None) -> PreparedJob:
     ops = LinuxOps() if ops is None else ops
     owned = inspect_owned_job(plan, ops=ops)
     cg, root = owned.cgroup_path, plan.workspace
+    systemd_workspace_mount_id = _systemd_readwrite_workspace_mount_id(plan, ops)
     _need(_identity(ops.stat(cg)) == owned.cgroup_identity and
           _identity(ops.stat(root)) == owned.workspace_identity, 'identity drift before mutation')
     ops.mkdir(cg + '/supervisor')
@@ -580,6 +618,8 @@ def prepare_owned_job(plan: JobPlan, *, ops=None) -> PreparedJob:
     ops.write(cg + '/containers/cgroup.subtree_control', '+cpu +io +memory +pids')
     _need(set(ops.read(cg + '/containers/cgroup.subtree_control').split()) == {'cpu', 'io', 'memory', 'pids'}, 'nested controllers not enabled')
     ops.run(('mount', '--make-rprivate', '/'))
+    _need(_systemd_readwrite_workspace_mount_id(plan, ops) == systemd_workspace_mount_id,
+          'systemd workspace mount identity drift before tmpfs')
     b = plan.budget
     options = f'size={b.tmpfs_bytes},nr_inodes={b.tmpfs_inodes},mode=0700,uid=0,gid=0,nodev,nosuid'
     ops.run(('mount', '-t', 'tmpfs', '-o', options, plan.unit[:-8], root))

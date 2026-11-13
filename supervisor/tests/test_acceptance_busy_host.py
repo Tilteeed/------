@@ -84,6 +84,8 @@ class SyntheticLinux:
                 '91 90 0:6 / /dev/pts rw - devpts devpts rw\n'
                 '92 1 0:7 / /tmp rw - tmpfs inherited rw\n'
                 '93 1 0:8 / /var/tmp rw - tmpfs inherited rw\n'
+                '94 1 0:30 / /run rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=67108864,mode=755\n'
+                f'95 94 0:30 /{plan.unit[:-8]} {plan.workspace} rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=67108864,mode=755\n'
             ),
         }
         self.namespaces = {('self', 'mnt'): 'mnt:[2]', ('1', 'mnt'): 'mnt:[1]',
@@ -115,7 +117,7 @@ class SyntheticLinux:
             self.props[name] = io.device + ' ' + str(value)
         self.bpf = '[{"id":17,"attach_type":"device","attach_flags":"multi","name":""}]'
         self.mounted = False
-        self.visible_ids = {}
+        self.visible_ids = {'/run': '94', plan.workspace: '95'}
 
     def visible_mount_id(self, path):
         return self.visible_ids[path]
@@ -227,7 +229,8 @@ class SyntheticLinux:
                 self.mounted = True
                 self.stats[self.plan.workspace].st_dev = 10
                 self.stats[self.plan.workspace].st_ino = 1
-                self.files['/proc/self/mountinfo'] += f'11 1 0:28 / {self.plan.workspace} rw,nodev,nosuid - tmpfs {self.plan.unit[:-8]} rw\n'
+                parent = self.visible_ids[self.plan.workspace]
+                self.files['/proc/self/mountinfo'] += f'11 {parent} 0:28 / {self.plan.workspace} rw,nodev,nosuid - tmpfs {self.plan.unit[:-8]} rw\n'
                 self.visible_ids[self.plan.workspace] = '11'
             elif argv[1] == '--bind' and argv[-1] == '/dev':
                 self.files['/proc/self/mountinfo'] += f'12 1 0:28 /dev /dev rw,nosuid - tmpfs {self.plan.unit[:-8]} rw\n'
@@ -367,6 +370,35 @@ class ChildInspectionTests(unittest.TestCase):
         self.assertFalse(ops.writes)
         self.assertFalse(any(c[0] == 'mount' or (c[0] == 'dockerd' and c != ('dockerd', '--version')) for c in ops.commands))
 
+    def test_workspace_accepts_only_exact_systemd_readwritepaths_self_bind(self):
+        cases = (
+            ('wrong parent', lambda row: row.replace('95 94 ', '95 1 ', 1)),
+            ('wrong device', lambda row: row.replace('0:30', '0:31', 1)),
+            ('wrong root', lambda row: row.replace('/acceptance-' + 'a' * 32, '/', 1)),
+            ('read only', lambda row: row.replace(' rw,nosuid', ' ro,nosuid', 1)),
+            ('wrong filesystem', lambda row: row.replace('tmpfs tmpfs', 'ext4 /dev/fake', 1)),
+            ('unexpected mount options', lambda row: row.replace('relatime -', 'relatime,exec -', 1)),
+        )
+        for name, corrupt in cases:
+            with self.subTest(case=name):
+                h, p, ops = fixture()
+                lines = ops.files['/proc/self/mountinfo'].splitlines()
+                index = next(i for i, line in enumerate(lines) if line.startswith('95 '))
+                lines[index] = corrupt(lines[index])
+                ops.files['/proc/self/mountinfo'] = '\n'.join(lines) + '\n'
+                with self.assertRaises(h.Rejected):
+                    h.prepare_owned_job(p, ops=ops)
+                self.assertFalse(ops.writes)
+                self.assertFalse(any(command[0] == 'mount' for command in ops.commands))
+
+        h, p, ops = fixture()
+        ops.files['/proc/self/mountinfo'] += (
+            f'96 94 0:30 /{p.unit[:-8]} {p.workspace} rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=67108864,mode=755\n')
+        with self.assertRaisesRegex(h.Rejected, 'workspace mount stack'):
+            h.prepare_owned_job(p, ops=ops)
+        self.assertFalse(ops.writes)
+        self.assertFalse(any(command[0] == 'mount' for command in ops.commands))
+
     def test_device_allow_requires_typed_empty_dbus_array_and_stays_strict(self):
         h, p, ops = fixture()
         # The systemctl output omits DeviceAllow; only a typed D-Bus empty
@@ -401,6 +433,14 @@ class ChildInspectionTests(unittest.TestCase):
 
 
 class PreparationTests(unittest.TestCase):
+    def test_nested_workspace_mount_after_preparation_is_rejected(self):
+        h, p, ops = fixture()
+        ready = h.prepare_owned_job(p, ops=ops)
+        ops.files['/proc/self/mountinfo'] += (
+            f'999 {ready.workspace_mount_id} 0:99 / {p.workspace}/foreign rw - tmpfs foreign rw\n')
+        with self.assertRaisesRegex(h.Rejected, 'nested workspace mount'):
+            h.verify_prepared_job(p, ready, ops=ops)
+
     def test_visible_overmounts_accept_hidden_old_mountinfo_records(self):
         h, p, ops = fixture()
         # Hidden IDs deliberately exceed the new visible IDs: max(ID) is wrong.
