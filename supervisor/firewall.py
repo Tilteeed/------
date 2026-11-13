@@ -25,6 +25,8 @@ INET_PRIORITY = -10
 BRIDGE_PRIORITY = -210
 MAX_POLICIES = 512
 MAX_RULESET_BYTES = 1_048_576
+MAX_NFT_TEXT_BYTES = 65_536
+_MISSING = object()
 _BRIDGE = re.compile(r'bza[0-9a-f]{12}\Z')
 _FWBRIDGE = re.compile(r'bzf[0-9a-f]{12}\Z')
 _INSTANCE = re.compile(r'[0-9a-f]{32}\Z')
@@ -227,7 +229,7 @@ class RulesetAdapter(Protocol):
 
 
 class NftablesAdapter:
-    """Atomic, table-scoped nft CLI adapter with exact JSON read-back."""
+    """Atomic, table-scoped nft adapter with JSON structure and verified text metadata."""
     def __init__(self, *, nft_binary='nft', runner: Callable | None = None,
                  batch_runner: Callable | None = None, table_name=TABLE_NAME,
                  table_comment=None):
@@ -253,7 +255,7 @@ class NftablesAdapter:
             output = self.runner(list(argv))
             if type(output) is bytes:
                 output = output.decode('utf-8')
-            if type(output) is not str or len(output.encode('utf-8')) > 65536:
+            if type(output) is not str or len(output.encode('utf-8')) > MAX_NFT_TEXT_BYTES:
                 raise ValueError
             return output
         except Exception:
@@ -278,13 +280,108 @@ class NftablesAdapter:
                 raise ValueError
             detail = self._read_text((self.nft_binary, '-a', '-j', 'list', 'table', family, self.table_name))
             manifest, handle = self._normalise_table(detail, family)
-            if handle != listed_handle:
+            table_text = self._read_text((self.nft_binary, '-a', 'list', 'table', family, self.table_name))
+            text_metadata = self._normalise_table_text(table_text)
+            if (handle != listed_handle or text_metadata['handle'] != listed_handle
+                    or text_metadata['family'] != family
+                    or text_metadata['name'] != self.table_name):
                 raise ValueError
+            canonical_table = manifest['tables'][family]['table']
+            text_comment = text_metadata['comment']
+            for json_table in (found[0], canonical_table):
+                json_comment = json_table.get('comment', _MISSING)
+                if json_comment is not _MISSING and json_comment != text_comment:
+                    raise ValueError
+            if text_comment is None:
+                canonical_table.pop('comment', None)
+            else:
+                canonical_table['comment'] = text_comment
             return {'handle': handle, 'manifest': manifest}
         except FirewallError:
             raise
         except Exception:
             raise FirewallError('nftables table inventory is invalid') from None
+
+    @staticmethod
+    def _normalise_table_text(text):
+        """Read table identity/comment from nft text without matching child comments."""
+        try:
+            if type(text) is not str or len(text.encode('utf-8')) > MAX_NFT_TEXT_BYTES:
+                raise ValueError
+            lines = text.splitlines()
+            if not lines:
+                raise ValueError
+            header = re.fullmatch(
+                r'table\s+(inet|bridge)\s+([A-Za-z_][A-Za-z0-9_]*)\s+\{\s+#\s+handle\s+([1-9][0-9]*)',
+                lines[0].strip(),
+            )
+            if header is None:
+                raise ValueError
+            family, name = header.group(1), header.group(2)
+            handle = int(header.group(3))
+            if handle > (1 << 64) - 1:
+                raise ValueError
+
+            depth = 1
+            closed = False
+            table_comment = None
+            table_prefix_open = True
+            for line in lines[1:]:
+                if closed:
+                    if line.strip():
+                        raise ValueError
+                    continue
+                stripped = line.strip()
+                if depth == 1 and stripped:
+                    if table_prefix_open:
+                        table_prefix_open = False
+                        field = re.fullmatch(r'comment\s+("(?:[^"\\]|\\.)*");?', stripped)
+                        if field is not None:
+                            table_comment = json.loads(field.group(1))
+                            if (type(table_comment) is not str
+                                    or len(table_comment.encode('utf-8')) > 256):
+                                raise ValueError
+                        elif stripped.startswith('comment'):
+                            raise ValueError
+                    elif stripped.startswith('comment '):
+                        # A later direct comment is ambiguous and cannot prove ownership.
+                        raise ValueError
+
+                quoted = False
+                escaped = False
+                for index, char in enumerate(line):
+                    if quoted:
+                        if escaped:
+                            escaped = False
+                        elif char == '\\':
+                            escaped = True
+                        elif char == '"':
+                            quoted = False
+                        continue
+                    if char == '"':
+                        quoted = True
+                    elif char == '#':
+                        break
+                    elif char == '{':
+                        depth += 1
+                        if depth > 32:
+                            raise ValueError
+                    elif char == '}':
+                        depth -= 1
+                        if depth < 0:
+                            raise ValueError
+                        if depth == 0:
+                            if line[index + 1:].strip():
+                                raise ValueError
+                            closed = True
+                            break
+                if quoted or escaped:
+                    raise ValueError
+            if not closed or depth != 0:
+                raise ValueError
+            return dict(family=family, name=name, handle=handle, comment=table_comment)
+        except Exception:
+            raise FirewallError('nftables textual table read-back is invalid') from None
 
     @staticmethod
     def _without_handle(value):

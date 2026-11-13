@@ -70,6 +70,23 @@ def nft_prefix_fixture(*, prefix_objects=True, src_addr='10.246.0.0', src_len=29
     ]})
 
 
+def nft_v102_table_text(family, name, handle, comment=None, *, chain_comment=None,
+                        rule_comment=None):
+    lines = [f'table {family} {name} {{ # handle {handle}']
+    if comment is not None:
+        lines.append('        comment ' + json.dumps(comment))
+    lines.extend((
+        '        chain input { # handle 20',
+        '                type filter hook input priority filter; policy accept;',
+    ))
+    if chain_comment is not None:
+        lines.append('                comment ' + json.dumps(chain_comment))
+    if rule_comment is not None:
+        lines.append('                ip saddr 192.0.2.0/24 drop comment ' + json.dumps(rule_comment))
+    lines.extend(('        }', '}'))
+    return '\n'.join(lines) + '\n'
+
+
 def network(hex_digit='a', subnet='192.0.2.0/29'):
     ident = hex_digit * 32
     import ipaddress
@@ -88,16 +105,248 @@ class NftablesAdapterTests(unittest.TestCase):
             calls.append(tuple(argv))
             if argv[-3:] == ('list', 'tables', 'inet'):
                 return ('{"nftables":[{"table":{"family":"inet","name":"agent_proxy_v1",'
-                        '"handle":12,"comment":"BEZR managed firewall agent_proxy_v1 v1"}}]}')
-            return ('{"nftables":[{"table":{"family":"inet","name":"agent_proxy_v1",'
-                    '"handle":12,"comment":"BEZR managed firewall agent_proxy_v1 v1"}}]}')
+                        '"handle":12}}]}')
+            if '-j' in argv:
+                return ('{"nftables":[{"table":{"family":"inet","name":"agent_proxy_v1",'
+                        '"handle":12}}]}')
+            return nft_v102_table_text(
+                'inet', 'agent_proxy_v1', 12, 'BEZR managed firewall agent_proxy_v1 v1')
         adapter = NftablesAdapter(nft_binary='nft-test', runner=runner,
                                   batch_runner=lambda *_args: None)
         self.assertEqual(adapter._family_table('inet')['handle'], 12)
         self.assertEqual(calls, [
             ('nft-test', '-a', '-j', 'list', 'tables', 'inet'),
             ('nft-test', '-a', '-j', 'list', 'table', 'inet', 'agent_proxy_v1'),
+            ('nft-test', '-a', 'list', 'table', 'inet', 'agent_proxy_v1'),
         ])
+
+    def test_nft_v102_text_readback_recovers_table_comment_for_both_profiles_and_families(self):
+        from supervisor.ollama_firewall import TABLE_COMMENT as OLLAMA_COMMENT
+        cases = (
+            ('agent_proxy_v1', 'BEZR managed firewall agent_proxy_v1 v1'),
+            ('agent_ollama_v1', OLLAMA_COMMENT),
+        )
+        for name, comment in cases:
+            for family in ('inet', 'bridge'):
+                with self.subTest(name=name, family=family):
+                    handle = 40 if family == 'inet' else 41
+
+                    def runner(argv):
+                        if argv[-2] == 'tables':
+                            requested_family = argv[-1]
+                            if requested_family != family:
+                                return '{"nftables":[]}'
+                            # nftables 1.0.2 omits table comments from JSON.
+                            return json.dumps({'nftables': [{'table': {
+                                'family': family, 'name': name, 'handle': handle}}]})
+                        requested_family = argv[-2]
+                        if '-j' in argv:
+                            return json.dumps({'nftables': [{'table': {
+                                'family': family, 'name': name, 'handle': handle}}]})
+                        return nft_v102_table_text(family, name, handle, comment)
+
+                    adapter = NftablesAdapter(nft_binary='nft-test', table_name=name,
+                        runner=runner, batch_runner=lambda *_args: None)
+                    observed = adapter.read()
+                    self.assertEqual(set(observed['tables']), {family})
+                    self.assertEqual(observed['tables'][family]['table'], {
+                        'family': family, 'name': name, 'comment': comment,
+                    })
+
+    def test_table_text_identity_must_match_json_family_name_and_handle(self):
+        from supervisor.ollama_firewall import TABLE_COMMENT as OLLAMA_COMMENT
+        profiles = (
+            ('agent_proxy_v1', 'BEZR managed firewall agent_proxy_v1 v1'),
+            ('agent_ollama_v1', OLLAMA_COMMENT),
+        )
+        for name, comment in profiles:
+            for family in ('inet', 'bridge'):
+                for mismatch in ('text_family', 'text_name', 'text_handle', 'detail_handle'):
+                    with self.subTest(name=name, family=family, mismatch=mismatch):
+                        listed_handle = 17
+                        detail_handle = 18 if mismatch == 'detail_handle' else listed_handle
+                        text_family = ('bridge' if family == 'inet' else 'inet') \
+                            if mismatch == 'text_family' else family
+                        text_name = 'foreign_table' if mismatch == 'text_name' else name
+                        text_handle = 18 if mismatch == 'text_handle' else listed_handle
+
+                        def runner(argv):
+                            if argv[-2:] == ['tables', family]:
+                                return json.dumps({'nftables': [{'table': {
+                                    'family': family, 'name': name,
+                                    'handle': listed_handle}}]})
+                            if '-j' in argv:
+                                return json.dumps({'nftables': [{'table': {
+                                    'family': family, 'name': name,
+                                    'handle': detail_handle}}]})
+                            return nft_v102_table_text(
+                                text_family, text_name, text_handle, comment)
+
+                        adapter = NftablesAdapter(nft_binary='nft-test', table_name=name,
+                            runner=runner, batch_runner=lambda *_args: None)
+                        with self.assertRaises(FirewallError):
+                            adapter._family_table(family)
+
+    def test_foreign_table_comment_refuses_replace_and_remove(self):
+        from supervisor.ollama_firewall import TABLE_COMMENT as OLLAMA_COMMENT
+        profiles = (
+            ('agent_proxy_v1', 'BEZR managed firewall agent_proxy_v1 v1'),
+            ('agent_ollama_v1', OLLAMA_COMMENT),
+        )
+        for name, _expected_comment in profiles:
+            for family in ('inet', 'bridge'):
+                for operation in ('replace', 'remove'):
+                    with self.subTest(name=name, family=family, operation=operation):
+                        batches = []
+                        handle = 17 if family == 'inet' else 18
+
+                        def runner(argv):
+                            if argv[-2] == 'tables':
+                                if argv[-1] != family:
+                                    return '{"nftables":[]}'
+                                return json.dumps({'nftables': [{'table': {
+                                    'family': family, 'name': name, 'handle': handle}}]})
+                            if '-j' in argv:
+                                return json.dumps({'nftables': [{'table': {
+                                    'family': family, 'name': name, 'handle': handle}}]})
+                            return nft_v102_table_text(family, name, handle, 'not-bezr')
+
+                        adapter = NftablesAdapter(nft_binary='nft-test', table_name=name,
+                            runner=runner,
+                            batch_runner=lambda argv, batch: batches.append((argv, batch)))
+                        with self.assertRaises(FirewallError):
+                            if operation == 'replace':
+                                adapter.replace(expected_ruleset((network(),)))
+                            else:
+                                adapter.remove()
+                        self.assertEqual(batches, [])
+
+    def test_v102_confirmed_owned_table_allows_replace_and_remove(self):
+        from supervisor.ollama_firewall import (
+            TABLE_COMMENT as OLLAMA_COMMENT, expected_ollama_ruleset,
+        )
+        from supervisor.tests.test_ollama_firewall import route
+
+        profiles = (
+            ('agent_proxy_v1', 'BEZR managed firewall agent_proxy_v1 v1',
+             expected_ruleset((network(),))),
+            ('agent_ollama_v1', OLLAMA_COMMENT,
+             expected_ollama_ruleset((route(),))),
+        )
+        for name, comment, ruleset in profiles:
+            for operation in ('replace', 'remove'):
+                with self.subTest(name=name, operation=operation):
+                    batches = []
+                    handles = {'inet': 17, 'bridge': 18}
+
+                    def runner(argv):
+                        family = argv[-1] if argv[-2] == 'tables' else argv[-2]
+                        if family not in handles:
+                            return '{"nftables":[]}'
+                        if argv[-2] == 'tables':
+                            return json.dumps({'nftables': [{'table': {
+                                'family': family, 'name': name,
+                                'handle': handles[family]}}]})
+                        if '-j' in argv:
+                            return json.dumps({'nftables': [{'table': {
+                                'family': family, 'name': name,
+                                'handle': handles[family]}}]})
+                        return nft_v102_table_text(
+                            family, name, handles[family], comment)
+
+                    adapter = NftablesAdapter(
+                        nft_binary='nft-test', table_name=name, runner=runner,
+                        batch_runner=lambda argv, batch: batches.append((argv, batch)))
+                    if operation == 'replace':
+                        adapter.replace(ruleset)
+                        self.assertEqual(len(batches), 1)
+                        self.assertIn('delete table inet handle 17', batches[0][1])
+                        self.assertIn('delete table bridge handle 18', batches[0][1])
+                    else:
+                        adapter.remove()
+                        self.assertEqual(len(batches), 1)
+                        self.assertEqual(
+                            batches[0][1],
+                            'delete table inet handle 17\ndelete table bridge handle 18\n')
+
+    def test_chain_or_rule_comment_never_confirms_table_ownership(self):
+        from supervisor.ollama_firewall import TABLE_COMMENT as OLLAMA_COMMENT
+        profiles = (
+            ('agent_proxy_v1', 'BEZR managed firewall agent_proxy_v1 v1'),
+            ('agent_ollama_v1', OLLAMA_COMMENT),
+        )
+        for name, comment in profiles:
+            for family in ('inet', 'bridge'):
+                with self.subTest(name=name, family=family):
+                    batches = []
+
+                    def runner(argv):
+                        if argv[-2:] == ['tables', family]:
+                            return json.dumps({'nftables': [{'table': {
+                                'family': family, 'name': name, 'handle': 17}}]})
+                        if '-j' in argv:
+                            return json.dumps({'nftables': [
+                                {'table': {'family': family, 'name': name, 'handle': 17}},
+                                {'chain': {'family': family, 'table': name, 'name': 'input',
+                                           'type': 'filter', 'hook': 'input', 'prio': -10,
+                                           'policy': 'accept', 'comment': comment, 'handle': 20}},
+                                {'rule': {'family': family, 'table': name, 'chain': 'input',
+                                          'expr': [{'drop': None}], 'comment': comment,
+                                          'handle': 30}},
+                            ]})
+                        return nft_v102_table_text(family, name, 17, None,
+                            chain_comment=comment, rule_comment=comment)
+
+                    adapter = NftablesAdapter(nft_binary='nft-test', table_name=name,
+                        runner=runner,
+                        batch_runner=lambda argv, batch: batches.append((argv, batch)))
+                    observed = adapter._family_table(family)['manifest']['tables'][family]
+                    self.assertNotIn('comment', observed['table'])
+                    self.assertEqual(observed['chains'][0]['comment'], comment)
+                    self.assertEqual(observed['rules'][0]['comment'], comment)
+                    with self.assertRaises(FirewallError):
+                        adapter.remove()
+                    self.assertEqual(batches, [])
+
+    def test_json_table_comment_is_not_trusted_without_matching_text_readback(self):
+        from supervisor.ollama_firewall import (
+            TABLE_COMMENT as OLLAMA_COMMENT, expected_ollama_ruleset,
+        )
+        from supervisor.tests.test_ollama_firewall import route
+        profiles = (
+            ('agent_proxy_v1', 'BEZR managed firewall agent_proxy_v1 v1',
+             expected_ruleset((network(),))),
+            ('agent_ollama_v1', OLLAMA_COMMENT,
+             expected_ollama_ruleset((route(),))),
+        )
+        for name, comment, ruleset in profiles:
+            for family in ('inet', 'bridge'):
+                for operation in ('replace', 'remove'):
+                    with self.subTest(name=name, family=family, operation=operation):
+                        batches = []
+
+                        def runner(argv):
+                            if argv[-2:] == ['tables', family]:
+                                return json.dumps({'nftables': [{'table': {
+                                    'family': family, 'name': name, 'handle': 17,
+                                    'comment': comment}}]})
+                            if '-j' in argv:
+                                return json.dumps({'nftables': [{'table': {
+                                    'family': family, 'name': name, 'handle': 17,
+                                    'comment': comment}}]})
+                            # JSON claims ownership; text shows the comment only on children.
+                            return nft_v102_table_text(family, name, 17, None,
+                                chain_comment=comment, rule_comment=comment)
+
+                        adapter = NftablesAdapter(nft_binary='nft-test', table_name=name,
+                            runner=runner,
+                            batch_runner=lambda argv, batch: batches.append((argv, batch)))
+                        with self.assertRaises(FirewallError):
+                            if operation == 'replace':
+                                adapter.replace(ruleset)
+                            else:
+                                adapter.remove()
+                        self.assertEqual(batches, [])
 
     def test_nft_json_readback_matches_and_detects_rule_drift(self):
         expected = expected_ruleset((network(),))
@@ -107,7 +356,12 @@ class NftablesAdapterTests(unittest.TestCase):
             table = expected['tables'][family]
             if argv[-2] == 'tables':
                 return json.dumps({'nftables': [{'table': {
-                    **table['table'], 'handle': 20 if family == 'inet' else 21}}]})
+                    'family': family, 'name': 'agent_proxy_v1',
+                    'handle': 20 if family == 'inet' else 21}}]})
+            if '-j' not in argv:
+                return nft_v102_table_text(
+                    family, 'agent_proxy_v1', 20 if family == 'inet' else 21,
+                    table['table']['comment'])
             objects = [{'table': {**table['table'], 'handle': 20 if family == 'inet' else 21}}]
             objects.extend({'chain': {**chain, 'handle': i + 30}}
                            for i, chain in enumerate(table['chains']))
@@ -253,10 +507,12 @@ class NftablesAdapterTests(unittest.TestCase):
         def runner(argv):
             if argv[-2:] == ['tables', 'inet']:
                 return ('{"nftables":[{"table":{"family":"inet","name":"agent_proxy_v1",'
-                        '"handle":17,"comment":"not-bezr"}}]}')
-            if argv[-3:] == ['table', 'inet', 'agent_proxy_v1']:
+                        '"handle":17}}]}')
+            if '-j' in argv and argv[-3:] == ['table', 'inet', 'agent_proxy_v1']:
                 return ('{"nftables":[{"table":{"family":"inet","name":"agent_proxy_v1",'
-                        '"handle":17,"comment":"not-bezr"}}]}')
+                        '"handle":17}}]}')
+            if argv[-4:] == ['list', 'table', 'inet', 'agent_proxy_v1']:
+                return nft_v102_table_text('inet', 'agent_proxy_v1', 17, 'not-bezr')
             return '{"nftables":[]}'
         adapter = NftablesAdapter(
             nft_binary='nft-test', runner=runner,
@@ -269,9 +525,15 @@ class NftablesAdapterTests(unittest.TestCase):
         def runner(argv):
             if argv[-2:] == ('tables', 'inet') or argv[-2:] == ['tables', 'inet']:
                 return ('{"nftables":[{"table":{"family":"inet","name":"agent_proxy_v1",'
-                        '"handle":17,"comment":"BEZR managed firewall agent_proxy_v1 v1"}}]}')
+                        '"handle":17}}]}')
             if argv[-2:] == ('tables', 'bridge') or argv[-2:] == ['tables', 'bridge']:
                 return '{"nftables":[]}'
+            if '-j' in argv:
+                return ('{"nftables":[{"table":{"family":"inet","name":"agent_proxy_v1",'
+                        '"handle":17}}]}')
+            if argv[-4:] == ['list', 'table', 'inet', 'agent_proxy_v1']:
+                return nft_v102_table_text(
+                    'inet', 'agent_proxy_v1', 17, 'BEZR managed firewall agent_proxy_v1 v1')
             return '{"nftables":[]}'
         adapter = NftablesAdapter(nft_binary='nft-test', runner=runner,
                                   batch_runner=lambda *_args: None)
