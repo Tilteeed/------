@@ -79,8 +79,15 @@ def execute_config(config, *, jobs=None, source=None, store=None,
         return {'status': 'incomplete', 'phase': 'permission', 'checks': []}
     config = parse_config(config)
     if jobs is None:
-        from scripts.gpu_acceptance_job import LinuxJobs
-        jobs = LinuxJobs(config)
+        from scripts import gpu_acceptance_job as job
+        try:
+            jobs = job.LinuxJobs(config)
+        except Exception as error:
+            return {
+                'status': 'incomplete', 'phase': 'preflight', 'checks': [],
+                'job_units': [],
+                'diagnostics': [job._diagnostic('host_preflight', error)],
+            }
     if source is None:
         source = receipts.ProductionStateSource(docker_socket=config['production_docker_socket'])
     if store is None:
@@ -99,6 +106,9 @@ def execute_config(config, *, jobs=None, source=None, store=None,
         cleanup_verifier=jobs.cleanup_verifier, busy_host_approved=True, allow_host_inspection=True)
     # Owned names support scoped diagnosis; not a cleanup-success assertion.
     result['job_units'] = [plan.unit for plan in getattr(jobs, 'plans', ())]
+    diagnostics = getattr(jobs, 'diagnostics', ())
+    if type(diagnostics) is list and diagnostics:
+        result['diagnostics'] = copy.deepcopy(diagnostics[:8])
     return result
 
 

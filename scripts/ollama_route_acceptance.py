@@ -227,7 +227,7 @@ def _kill_command(process, *, start_new_session=True):
 
 
 def command(argv, *, timeout: float = 30, input_text=None, pass_fds=(), env=None,
-            start_new_session=True):
+            start_new_session=True, on_failure=None):
     """Bound concurrent pipe I/O and process wait by one monotonic deadline.
 
     Nonblocking pipe operations also let both workers stop when a descendant
@@ -303,6 +303,15 @@ def command(argv, *, timeout: float = 30, input_text=None, pass_fds=(), env=None
                 # Recheck after workers finish: a worker may have published a
                 # failure between the earlier check and the liveness check.
                 if process.returncode or overflow.is_set() or errors:
+                    # Internal callers may inspect their own bounded diagnostic
+                    # marker. Raw child output remains captured and is never
+                    # included in this exception or emitted by this function.
+                    if (process.returncode and not overflow.is_set() and not errors
+                            and on_failure is not None):
+                        try:
+                            on_failure(output.decode('utf-8', 'replace'), process.returncode)
+                        except Exception:
+                            pass
                     raise RuntimeError('Command failed or output exceeded bound: ' + argv[0])
                 return output.decode('utf-8')
             cancel.wait(min(.01, remaining))
