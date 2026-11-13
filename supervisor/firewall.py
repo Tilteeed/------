@@ -279,7 +279,7 @@ class NftablesAdapter:
             if type(listed_handle) is not int or listed_handle <= 0:
                 raise ValueError
             detail = self._read_text((self.nft_binary, '-a', '-j', 'list', 'table', family, self.table_name))
-            manifest, handle = self._normalise_table(detail, family)
+            manifest, handle, json_objects = self._normalise_table_with_handles(detail, family)
             table_text = self._read_text((self.nft_binary, '-a', 'list', 'table', family, self.table_name))
             text_metadata = self._normalise_table_text(table_text)
             if (handle != listed_handle or text_metadata['handle'] != listed_handle
@@ -296,6 +296,24 @@ class NftablesAdapter:
                 canonical_table.pop('comment', None)
             else:
                 canonical_table['comment'] = text_comment
+            for section in ('chains', 'rules'):
+                json_section = json_objects[section]
+                text_section = text_metadata[section]
+                if set(json_section) != set(text_section):
+                    raise ValueError
+                for identity, json_object in json_section.items():
+                    text_object = text_section[identity]
+                    if json_object['handle'] != text_object['handle']:
+                        raise ValueError
+                    canonical_object = json_object['object']
+                    json_comment = canonical_object.get('comment', _MISSING)
+                    text_comment = text_object['comment']
+                    if json_comment is not _MISSING and json_comment != text_comment:
+                        raise ValueError
+                    if text_comment is None:
+                        canonical_object.pop('comment', None)
+                    else:
+                        canonical_object['comment'] = text_comment
             return {'handle': handle, 'manifest': manifest}
         except FirewallError:
             raise
@@ -304,7 +322,7 @@ class NftablesAdapter:
 
     @staticmethod
     def _normalise_table_text(text):
-        """Read table identity/comment from nft text without matching child comments."""
+        """Read table, chain, and rule comment metadata from nft text read-back."""
         try:
             if type(text) is not str or len(text.encode('utf-8')) > MAX_NFT_TEXT_BYTES:
                 raise ValueError
@@ -322,31 +340,7 @@ class NftablesAdapter:
             if handle > (1 << 64) - 1:
                 raise ValueError
 
-            depth = 1
-            closed = False
-            table_comment = None
-            table_prefix_open = True
-            for line in lines[1:]:
-                if closed:
-                    if line.strip():
-                        raise ValueError
-                    continue
-                stripped = line.strip()
-                if depth == 1 and stripped:
-                    if table_prefix_open:
-                        table_prefix_open = False
-                        field = re.fullmatch(r'comment\s+("(?:[^"\\]|\\.)*");?', stripped)
-                        if field is not None:
-                            table_comment = json.loads(field.group(1))
-                            if (type(table_comment) is not str
-                                    or len(table_comment.encode('utf-8')) > 256):
-                                raise ValueError
-                        elif stripped.startswith('comment'):
-                            raise ValueError
-                    elif stripped.startswith('comment '):
-                        # A later direct comment is ambiguous and cannot prove ownership.
-                        raise ValueError
-
+            def split_annotation(line):
                 quoted = False
                 escaped = False
                 for index, char in enumerate(line):
@@ -357,29 +351,120 @@ class NftablesAdapter:
                             escaped = True
                         elif char == '"':
                             quoted = False
-                        continue
-                    if char == '"':
+                    elif char == '"':
                         quoted = True
                     elif char == '#':
-                        break
-                    elif char == '{':
-                        depth += 1
-                        if depth > 32:
-                            raise ValueError
-                    elif char == '}':
-                        depth -= 1
-                        if depth < 0:
-                            raise ValueError
-                        if depth == 0:
-                            if line[index + 1:].strip():
-                                raise ValueError
-                            closed = True
-                            break
+                        return line[:index].strip(), line[index + 1:].strip()
                 if quoted or escaped:
                     raise ValueError
-            if not closed or depth != 0:
+                return line.strip(), None
+
+            def read_handle(annotation):
+                match = re.fullmatch(r'handle\s+([1-9][0-9]*)', annotation or '')
+                if match is None:
+                    raise ValueError
+                value = int(match.group(1))
+                if value > (1 << 64) - 1:
+                    raise ValueError
+                return value
+
+            def read_comment(statement):
+                match = re.fullmatch(r'comment\s+("(?:[^"\\]|\\.)*");?', statement)
+                if match is None:
+                    raise ValueError
+                value = json.loads(match.group(1))
+                if type(value) is not str or len(value.encode('utf-8')) > 256:
+                    raise ValueError
+                return value
+
+            def read_rule_comment(statement):
+                match = re.search(r'(?<!\S)comment\s+("(?:[^"\\]|\\.)*")\s*;?$', statement)
+                if match is None:
+                    if re.search(r'(?<!\S)comment(?:\s|$)', statement):
+                        raise ValueError
+                    return None
+                value = json.loads(match.group(1))
+                if type(value) is not str or len(value.encode('utf-8')) > 256:
+                    raise ValueError
+                return value
+
+            closed = False
+            table_comment = None
+            table_comment_seen = False
+            saw_chain = False
+            chain_objects = {}
+            text_chain_handles = set()
+            rule_objects = {}
+            current_chain = None
+            for line in lines[1:]:
+                if closed:
+                    if line.strip():
+                        raise ValueError
+                    continue
+                statement, annotation = split_annotation(line)
+                if not statement:
+                    if annotation is not None:
+                        raise ValueError
+                    continue
+
+                if current_chain is None:
+                    if statement == '}':
+                        if annotation is not None:
+                            raise ValueError
+                        closed = True
+                        continue
+                    if statement.startswith('comment'):
+                        if saw_chain or table_comment_seen or annotation is not None:
+                            raise ValueError
+                        table_comment = read_comment(statement)
+                        table_comment_seen = True
+                        continue
+                    chain_match = re.fullmatch(
+                        r'chain\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{', statement)
+                    if chain_match is None:
+                        raise ValueError
+                    chain_name = chain_match.group(1)
+                    chain_handle = read_handle(annotation)
+                    if chain_name in chain_objects or chain_handle in text_chain_handles:
+                        raise ValueError
+                    chain_objects[chain_name] = {
+                        'handle': chain_handle, 'comment': None,
+                    }
+                    text_chain_handles.add(chain_handle)
+                    current_chain = chain_name
+                    saw_chain = True
+                    continue
+
+                if statement == '}':
+                    if annotation is not None:
+                        raise ValueError
+                    current_chain = None
+                    continue
+                if statement.startswith('comment'):
+                    if annotation is not None or chain_objects[current_chain]['comment'] is not None:
+                        raise ValueError
+                    chain_objects[current_chain]['comment'] = read_comment(statement)
+                    continue
+                if statement.startswith(('type ', 'policy ', 'flags ')):
+                    if annotation is not None:
+                        raise ValueError
+                    continue
+                if '{' in statement or '}' in statement:
+                    raise ValueError
+                rule_handle = read_handle(annotation)
+                identity = (current_chain, rule_handle)
+                if identity in rule_objects:
+                    raise ValueError
+                rule_objects[identity] = {
+                    'handle': rule_handle,
+                    'comment': read_rule_comment(statement),
+                }
+            if not closed or current_chain is not None:
                 raise ValueError
-            return dict(family=family, name=name, handle=handle, comment=table_comment)
+            return dict(
+                family=family, name=name, handle=handle, comment=table_comment,
+                chains=chain_objects, rules=rule_objects,
+            )
         except Exception:
             raise FirewallError('nftables textual table read-back is invalid') from None
 
@@ -424,11 +509,17 @@ class NftablesAdapter:
         return rule
 
     def _normalise_table(self, text, family):
+        manifest, handle, _objects = self._normalise_table_with_handles(text, family)
+        return manifest, handle
+
+    def _normalise_table_with_handles(self, text, family):
         try:
             items = json.loads(text)['nftables']
             if type(items) is not list or len(items) > 65536:
                 raise ValueError
             table, handle, chains, rules = None, None, [], []
+            chain_objects, rule_objects = {}, {}
+            json_chain_handles = set()
             for item in items:
                 if type(item) is not dict or len(item) != 1:
                     raise ValueError
@@ -447,9 +538,32 @@ class NftablesAdapter:
                     if value.get('family') != family or value.get('table') != self.table_name:
                         raise ValueError
                     if kind == 'chain':
-                        chains.append(self._without_handle(value))
+                        object_handle = value.get('handle')
+                        chain_name = value.get('name')
+                        if (type(object_handle) is not int or object_handle <= 0
+                                or type(chain_name) is not str or not chain_name
+                                or chain_name in chain_objects
+                                or object_handle in json_chain_handles):
+                            raise ValueError
+                        canonical = self._without_handle(value)
+                        chains.append(canonical)
+                        chain_objects[chain_name] = {
+                            'handle': object_handle, 'object': canonical,
+                        }
+                        json_chain_handles.add(object_handle)
                     else:
-                        rules.append(self._normalise_rule(self._without_handle(value)))
+                        object_handle = value.get('handle')
+                        chain_name = value.get('chain')
+                        identity = (chain_name, object_handle)
+                        if (type(object_handle) is not int or object_handle <= 0
+                                or type(chain_name) is not str or not chain_name
+                                or identity in rule_objects):
+                            raise ValueError
+                        canonical = self._normalise_rule(self._without_handle(value))
+                        rules.append(canonical)
+                        rule_objects[identity] = {
+                            'handle': object_handle, 'object': canonical,
+                        }
                 else:
                     raise ValueError
             if type(handle) is not int or handle <= 0 or table is None:
@@ -458,7 +572,7 @@ class NftablesAdapter:
                 'table': table, 'chains': sorted(chains, key=lambda item: item.get('name', '')),
                 'rules': sorted(rules, key=lambda item: item.get('chain', '')),
             }}, 'semantics_validated': False}
-            return manifest, handle
+            return manifest, handle, {'chains': chain_objects, 'rules': rule_objects}
         except Exception:
             raise FirewallError('nftables ruleset read-back is invalid') from None
 

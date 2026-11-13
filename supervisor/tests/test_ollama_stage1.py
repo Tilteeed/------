@@ -56,9 +56,13 @@ class ColdARPTests(unittest.TestCase):
         self.assertIn('ether type == arp arp saddr ip == 10.98.0.2 arp daddr ip == 10.98.0.1 arp operation == request', batch)
         for family, table in desired['tables'].items():
             # Explicit synthetic JSON round-trip; no inferred live nft output.
-            raw = {'nftables': [{'table': {**table['table'], 'handle': 1}},
-                               *({'chain': c} for c in table['chains']),
-                               *({'rule': r} for r in table['rules'])]}
+            raw = {'nftables': [
+                {'table': {**table['table'], 'handle': 1}},
+                *({'chain': {**chain, 'handle': index + 2}}
+                  for index, chain in enumerate(table['chains'])),
+                *({'rule': {**rule, 'handle': index + 100}}
+                  for index, rule in enumerate(table['rules'])),
+            ]}
             observed, _ = adapter._normalise_table(json.dumps(raw), family)
             self.assertEqual(observed['tables'][family], table)
         for field, right in (('saddr ip', '10.98.0.0/29'), ('saddr ip', 'not-ip'),
