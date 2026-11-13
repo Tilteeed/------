@@ -389,7 +389,9 @@ def expected_ollama_ruleset(routes):
                     for operation in ('request', 'reply'):
                         rules.append(_rule(family, chain, [
                             _match(_meta(interface), item.bridge),
-                            _match({'payload': {'protocol': 'ether', 'field': 'type'}}, 'arp'),
+                            # nft inserts the Ethernet ARP dependency for named
+                            # ARP payload expressions. nft 1.0.2 omits this
+                            # redundant dependency from its JSON readback.
                             _match({'payload': {'protocol': 'arp', 'field': 'saddr ip'}}, source),
                             _match({'payload': {'protocol': 'arp', 'field': 'daddr ip'}}, destination),
                             _match({'payload': {'protocol': 'arp', 'field': 'operation'}}, operation),

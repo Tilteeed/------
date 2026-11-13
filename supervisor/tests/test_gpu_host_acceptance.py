@@ -306,6 +306,19 @@ class JobBoundaryTests(unittest.TestCase):
                     lab.verify_daemon_ready()
                 lab.dc.assert_not_called()
 
+    def test_daemon_readiness_rejects_shared_cgroup_namespace(self):
+        from unittest.mock import Mock, patch
+        from types import SimpleNamespace
+        api = importlib.import_module('scripts.gpu_acceptance_job')
+        lab = object.__new__(api.BoundedLabMixin)
+        lab.daemon = SimpleNamespace(pid=123)
+        lab.prepared_job = SimpleNamespace(mount_namespace='mnt:[42]')
+        lab.dc = Mock()
+        with patch.object(api.os, 'readlink', side_effect=('mnt:[43]', 'cgroup:[5]', 'cgroup:[5]')):
+            with self.assertRaisesRegex(RuntimeError, 'cgroup namespace proof failed'):
+                lab.verify_daemon_ready()
+        lab.dc.assert_not_called()
+
     def test_cleanup_stops_owned_children_after_resource_failure_and_still_fails_closed(self):
         from unittest.mock import Mock, patch
         api = importlib.import_module('scripts.gpu_acceptance_job')
@@ -352,12 +365,12 @@ class JobBoundaryTests(unittest.TestCase):
         def synthetic_entry(config, check, run_id, actual_plan, prepared):
             reached.append(prepared.container_cgroup_parent)
             self.assertTrue(ops.writes)
-            self.assertIn('--cgroup-parent=' + prepared.container_cgroup_parent, prepared.daemon_argv)
+            self.assertIn('--cgroup-parent=/workloads', prepared.daemon_argv)
             raise RuntimeError('synthetic boundary reached')
         with self.assertRaisesRegex(RuntimeError, 'synthetic boundary reached'):
             api.run_unit(profile(), 'linux_proxy_isolated_check', 'd' * 32,
                          plan.unit, ops=ops, enter=synthetic_entry)
-        self.assertEqual(reached, [plan.cgroup + '/containers'])
+        self.assertEqual(reached, [plan.cgroup + '/containers/docker/workloads'])
 
 
 if __name__ == '__main__':

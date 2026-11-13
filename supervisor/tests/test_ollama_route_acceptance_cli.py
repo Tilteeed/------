@@ -249,6 +249,15 @@ class RouteAcceptanceTests(unittest.TestCase):
         with self.assertRaises(subprocess.TimeoutExpired):
             route.command([sys.executable, '-c', 'import time; time.sleep(5)'], timeout=.1)
 
+    def test_command_keeps_docker_stdout_separate_and_bounds_stderr(self):
+        import sys
+        code = 'import sys; print("container-id"); print("warning", file=sys.stderr)'
+        self.assertEqual(route.command([sys.executable, '-c', code],
+                                       separate_stderr=True).strip(), 'container-id')
+        with patch.object(route, 'LIMIT', 16), self.assertRaises(RuntimeError):
+            route.command([sys.executable, '-c', 'import sys; sys.stderr.write("x" * 1000)'],
+                          separate_stderr=True)
+
     def test_no_report_file_skip_or_existing_receipt_cli_inputs(self):
         import contextlib
         import io

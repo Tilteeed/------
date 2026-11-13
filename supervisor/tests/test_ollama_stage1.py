@@ -19,6 +19,10 @@ def verdict(rules, chain, packet):
                     key = ('meta', left['meta']['key'])
                 else:
                     key = (left['payload']['protocol'], left['payload']['field'])
+                    # Named ARP fields have an implicit Ethernet ARP protocol
+                    # dependency in nftables, including when it is not printed.
+                    if key[0] == 'arp' and packet.get(('ether', 'type')) != 'arp':
+                        break
                 if key not in packet or packet[key] != match['right']:
                     break
             else:
@@ -34,7 +38,7 @@ class ColdARPTests(unittest.TestCase):
         desired = expected_ollama_ruleset((policy,))
         arp_index = next(i for i, rule in enumerate(desired['tables']['bridge']['rules'])
                          if 'bridge arp input request' in rule['comment'])
-        for expression in range(5):
+        for expression in range(4):
             adapter = FakeAdapter(copy.deepcopy(desired))
             manager = OllamaFirewallManager(adapter, semantics_validated=True)
             self.assertTrue(manager.ready((policy,)))
@@ -53,7 +57,7 @@ class ColdARPTests(unittest.TestCase):
         adapter = NftablesAdapter(table_name=TABLE_NAME)
         desired = expected_ollama_ruleset((route(),))
         batch = adapter._render_batch(desired, {'inet': None, 'bridge': None})
-        self.assertIn('ether type == arp arp saddr ip == 10.98.0.2 arp daddr ip == 10.98.0.1 arp operation == request', batch)
+        self.assertIn('arp saddr ip == 10.98.0.2 arp daddr ip == 10.98.0.1 arp operation == request', batch)
         for family, table in desired['tables'].items():
             # Explicit synthetic JSON round-trip; no inferred live nft output.
             raw = {'nftables': [
@@ -101,7 +105,7 @@ class ColdARPTests(unittest.TestCase):
         self.assertEqual(len(arp), 8)
         # Every ARP allow is fully pinned, with no subnet/blanket exemption.
         for rule in arp:
-            self.assertEqual(len(rule['expr']), 6)
+            self.assertEqual(len(rule['expr']), 5)
 
 
 class TopologyLabTests(unittest.TestCase):

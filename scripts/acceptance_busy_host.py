@@ -177,14 +177,15 @@ _PREPARATION_OPERATIONS = {
         'read_launcher_cgroup', 'enable_supervisor_controllers',
         'read_supervisor_controllers', 'create_containers_cgroup',
         'read_containers_cgroup_procs', 'enable_container_controllers',
-        'read_container_controllers',
+        'read_container_controllers', 'create_docker_domain', 'create_docker_daemon',
+        'create_docker_workloads',
     )),
     'tmpfs_setup': frozenset((
         'read_systemd_workspace_mount', 'make_mounts_private',
         'verify_systemd_workspace_mount', 'mount_workspace_tmpfs',
         'verify_workspace_tmpfs', 'list_workspace', 'mkdir_workspace_dev',
         'mkdir_workspace_tmp', 'mkdir_workspace_data', 'mkdir_workspace_exec',
-        'mkdir_workspace_client', 'mkdir_workspace_home', 'mkdir_workspace_cdi',
+        'mkdir_workspace_client', 'mkdir_workspace_home', 'mkdir_workspace_cdi', 'mkdir_workspace_shim',
         'capture_tmp_mount', 'capture_var_tmp_mount',
     )),
     'device_creation': frozenset((
@@ -827,6 +828,10 @@ def prepare_owned_job(plan: JobPlan, *, ops=None) -> PreparedJob:
     container_controllers = _prepare_operation('cgroup_setup', 'read_container_controllers',
                                                 ops.read, cg + '/containers/cgroup.subtree_control')
     _need(set(container_controllers.split()) == {'cpu', 'io', 'memory', 'pids'}, 'nested controllers not enabled')
+    for operation, suffix in (('create_docker_domain', '/containers/docker'),
+                              ('create_docker_daemon', '/containers/docker/daemon'),
+                              ('create_docker_workloads', '/containers/docker/workloads')):
+        _prepare_operation('cgroup_setup', operation, ops.mkdir, cg + suffix)
     _prepare_operation('tmpfs_setup', 'make_mounts_private', ops.run, ('mount', '--make-rprivate', '/'))
     current_workspace_mount_id = _prepare_operation(
         'tmpfs_setup', 'verify_systemd_workspace_mount', _systemd_readwrite_workspace_mount_id, plan, ops)
@@ -839,7 +844,7 @@ def prepare_owned_job(plan: JobPlan, *, ops=None) -> PreparedJob:
     mount_id = _prepare_operation('tmpfs_setup', 'verify_workspace_tmpfs', _workspace_mount, plan, ops)
     workspace_entries = _prepare_operation('tmpfs_setup', 'list_workspace', ops.listdir, root)
     _need(not workspace_entries, 'new tmpfs not empty')
-    for name in ('dev', 'tmp', 'data', 'exec', 'client', 'home', 'cdi'):
+    for name in ('dev', 'tmp', 'data', 'exec', 'client', 'home', 'cdi', 'shim'):
         _prepare_operation('tmpfs_setup', 'mkdir_workspace_' + name, ops.mkdir, root + '/' + name)
     for name, operation in (('pts', 'mkdir_dev_pts'), ('shm', 'mkdir_dev_shm')):
         _prepare_operation('device_creation', operation, ops.mkdir, root + '/dev/' + name)
@@ -868,15 +873,36 @@ def prepare_owned_job(plan: JobPlan, *, ops=None) -> PreparedJob:
                        root + '/client/config.json', '{}\n', create=True)
     # Docker makes its data-root shared during startup. Keep those mounts in a
     # separate, initially private mount namespace, not the verifier's namespace.
-    daemon = ('unshare', '--mount', '--propagation', 'private', '--',
-              'dockerd', '--config-file=' + root + '/daemon.json', '--data-root=' + root + '/data',
+    # containerd 2.2 uses /run/containerd/s even with a private --exec-root.
+    # Mount a bounded directory only in the daemon's own mount namespace.
+    # A separate cgroup namespace rooted at our delegated subtree avoids runc
+    # traversing systemd's cgroup bind mount and enables only approved controllers.
+    inner = ('import os,subprocess,sys;'
+             'os.readlink("/proc/self/ns/cgroup")!=os.readlink("/proc/1/ns/cgroup") or sys.exit(1);'
+             'open("/proc/self/cgroup").read().strip()=="0::/" or sys.exit(1);'
+             'source=os.stat(sys.argv[1]);'
+             'subprocess.run(("mount","--bind",sys.argv[1],"/sys/fs/cgroup"),check=True);'
+             '(source.st_dev,source.st_ino)==(os.stat("/sys/fs/cgroup").st_dev,os.stat("/sys/fs/cgroup").st_ino) or sys.exit(1);'
+             'open("/sys/fs/cgroup/daemon/cgroup.procs","w").write("0");'
+             'open("/sys/fs/cgroup/cgroup.subtree_control","w").write("+cpu +io +memory +pids");'
+             'open("/sys/fs/cgroup/workloads/cgroup.subtree_control","w").write("+cpu +io +memory +pids");'
+             'os.execvp(sys.argv[2],sys.argv[2:])')
+    outer = ('import os,subprocess,sys;'
+             'os.readlink("/proc/self/ns/mnt")!=os.readlink("/proc/1/ns/mnt") or sys.exit(1);'
+             'subprocess.run(("mount","--bind",sys.argv[1],"/run/containerd"),check=True);'
+             '(os.stat(sys.argv[1]).st_dev,os.stat(sys.argv[1]).st_ino)==(os.stat("/run/containerd").st_dev,os.stat("/run/containerd").st_ino) or sys.exit(1);'
+             'open(sys.argv[2]+"/cgroup.procs","w").write("0");'
+             'os.execvp("unshare",("unshare","--cgroup","--","/usr/bin/python3","-c",sys.argv[3],sys.argv[2],*sys.argv[4:]))')
+    dockerd = ('dockerd', '--config-file=' + root + '/daemon.json', '--data-root=' + root + '/data',
               '--exec-root=' + root + '/exec', '--pidfile=' + root + '/dockerd.pid',
               '--host=unix://' + root + '/docker.sock', '--storage-driver=vfs',
-              '--exec-opt=native.cgroupdriver=cgroupfs', '--cgroup-parent=' + plan.cgroup + '/containers',
+              '--exec-opt=native.cgroupdriver=cgroupfs', '--cgroup-parent=/workloads',
               '--default-cgroupns-mode=private', '--containerd-namespace=' + plan.unit[:-8],
               '--containerd-plugins-namespace=' + plan.unit[:-8] + '-plugins',
               '--bridge=none', '--iptables=false', '--ip6tables=false', '--ip-forward=false', '--ip-masq=false',
               '--userland-proxy=false')
+    daemon = ('unshare', '--mount', '--propagation', 'private', '--',
+              '/usr/bin/python3', '-c', outer, root + '/shim', cg + '/containers/docker', inner) + dockerd
     environment = tuple(sorted({'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C', 'LANG': 'C',
                                 'HOME': root + '/home', 'TMPDIR': root + '/tmp',
                                 'XDG_CONFIG_HOME': root + '/home', 'XDG_RUNTIME_DIR': root + '/exec'}.items()))
@@ -888,14 +914,14 @@ def prepare_owned_job(plan: JobPlan, *, ops=None) -> PreparedJob:
                                           lambda: _visible_mount('/var/tmp', ops)[0][0])
     devpts_mount_id = _prepare_operation('device_creation', 'capture_devpts_mount',
                                          lambda: _visible_mount('/dev/pts', ops)[0][0])
-    ready = PreparedJob(owned, plan.cgroup + '/containers', workspace_identity, mount_id,
+    ready = PreparedJob(owned, plan.cgroup + '/containers/docker/workloads', workspace_identity, mount_id,
                         dev_mount_id, daemon,
                         ('docker', '--config', root + '/client', '--host', 'unix://' + root + '/docker.sock'),
                         environment, mount_namespace, tmp_mount_id, var_tmp_mount_id, devpts_mount_id)
     _prepare_operation('config_setup', 'verify_prepared_job',
                        verify_prepared_job, plan, ready, pids=(ops.pid,), ops=ops)
     # Docker validates its real configuration/flags without starting the daemon.
-    _prepare_operation('config_setup', 'validate_docker_config', ops.run, daemon[5:] + ('--validate',))
+    _prepare_operation('config_setup', 'validate_docker_config', ops.run, dockerd + ('--validate',))
     return ready
 
 
@@ -954,7 +980,7 @@ def verify_prepared_job(plan: JobPlan, prepared: PreparedJob, *, pids=(), contai
         _need(set(ops.read(cg + suffix + '/cgroup.subtree_control').split()) == {'cpu', 'io', 'memory', 'pids'}, 'controller drift')
     _need(not ops.read(cg + '/containers/cgroup.procs').strip(), 'container parent populated')
     _need(ops.read('/proc/self/cgroup').strip() == '0::' + plan.cgroup + '/supervisor', 'supervisor escaped owned leaf')
-    _need(prepared.container_cgroup_parent == plan.cgroup + '/containers', 'unexpected container cgroup parent')
+    _need(prepared.container_cgroup_parent == plan.cgroup + '/containers/docker/workloads', 'unexpected container cgroup parent')
     _need(_identity(ops.stat(plan.workspace)) == prepared.workspace_identity and
           _workspace_mount(plan, ops) == prepared.workspace_mount_id and
           _private_devices(plan, ops) == prepared.device_mount_id, 'private storage identity drift')

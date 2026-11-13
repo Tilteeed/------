@@ -227,7 +227,7 @@ def _kill_command(process, *, start_new_session=True):
 
 
 def command(argv, *, timeout: float = 30, input_text=None, pass_fds=(), env=None,
-            start_new_session=True, on_failure=None):
+            start_new_session=True, on_failure=None, separate_stderr=False):
     """Bound concurrent pipe I/O and process wait by one monotonic deadline.
 
     Nonblocking pipe operations also let both workers stop when a descendant
@@ -236,30 +236,33 @@ def command(argv, *, timeout: float = 30, input_text=None, pass_fds=(), env=None
     """
     deadline = time.monotonic() + timeout
     process = subprocess.Popen(argv, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=False,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT, shell=False,
                                start_new_session=start_new_session, pass_fds=pass_fds, env=env,
                                bufsize=0, preexec_fn=_parent_death_setup())
     output = bytearray()
+    stderr_output = bytearray()
+    output_lock = threading.Lock()
     cancel = threading.Event()
     overflow = threading.Event()
     errors = []
     workers = []
 
-    def read():
-        assert process.stdout is not None
+    def read(stream, destination):
         try:
             while not cancel.is_set():
                 try:
-                    chunk = os.read(process.stdout.fileno(), 4096)
+                    chunk = os.read(stream.fileno(), 4096)
                 except BlockingIOError:
                     cancel.wait(.01)
                     continue
                 if not chunk:
                     return
-                if len(output) + len(chunk) > LIMIT:
-                    overflow.set()
-                    return
-                output.extend(chunk)
+                with output_lock:
+                    if len(output) + len(stderr_output) + len(chunk) > LIMIT:
+                        overflow.set()
+                        return
+                    destination.extend(chunk)
         except OSError as error:
             errors.append(error)
 
@@ -287,7 +290,12 @@ def command(argv, *, timeout: float = 30, input_text=None, pass_fds=(), env=None
     try:
         assert process.stdout is not None
         os.set_blocking(process.stdout.fileno(), False)
-        workers.append(threading.Thread(target=read, name='acceptance-stdout'))
+        workers.append(threading.Thread(target=read, args=(process.stdout, output),
+                                        name='acceptance-stdout'))
+        if process.stderr is not None:
+            os.set_blocking(process.stderr.fileno(), False)
+            workers.append(threading.Thread(target=read, args=(process.stderr, stderr_output),
+                                            name='acceptance-stderr'))
         if process.stdin is not None:
             os.set_blocking(process.stdin.fileno(), False)
             workers.append(threading.Thread(target=write, name='acceptance-stdin'))
@@ -309,7 +317,7 @@ def command(argv, *, timeout: float = 30, input_text=None, pass_fds=(), env=None
                     if (process.returncode and not overflow.is_set() and not errors
                             and on_failure is not None):
                         try:
-                            on_failure(output.decode('utf-8', 'replace'), process.returncode)
+                            on_failure((output + stderr_output).decode('utf-8', 'replace'), process.returncode)
                         except Exception:
                             pass
                     raise RuntimeError('Command failed or output exceeded bound: ' + argv[0])
@@ -326,7 +334,7 @@ def command(argv, *, timeout: float = 30, input_text=None, pass_fds=(), env=None
                     worker.join(timeout=1)
             if any(worker.is_alive() for worker in workers):
                 raise RuntimeError('Command pipe workers failed to stop')
-            for stream in (process.stdin, process.stdout):
+            for stream in (process.stdin, process.stdout, process.stderr):
                 if stream is not None:
                     stream.close()
 

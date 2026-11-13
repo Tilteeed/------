@@ -342,7 +342,8 @@ class Lab:
             raise RuntimeError('Private nested Docker daemon unavailable or namespace changed')
         return self.run(['docker', '--config', str(Path(self.socket).parent / 'cli'),
                          '--host', 'unix://' + self.socket, *argv],
-                        env={k: v for k, v in os.environ.items() if not k.startswith('DOCKER_')}, **kwargs)
+                        env={k: v for k, v in os.environ.items() if not k.startswith('DOCKER_')},
+                        separate_stderr=True, **kwargs)
 
     def setup_docker(self):
         self.guard()

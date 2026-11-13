@@ -700,7 +700,7 @@ class PreparationTests(unittest.TestCase):
     def test_prepares_only_owned_subtree_and_private_bounded_storage(self):
         h, p, ops = fixture()
         ready = h.prepare_owned_job(p, ops=ops)
-        self.assertEqual(ready.container_cgroup_parent, p.cgroup + '/containers')
+        self.assertEqual(ready.container_cgroup_parent, p.cgroup + '/containers/docker/workloads')
         self.assertEqual(ops.files[ops.cg + '/cgroup.procs'], '')
         self.assertEqual(ops.files[ops.cg + '/supervisor/cgroup.procs'], '701')
         self.assertEqual(ops.files[ops.cg + '/cgroup.subtree_control'], 'cpu io memory pids')
@@ -715,8 +715,10 @@ class PreparationTests(unittest.TestCase):
         self.assertLess(private_dev_bind, private_dev_remount)
         self.assertIn('--storage-driver=vfs', ready.daemon_argv)
         self.assertEqual(ready.daemon_argv[:6],
-                         ('unshare', '--mount', '--propagation', 'private', '--', 'dockerd'))
-        self.assertIn('--cgroup-parent=' + ready.container_cgroup_parent, ready.daemon_argv)
+                         ('unshare', '--mount', '--propagation', 'private', '--', '/usr/bin/python3'))
+        self.assertIn('--cgroup-parent=/workloads', ready.daemon_argv)
+        self.assertIn(p.workspace + '/shim', ready.daemon_argv)
+        self.assertIn(ops.cg + '/containers/docker', ready.daemon_argv)
         self.assertIn('--exec-opt=native.cgroupdriver=cgroupfs', ready.daemon_argv)
         self.assertIn('--host=unix://' + p.workspace + '/docker.sock', ready.daemon_argv)
         self.assertIn('--config-file=' + p.workspace + '/daemon.json', ready.daemon_argv)
@@ -990,8 +992,11 @@ class RejectionTests(unittest.TestCase):
     def test_container_pid_must_be_below_exact_container_parent(self):
         h, p, ops = fixture()
         ready = h.prepare_owned_job(p, ops=ops)
-        ops.files['/proc/702/cgroup'] = '0::' + p.cgroup + '/containers/id'
+        ops.files['/proc/702/cgroup'] = '0::' + p.cgroup + '/containers/docker/workloads/id'
         h.verify_prepared_job(p, ready, container_pids=(702,), ops=ops)
+        ops.files['/proc/702/cgroup'] = '0::' + p.cgroup + '/containers/id'
+        with self.assertRaises(h.Rejected):
+            h.verify_prepared_job(p, ready, container_pids=(702,), ops=ops)
         ops.files['/proc/702/cgroup'] = '0::' + p.cgroup + '/supervisor'
         with self.assertRaises(h.Rejected):
             h.verify_prepared_job(p, ready, container_pids=(702,), ops=ops)

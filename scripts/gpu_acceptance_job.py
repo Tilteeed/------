@@ -393,7 +393,7 @@ class BoundedLabMixin(Lab):
         return list(self.prepared_job.daemon_argv)
 
     def container_options(self):
-        return ['--cgroup-parent', self.prepared_job.container_cgroup_parent]
+        return ['--cgroup-parent', '/workloads']
 
     def run(self, argv, **kwargs):
         self.guard()
@@ -416,9 +416,24 @@ class BoundedLabMixin(Lab):
         if (re.fullmatch(r'mnt:\[[1-9][0-9]*\]', daemon_mount) is None
                 or daemon_mount == self.prepared_job.mount_namespace):
             raise RuntimeError('Private daemon mount namespace proof failed')
+        daemon_root = '/proc/' + str(self.daemon.pid) + '/root'
+        if os.readlink('/proc/' + str(self.daemon.pid) + '/ns/cgroup') == os.readlink('/proc/self/ns/cgroup'):
+            raise RuntimeError('Private daemon cgroup namespace proof failed')
+        for target, source in (('/run/containerd', self.job_plan.workspace + '/shim'),
+                               ('/sys/fs/cgroup', self.prepared_job.owned.cgroup_path + '/containers/docker')):
+            observed, expected = os.stat(daemon_root + target), os.stat(source)
+            if (observed.st_dev, observed.st_ino) != (expected.st_dev, expected.st_ino):
+                raise RuntimeError('Private daemon mount identity proof failed')
+        for suffix in ('', '/workloads'):
+            with open(self.prepared_job.owned.cgroup_path + '/containers/docker' + suffix +
+                      '/cgroup.subtree_control', encoding='ascii') as stream:
+                controllers = stream.read().split()
+            if set(controllers) != {'cpu', 'io', 'memory', 'pids'}:
+                raise RuntimeError('Private daemon controller proof failed')
         info = route.strict_json(self.dc(['info', '--format', '{{json .}}']))
         if (info.get('CgroupDriver') != 'cgroupfs' or info.get('CgroupVersion') != '2'
-                or info.get('Driver') != 'vfs'
+                or info.get('Driver') != 'vfs' or info.get('MemoryLimit') is not True
+                or info.get('PidsLimit') is not True
                 or info.get('DockerRootDir') != self.job_plan.workspace + '/data'):
             raise RuntimeError('Private daemon driver/cgroup/storage readback failed')
         path = self.job_plan.workspace + '/exec/containerd/containerd.pid'
@@ -434,7 +449,7 @@ class BoundedLabMixin(Lab):
 
     def verify_started_container(self, data):
         host = data.get('HostConfig', {})
-        if (host.get('CgroupParent') != self.prepared_job.container_cgroup_parent
+        if (host.get('CgroupParent') != '/workloads'
                 or host.get('DeviceRequests') not in (None, [])):
             raise RuntimeError('Container resource/device configuration drift')
         self.resource_check(container_pids=(data['State']['Pid'],))
