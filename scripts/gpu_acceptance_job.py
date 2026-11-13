@@ -18,7 +18,9 @@ from scripts import acceptance_busy_host as resources
 from scripts import gpu_acceptance_receipts as receipts
 from scripts import ollama_route_acceptance as route
 from scripts import proxy_packet_acceptance as base
-from scripts.ollama_route_linux import Lab
+from scripts.ollama_route_linux import (
+    CLEANUP_FAILURE_OPERATIONS, CLEANUP_FAILURE_REASONS, Lab,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 _FAILURE_PREFIX = 'BEZR_ACCEPTANCE_DIAGNOSTIC '
@@ -32,6 +34,57 @@ _FAILURE_STAGES = frozenset((
     'systemd_unit', 'report_readback', 'cleanup_verification',
     'host_preflight',
 ))
+_RULESET_DIAGNOSTIC_FIELDS = frozenset((
+    'tables', 'semantics_validated', 'table', 'chains', 'rules', 'family', 'name',
+    'comment', 'type', 'hook', 'prio', 'policy', 'chain', 'expr', 'match', 'left',
+    'op', 'right', 'meta', 'key', 'payload', 'protocol', 'field', 'prefix',
+    'accept', 'drop', 'reject', 'verdict', 'ct', 'state', 'mark', 'counter',
+    'notrack', 'set', 'map', 'numgen', 'jhash', 'th', 'tcp', 'udp', 'icmp',
+    'icmpv6', 'ether', 'other',
+))
+_RULESET_DIFFERENCES = frozenset((
+    'missing_field', 'extra_field', 'type_mismatch', 'value_mismatch', 'order_mismatch',
+))
+
+
+def _valid_ruleset_diagnostic(value):
+    if (type(value) is not dict
+            or set(value) != {'family', 'section', 'chain', 'rule_index', 'field', 'difference'}
+            or value['family'] not in ('inet', 'bridge')
+            or value['section'] not in ('table', 'chains', 'rules')
+            or (value['chain'] is not None and value['chain'] not in ('input', 'output', 'forward'))
+            or type(value['difference']) is not str or value['difference'] not in _RULESET_DIFFERENCES
+            or type(value['field']) is not str or not value['field'] or len(value['field']) > 160
+            or any(ord(char) < 32 for char in value['field'])):
+        return False
+    rule_index = value['rule_index']
+    if rule_index is not None and (type(rule_index) is not int or not 0 <= rule_index <= 65535):
+        return False
+    for component in value['field'].split('.'):
+        match = re.fullmatch(r'([A-Za-z_][A-Za-z0-9_]*)(?:\[(0|[1-9][0-9]{0,4})\])?', component)
+        if (match is None or match[1] not in _RULESET_DIAGNOSTIC_FIELDS
+                or (match[2] is not None and int(match[2]) > 65535)):
+            return False
+    return True
+
+
+def _valid_cleanup_diagnostics(value):
+    if type(value) is not list or not 1 <= len(value) <= 64:
+        return False
+    for item in value:
+        if (type(item) is not dict
+                or set(item) != {'operation', 'exception', 'reason', 'errno'}
+                or type(item['operation']) is not str
+                or item['operation'] not in CLEANUP_FAILURE_OPERATIONS
+                or type(item['exception']) is not str
+                or re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', item['exception']) is None
+                or type(item['reason']) is not str
+                or item['reason'] not in CLEANUP_FAILURE_REASONS):
+            return False
+        errno_value = item['errno']
+        if errno_value is not None and (type(errno_value) is not int or not 0 <= errno_value <= 65535):
+            return False
+    return True
 
 
 def _safe_condition(error):
@@ -76,6 +129,14 @@ def _diagnostic(stage, error, *, check=None):
     }
     if preparation_failure:
         result.update(substage=error.substage, operation=error.operation, errno=error.errno)
+    ruleset_diff = getattr(error, 'ruleset_diff', None)
+    if _valid_ruleset_diagnostic(ruleset_diff):
+        result.update(ruleset_diff)
+    cleanup_failures = getattr(error, 'cleanup_failures', None)
+    if type(cleanup_failures) is tuple:
+        cleanup_failures = list(cleanup_failures)
+    if _valid_cleanup_diagnostics(cleanup_failures):
+        result['cleanup_failures'] = cleanup_failures
     if check is not None:
         result['check'] = check
     return result
@@ -95,6 +156,8 @@ def _diagnostics_from_output(text):
     records = []
     base_keys = {'stage', 'exception', 'condition'}
     preparation_keys = base_keys | {'substage', 'operation', 'errno'}
+    ruleset_keys = base_keys | {'family', 'section', 'chain', 'rule_index', 'field', 'difference'}
+    cleanup_keys = base_keys | {'cleanup_failures'}
     for line in text.splitlines():
         if not line.startswith(_FAILURE_PREFIX):
             continue
@@ -102,7 +165,8 @@ def _diagnostics_from_output(text):
             value = route.strict_json(line[len(_FAILURE_PREFIX):])
         except (TypeError, ValueError, RecursionError):
             continue
-        if (type(value) is not dict or set(value) not in (base_keys, preparation_keys)
+        if (type(value) is not dict or set(value) not in (
+                    base_keys, preparation_keys, ruleset_keys, cleanup_keys)
                 or type(value['stage']) is not str or value['stage'] not in _FAILURE_STAGES
                 or type(value['exception']) is not str
                 or re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', value['exception']) is None
@@ -118,6 +182,19 @@ def _diagnostics_from_output(text):
                     or (diagnostic_errno is not None and
                         (type(diagnostic_errno) is not int or diagnostic_errno < 0))
                     or value['condition'] != condition):
+                continue
+        elif set(value) == ruleset_keys:
+            diff = {key: value[key] for key in ruleset_keys - base_keys}
+            if (value['stage'] != 'packet_check'
+                    or value['exception'] != 'ProxyRulesetMismatch'
+                    or value['condition'] != 'Independent proxy canonical readback failed'
+                    or not _valid_ruleset_diagnostic(diff)):
+                continue
+        elif set(value) == cleanup_keys:
+            if (value['stage'] != 'cleanup'
+                    or value['exception'] != 'CleanupFailure'
+                    or value['condition'] != 'Disposable lab cleanup failed; no report/receipt'
+                    or not _valid_cleanup_diagnostics(value['cleanup_failures'])):
                 continue
         records.append(value)
     # The outer bootstrap may report that namespace entry failed after the

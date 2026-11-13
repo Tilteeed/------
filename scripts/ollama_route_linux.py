@@ -20,11 +20,37 @@ from scripts.ollama_route_acceptance import (
     strict_json, validate_report,
 )
 from supervisor.docker_engine import DockerEngine
-from supervisor.firewall import NftablesAdapter
+from supervisor.firewall import FirewallError, NftablesAdapter
 from supervisor.firewall_acceptance import machine_id_sha256
 from supervisor.ollama_firewall import TABLE_NAME, expected_ollama_ruleset
 
 ROOT = Path(__file__).resolve().parents[1]
+CLEANUP_FAILURE_OPERATIONS = frozenset((
+    'remove_ollama_policy', 'remove_proxy_policy', 'remove_local_endpoint',
+    'remove_owned_container', 'remove_owned_network', 'verify_daemon_empty',
+    'stop_holder', 'stop_lab_process', 'delete_owned_link', 'cleanup_workspace',
+    'verify_ollama_policy_absent', 'verify_proxy_policy_absent', 'verify_links_absent',
+))
+CLEANUP_FAILURE_REASONS = frozenset((
+    'operation_failed', 'os_error', 'timeout', 'readback_failed',
+    'firewall_operation_failed', 'policy_present', 'resources_present',
+    'process_still_alive',
+))
+
+
+class CleanupFailure(RuntimeError):
+    """Cleanup failed; contains fixed operation IDs and sanitized causes only."""
+    def __init__(self, failures):
+        self.cleanup_failures = tuple(failures)
+        super().__init__('Disposable lab cleanup failed; no report/receipt')
+
+
+class CleanupObservationFailure(RuntimeError):
+    def __init__(self, reason):
+        self.cleanup_reason = reason
+        super().__init__(reason)
+
+
 # The image must already contain Python 3. No package installation or image pull.
 SERVER = r'''
 import http.server, sys, threading
@@ -447,6 +473,10 @@ class Lab:
                 if adapter.read() is not None:
                     raise RuntimeError('Narrow positive-control policy removal failed')
 
+    def cleanup_policy_removals(self):
+        return (('remove_ollama_policy', self.adapter),
+                ('remove_proxy_policy', self.proxy_adapter))
+
     def flush_neighbors(self):
         """Do not let pre-enforcement positive controls hide cold-path ARP failures."""
         self.guard()
@@ -502,53 +532,110 @@ class Lab:
 
     def cleanup(self):
         self.guard()
-        errors = []
-        def attempt(action):
+        failures = []
+
+        def record(operation, error, *, reason=None):
+            if reason is None:
+                reason = getattr(error, 'cleanup_reason', None)
+            if type(reason) is not str or reason not in CLEANUP_FAILURE_REASONS:
+                if isinstance(error, subprocess.TimeoutExpired):
+                    reason = 'timeout'
+                elif isinstance(error, OSError):
+                    reason = 'os_error'
+                elif isinstance(error, FirewallError):
+                    reason = 'firewall_operation_failed'
+                else:
+                    reason = 'operation_failed'
+            exception = type(error).__name__
+            if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', exception) is None:
+                exception = 'Exception'
+            errno_value = getattr(error, 'errno', None)
+            if type(errno_value) is not int or errno_value < 0 or errno_value > 65535:
+                errno_value = None
+            failures.append(dict(operation=operation, exception=exception,
+                                 reason=reason, errno=errno_value))
+
+        def attempt(operation, action, *, readback=False):
             try:
                 action()
             except Exception as error:
-                errors.append(type(error).__name__)
-        attempt(lambda: self.set_policy(False))
+                reason = None
+                if (readback and getattr(error, 'cleanup_reason', None) is None
+                        and not isinstance(error, (OSError, subprocess.TimeoutExpired))):
+                    reason = 'readback_failed'
+                record(operation, error, reason=reason)
+
+        # Keep mutations and their readback as separate operations so a failed
+        # observation cannot be mistaken for a failed nftables deletion.
+        for operation, adapter in self.cleanup_policy_removals():
+            attempt(operation, adapter.remove)
         if getattr(self, 'endpoint_on_router', False):
             def remove_local_endpoint():
                 self.run(['ip', 'address', 'delete', self.args.endpoint + '/32', 'dev', 'lo'])
                 addresses = strict_json(self.run(['ip', '-j', '-4', 'address', 'show', 'dev', 'lo']))
                 if any(address.get('local') == self.args.endpoint
                        for link in addresses for address in link.get('addr_info', [])):
-                    raise RuntimeError('Owned router endpoint remains after cleanup')
+                    raise CleanupObservationFailure('resources_present')
                 self.endpoint_on_router = False
-            attempt(remove_local_endpoint)
-        if self.daemon and self.daemon.poll() is None:
+            attempt('remove_local_endpoint', remove_local_endpoint)
+        daemon_running = False
+        if self.daemon:
+            try:
+                daemon_running = self.daemon.poll() is None
+            except Exception as error:
+                record('verify_daemon_empty', error, reason='readback_failed')
+        if daemon_running:
             for container in reversed(self.containers):
-                attempt(lambda c=container: self.dc(['rm', '--force', c], timeout=15))
+                attempt('remove_owned_container', lambda c=container: self.dc(['rm', '--force', c], timeout=15))
             for network in reversed(self.networks):
-                attempt(lambda n=network: self.dc(['network', 'rm', n], timeout=15))
+                attempt('remove_owned_network', lambda n=network: self.dc(['network', 'rm', n], timeout=15))
             def verify_daemon_empty():
                 if self.dc(['container', 'ls', '--all', '--quiet']).strip():
-                    raise RuntimeError('Owned containers remain after cleanup')
+                    raise CleanupObservationFailure('resources_present')
                 names = self.dc(['network', 'ls', '--format', '{{.Name}}']).splitlines()
                 owned_names = {payload['Name'] for _, payload, _ in self.specs}
                 if owned_names.intersection(names):
-                    raise RuntimeError('Owned networks remain after cleanup')
-            attempt(verify_daemon_empty)
+                    raise CleanupObservationFailure('resources_present')
+            attempt('verify_daemon_empty', verify_daemon_empty, readback=True)
         for process in reversed(self.processes):
-            attempt(lambda p=process: stop(p))
-            if process.poll() is None:
-                errors.append('process still alive')
+            operation = ('stop_holder' if any(process is holder
+                         for holder in getattr(self, 'holders', {}).values()) else 'stop_lab_process')
+            def stop_and_verify(p=process):
+                stop(p)
+                if p.poll() is None:
+                    raise CleanupObservationFailure('process_still_alive')
+            attempt(operation, stop_and_verify)
         # Stop target namespaces first; their veth counterparts disappear.
         for link in reversed(self.links):
-            current = strict_json(self.run(['ip', '-j', 'link', 'show']))
-            if any(item['ifname'] == link for item in current):
-                attempt(lambda name=link: self.run(['ip', 'link', 'delete', name]))
+            def delete_owned_link(name=link):
+                current = strict_json(self.run(['ip', '-j', 'link', 'show']))
+                if any(item['ifname'] == name for item in current):
+                    self.run(['ip', 'link', 'delete', name])
+            attempt('delete_owned_link', delete_owned_link)
         if self.temp:
-            attempt(self.temp.cleanup)
-        if self.adapter.read() is not None or self.proxy_adapter.read() is not None:
-            errors.append('policy still installed')
-        remaining = strict_json(self.run(['ip', '-j', 'link', 'show']))
-        if any(item['ifname'] != 'lo' for item in remaining):
-            errors.append('owned network links remain')
-        if errors:
-            raise RuntimeError('Disposable lab cleanup failed; no report/receipt')
+            attempt('cleanup_workspace', self.temp.cleanup)
+
+        def verify_policy_absent(operation, adapter):
+            try:
+                policy = adapter.read()
+            except Exception as error:
+                reason = ('timeout' if isinstance(error, subprocess.TimeoutExpired)
+                          else 'os_error' if isinstance(error, OSError) else 'readback_failed')
+                record(operation, error, reason=reason)
+                return
+            if policy is not None:
+                record(operation, CleanupObservationFailure('policy_present'))
+
+        verify_policy_absent('verify_ollama_policy_absent', self.adapter)
+        verify_policy_absent('verify_proxy_policy_absent', self.proxy_adapter)
+
+        def verify_links_absent():
+            remaining = strict_json(self.run(['ip', '-j', 'link', 'show']))
+            if any(item.get('ifname') != 'lo' for item in remaining):
+                raise CleanupObservationFailure('resources_present')
+        attempt('verify_links_absent', verify_links_absent, readback=True)
+        if failures:
+            raise CleanupFailure(failures)
 
 
 def main(argv=None, *, docker=False, _inside=False):

@@ -282,6 +282,83 @@ class RouteAcceptanceTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             lab.cleanup()
 
+    def test_cleanup_reports_operation_and_sanitized_reason_for_remove_and_readback(self):
+        from scripts import ollama_route_linux as linux
+        from unittest.mock import Mock
+
+        class Adapter:
+            def __init__(self, *, remove_error=None, read_error=None, value=None,
+                         keep_on_remove=False):
+                self.remove_error, self.read_error, self.value = remove_error, read_error, value
+                self.keep_on_remove = keep_on_remove
+            def remove(self):
+                if self.remove_error:
+                    raise self.remove_error
+                if not self.keep_on_remove:
+                    self.value = None
+            def read(self):
+                if self.read_error:
+                    raise self.read_error
+                return self.value
+
+        def make_lab(adapter, proxy_adapter):
+            lab = linux.Lab.__new__(linux.Lab)
+            lab.guard = Mock()
+            lab.adapter, lab.proxy_adapter = adapter, proxy_adapter
+            lab.endpoint_on_router = False
+            lab.daemon = None
+            lab.processes, lab.holders, lab.links = [], {}, []
+            lab.temp = None
+            lab.run = Mock(return_value='[{"ifname":"lo"}]')
+            return lab
+
+        lab = make_lab(
+            Adapter(remove_error=PermissionError(13, 'private stderr', '/secret/path')),
+            Adapter(),
+        )
+        with self.assertRaises(linux.CleanupFailure) as caught:
+            lab.cleanup()
+        self.assertEqual(caught.exception.cleanup_failures, ({
+            'operation': 'remove_ollama_policy', 'exception': 'PermissionError',
+            'reason': 'os_error', 'errno': 13,
+        },))
+        self.assertNotIn('/secret/path', str(caught.exception))
+        self.assertNotIn('private stderr', str(caught.exception))
+
+        lab = make_lab(
+            Adapter(remove_error=linux.FirewallError('arbitrary nft stderr is hidden')),
+            Adapter(),
+        )
+        with self.assertRaises(linux.CleanupFailure) as caught:
+            lab.cleanup()
+        self.assertEqual(caught.exception.cleanup_failures[0], {
+            'operation': 'remove_ollama_policy', 'exception': 'FirewallError',
+            'reason': 'firewall_operation_failed', 'errno': None,
+        })
+        self.assertNotIn('arbitrary nft stderr', str(caught.exception))
+
+        lab = make_lab(
+            Adapter(read_error=RuntimeError('raw nftables output /secret/path')),
+            Adapter(),
+        )
+        with self.assertRaises(linux.CleanupFailure) as caught:
+            lab.cleanup()
+        self.assertEqual(caught.exception.cleanup_failures, ({
+            'operation': 'verify_ollama_policy_absent', 'exception': 'RuntimeError',
+            'reason': 'readback_failed', 'errno': None,
+        },))
+        self.assertNotIn('raw nftables output', str(caught.exception))
+        self.assertNotIn('/secret/path', str(caught.exception))
+
+        lab = make_lab(Adapter(value={'owned': True}, keep_on_remove=True), Adapter())
+        with self.assertRaises(linux.CleanupFailure) as caught:
+            lab.cleanup()
+        self.assertEqual(caught.exception.cleanup_failures[0], {
+            'operation': 'verify_ollama_policy_absent',
+            'exception': 'CleanupObservationFailure',
+            'reason': 'policy_present', 'errno': None,
+        })
+
     def test_public_cli_cannot_select_internal_entry_with_namespace_descriptors(self):
         from scripts import ollama_route_linux as linux
         from unittest.mock import Mock

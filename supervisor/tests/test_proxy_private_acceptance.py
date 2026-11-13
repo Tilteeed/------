@@ -3,6 +3,73 @@ import unittest
 
 
 class ProxyPrivateContractTests(unittest.TestCase):
+    def test_proxy_ruleset_difference_reports_safe_family_section_chain_and_path(self):
+        from copy import deepcopy
+        from scripts.proxy_acceptance_linux import (
+            ProxyLab, ProxyRulesetMismatch, first_ruleset_difference,
+        )
+        from scripts.proxy_packet_acceptance import binding
+        from scripts.ollama_route_acceptance import proxy_policy
+        expected = proxy_policy(binding('10.240.0.0/13', '10.248.0.0/13', 'a' * 64))
+
+        actual = deepcopy(expected)
+        actual['tables']['bridge']['rules'][0]['expr'][0]['match']['right'] = '192.0.2.99'
+        self.assertEqual(first_ruleset_difference(expected, actual), {
+            'family': 'bridge', 'section': 'rules', 'chain': 'forward', 'rule_index': 0,
+            'field': 'rules[0].expr[0].match.right', 'difference': 'value_mismatch',
+        })
+        self.assertNotIn('192.0.2.99', repr(first_ruleset_difference(expected, actual)))
+        absent = first_ruleset_difference(expected, None)
+        self.assertEqual((absent['family'], absent['section'], absent['difference']),
+                         ('inet', 'table', 'missing_field'))
+
+        class Adapter:
+            def __init__(self, value=None):
+                self.value = value
+            def read(self):
+                return self.value
+            def replace(self, value):
+                pass
+
+        lab = object.__new__(ProxyLab)
+        lab.guard = lambda: None
+        lab.adapter = Adapter()
+        lab.proxy_adapter = Adapter(actual)
+        lab.proxy_rules = expected
+        with self.assertRaises(ProxyRulesetMismatch) as caught:
+            lab.set_policy(True)
+        self.assertEqual(caught.exception.ruleset_diff, {
+            'family': 'bridge', 'section': 'rules', 'chain': 'forward', 'rule_index': 0,
+            'field': 'rules[0].expr[0].match.right', 'difference': 'value_mismatch',
+        })
+
+        cases = (
+            ('missing_field', lambda rules: rules['tables']['inet']['table'].pop('comment'),
+             'table.comment'),
+            ('extra_field', lambda rules: rules['tables']['inet']['table'].__setitem__(
+                'private/path', 'must-not-be-reported'), 'table.other'),
+            ('type_mismatch', lambda rules: rules['tables']['inet']['chains'][0].__setitem__(
+                'prio', str(rules['tables']['inet']['chains'][0]['prio'])), 'chains[0].prio'),
+            ('order_mismatch', lambda rules: rules['tables']['bridge']['rules'].__setitem__(
+                slice(0, 2), reversed(rules['tables']['bridge']['rules'][:2])), 'rules[0]'),
+        )
+        for difference, mutate, field in cases:
+            with self.subTest(difference=difference):
+                changed = deepcopy(expected)
+                mutate(changed)
+                observed = first_ruleset_difference(expected, changed)
+                self.assertEqual(observed['difference'], difference)
+                self.assertEqual(observed['field'], field)
+                self.assertNotIn('private/path', repr(observed))
+
+        changed = deepcopy(expected)
+        rules = changed['tables']['bridge']['rules']
+        rules.insert(1, deepcopy(rules[0]))
+        observed = first_ruleset_difference(expected, changed)
+        self.assertEqual(observed['difference'], 'extra_field')
+        self.assertEqual(observed['rule_index'], 1)
+        self.assertEqual(observed['field'], 'rules[1]')
+
     def test_base_matrix_has_only_proxy_networks_and_both_allowed_pair_directions(self):
         from scripts.proxy_packet_acceptance import binding, make_plan, network_specs
         config = binding('10.240.0.0/13', '10.248.0.0/13', 'a' * 64)
@@ -72,6 +139,8 @@ class ProxyPrivateContractTests(unittest.TestCase):
             lab.set_policy(False)
             self.assertEqual(lab.proxy_adapter.events, ['replace', 'remove'])
             self.assertEqual(lab.adapter.events, [])
+            self.assertEqual(lab.cleanup_policy_removals(),
+                             (('remove_proxy_policy', lab.proxy_adapter),))
             lab.adapter.value = {'foreign': 'unexpected'}
             with self.assertRaises(RuntimeError):
                 lab.set_policy(True)

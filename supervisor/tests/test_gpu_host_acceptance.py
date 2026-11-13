@@ -163,6 +163,51 @@ class JobBoundaryTests(unittest.TestCase):
         self.assertEqual(api._diagnostics_from_output(
             api._FAILURE_PREFIX + json.dumps(forged)), [])
 
+    def test_proxy_ruleset_diff_diagnostic_is_allowlisted_and_forwarded(self):
+        import contextlib
+        import io
+        from scripts.proxy_acceptance_linux import ProxyRulesetMismatch
+        api = importlib.import_module('scripts.gpu_acceptance_job')
+        error = ProxyRulesetMismatch({
+            'family': 'bridge', 'section': 'rules', 'chain': 'forward',
+            'rule_index': 3, 'field': 'rules[3].expr[0].match.right',
+            'difference': 'value_mismatch',
+        })
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            api._emit_diagnostic('packet_check', error)
+        records = api._diagnostics_from_output(output.getvalue())
+        self.assertEqual(records, [api._diagnostic('packet_check', error)])
+        self.assertNotIn('10.', output.getvalue())
+
+        record = dict(records[0], field='rules[3].expr[0].private/path')
+        self.assertEqual(api._diagnostics_from_output(
+            api._FAILURE_PREFIX + json.dumps(record)), [])
+
+    def test_cleanup_failure_diagnostic_distinguishes_removal_from_readback(self):
+        import contextlib
+        import io
+        from scripts.ollama_route_linux import CleanupFailure
+        api = importlib.import_module('scripts.gpu_acceptance_job')
+        error = CleanupFailure((
+            {'operation': 'remove_proxy_policy', 'exception': 'PermissionError',
+             'reason': 'os_error', 'errno': 13},
+            {'operation': 'verify_ollama_policy_absent', 'exception': 'FirewallError',
+             'reason': 'readback_failed', 'errno': None},
+        ))
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            api._emit_diagnostic('cleanup', error)
+        records = api._diagnostics_from_output(output.getvalue())
+        self.assertEqual(records, [api._diagnostic('cleanup', error)])
+        self.assertEqual(records[0]['cleanup_failures'][0]['operation'], 'remove_proxy_policy')
+        self.assertEqual(records[0]['cleanup_failures'][1]['reason'], 'readback_failed')
+
+        forged = json.loads(output.getvalue().split(api._FAILURE_PREFIX, 1)[1])
+        forged['cleanup_failures'][0]['operation'] = '/secret/path'
+        self.assertEqual(api._diagnostics_from_output(
+            api._FAILURE_PREFIX + json.dumps(forged)), [])
+
     def test_namespace_entry_rebinds_after_descriptor_validation_before_resources(self):
         """Synthetic transport ordering only; no packet/namespace execution."""
         import contextlib

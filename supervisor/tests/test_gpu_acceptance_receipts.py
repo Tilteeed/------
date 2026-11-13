@@ -330,8 +330,14 @@ class CandidateOrchestrationTests(unittest.TestCase):
                     self.assertEqual(self.store.events, [])
 
     def test_check_exception_still_runs_cleanup_and_writes_nothing(self):
+        from scripts.ollama_route_linux import CleanupFailure
         def raises(*args):
-            raise RuntimeError('synthetic failure with private content')
+            raise CleanupFailure(({
+                'operation': 'verify_proxy_policy_absent',
+                'exception': 'FirewallError',
+                'reason': 'readback_failed',
+                'errno': None,
+            },))
         with patch.object(self.api, 'machine_id_sha256', return_value='a' * 64), \
              patch.object(self, 'runner', side_effect=raises):
             cleanup = []
