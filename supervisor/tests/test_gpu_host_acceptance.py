@@ -131,6 +131,38 @@ class ConnectedAcceptanceTests(unittest.TestCase):
 
 
 class JobBoundaryTests(unittest.TestCase):
+    def test_preparation_diagnostic_exposes_only_fixed_step_and_errno(self):
+        import contextlib
+        import errno
+        import io
+        from unittest.mock import patch
+        from supervisor.tests.test_acceptance_busy_host import fixture
+        api = importlib.import_module('scripts.gpu_acceptance_job')
+        _, plan, ops = fixture()
+        ops.mknod = lambda path, major, minor: (_ for _ in ()).throw(
+            PermissionError(errno.EACCES, 'Permission denied', '/private/secret/path'))
+        with self.assertRaises(api.resources.PreparationOperationFailure) as caught:
+            api.resources.prepare_owned_job(plan, ops=ops)
+
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            api._emit_diagnostic('systemd_cgroup_preparation', caught.exception)
+        line = output.getvalue()
+        records = api._diagnostics_from_output(line)
+        self.assertEqual(records, [{
+            'stage': 'systemd_cgroup_preparation',
+            'substage': 'device_creation',
+            'operation': 'mknod_null',
+            'exception': 'PermissionError',
+            'errno': errno.EACCES,
+            'condition': 'errno=13',
+        }])
+        self.assertNotIn('/private/secret/path', line)
+
+        forged = dict(records[0], operation='../secret')
+        self.assertEqual(api._diagnostics_from_output(
+            api._FAILURE_PREFIX + json.dumps(forged)), [])
+
     def test_namespace_entry_rebinds_after_descriptor_validation_before_resources(self):
         """Synthetic transport ordering only; no packet/namespace execution."""
         import contextlib

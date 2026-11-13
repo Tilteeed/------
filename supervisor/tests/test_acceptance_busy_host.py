@@ -464,6 +464,46 @@ class ChildInspectionTests(unittest.TestCase):
 
 
 class PreparationTests(unittest.TestCase):
+    def test_os_errors_report_fixed_substage_operation_and_errno(self):
+        import errno
+
+        cases = (
+            ('cgroup_setup', 'create_supervisor_cgroup', 'mkdir'),
+            ('tmpfs_setup', 'mount_workspace_tmpfs', 'tmpfs_mount'),
+            ('device_creation', 'mknod_null', 'mknod'),
+            ('config_setup', 'write_daemon_json', 'daemon_config'),
+        )
+        for substage, operation, failpoint in cases:
+            with self.subTest(substage=substage, operation=operation):
+                h, p, ops = fixture()
+                denied = PermissionError(errno.EACCES, 'Permission denied', '/secret/never-report')
+                if failpoint == 'mkdir':
+                    ops.mkdir = lambda path: (_ for _ in ()).throw(denied)
+                elif failpoint == 'tmpfs_mount':
+                    original = ops.run
+                    def run(argv):
+                        if argv[:3] == ('mount', '-t', 'tmpfs'):
+                            raise denied
+                        return original(argv)
+                    ops.run = run
+                elif failpoint == 'mknod':
+                    ops.mknod = lambda path, major, minor: (_ for _ in ()).throw(denied)
+                else:
+                    original = ops.write
+                    def write(path, value, *, create=False):
+                        if path.endswith('/daemon.json'):
+                            raise denied
+                        return original(path, value, create=create)
+                    ops.write = write
+
+                with self.assertRaises(h.PreparationOperationFailure) as caught:
+                    h.prepare_owned_job(p, ops=ops)
+                self.assertEqual(caught.exception.substage, substage)
+                self.assertEqual(caught.exception.operation, operation)
+                self.assertEqual(caught.exception.errno, errno.EACCES)
+                self.assertEqual(caught.exception.exception_name, 'PermissionError')
+                self.assertNotIn('/secret/never-report', str(caught.exception))
+
     def test_nested_workspace_mount_after_preparation_is_rejected(self):
         h, p, ops = fixture()
         ready = h.prepare_owned_job(p, ops=ops)

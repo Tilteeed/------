@@ -36,6 +36,8 @@ _FAILURE_STAGES = frozenset((
 
 def _safe_condition(error):
     """Return a bounded code-owned condition, never a traceback or process output."""
+    if isinstance(error, resources.PreparationOperationFailure):
+        return 'errno=' + (str(error.errno) if error.errno is not None else 'unknown')
     if isinstance(error, subprocess.TimeoutExpired):
         return 'Configured command deadline exceeded'
     if isinstance(error, UnicodeError):
@@ -62,13 +64,18 @@ def _safe_condition(error):
 
 
 def _diagnostic(stage, error, *, check=None):
+    preparation_failure = isinstance(error, resources.PreparationOperationFailure)
+    if preparation_failure:
+        stage = 'systemd_cgroup_preparation'
     if stage not in _FAILURE_STAGES:
         stage = 'systemd_unit'
     result = {
         'stage': stage,
-        'exception': type(error).__name__,
+        'exception': error.exception_name if preparation_failure else type(error).__name__,
         'condition': _safe_condition(error),
     }
+    if preparation_failure:
+        result.update(substage=error.substage, operation=error.operation, errno=error.errno)
     if check is not None:
         result['check'] = check
     return result
@@ -86,6 +93,8 @@ def _emit_diagnostic_record(record):
 def _diagnostics_from_output(text):
     """Read only our bounded, structured failure records; ignore all raw output."""
     records = []
+    base_keys = {'stage', 'exception', 'condition'}
+    preparation_keys = base_keys | {'substage', 'operation', 'errno'}
     for line in text.splitlines():
         if not line.startswith(_FAILURE_PREFIX):
             continue
@@ -93,7 +102,7 @@ def _diagnostics_from_output(text):
             value = route.strict_json(line[len(_FAILURE_PREFIX):])
         except (TypeError, ValueError, RecursionError):
             continue
-        if (type(value) is not dict or set(value) != {'stage', 'exception', 'condition'}
+        if (type(value) is not dict or set(value) not in (base_keys, preparation_keys)
                 or type(value['stage']) is not str or value['stage'] not in _FAILURE_STAGES
                 or type(value['exception']) is not str
                 or re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', value['exception']) is None
@@ -101,6 +110,15 @@ def _diagnostics_from_output(text):
                 or not value['condition'] or len(value['condition']) > 240
                 or any(ord(char) < 32 for char in value['condition'])):
             continue
+        if set(value) == preparation_keys:
+            diagnostic_errno = value['errno']
+            condition = 'errno=' + (str(diagnostic_errno) if type(diagnostic_errno) is int else 'unknown')
+            if (value['stage'] != 'systemd_cgroup_preparation'
+                    or not resources.preparation_operation_allowed(value['substage'], value['operation'])
+                    or (diagnostic_errno is not None and
+                        (type(diagnostic_errno) is not int or diagnostic_errno < 0))
+                    or value['condition'] != condition):
+                continue
         records.append(value)
     # The outer bootstrap may report that namespace entry failed after the
     # private process already emitted the more specific cause.

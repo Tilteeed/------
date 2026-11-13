@@ -170,6 +170,66 @@ def _need(condition, message):
         raise Rejected(message)
 
 
+_PREPARATION_OPERATIONS = {
+    'cgroup_setup': frozenset((
+        'stat_owned_cgroup', 'stat_workspace', 'create_supervisor_cgroup',
+        'move_launcher_to_supervisor', 'read_parent_cgroup_procs',
+        'read_launcher_cgroup', 'enable_supervisor_controllers',
+        'read_supervisor_controllers', 'create_containers_cgroup',
+        'read_containers_cgroup_procs', 'enable_container_controllers',
+        'read_container_controllers',
+    )),
+    'tmpfs_setup': frozenset((
+        'read_systemd_workspace_mount', 'make_mounts_private',
+        'verify_systemd_workspace_mount', 'mount_workspace_tmpfs',
+        'verify_workspace_tmpfs', 'list_workspace', 'mkdir_workspace_dev',
+        'mkdir_workspace_tmp', 'mkdir_workspace_data', 'mkdir_workspace_exec',
+        'mkdir_workspace_client', 'mkdir_workspace_home', 'mkdir_workspace_cdi',
+        'capture_tmp_mount', 'capture_var_tmp_mount',
+    )),
+    'device_creation': frozenset((
+        'mkdir_dev_pts', 'mkdir_dev_shm', 'mknod_null', 'mknod_zero',
+        'mknod_full', 'mknod_random', 'mknod_urandom', 'mknod_tty',
+        'symlink_fd', 'symlink_stdin', 'symlink_stdout', 'symlink_stderr',
+        'symlink_ptmx', 'bind_private_dev', 'remount_private_dev',
+        'mount_private_devpts', 'bind_tmp', 'bind_var_tmp',
+        'verify_private_dev', 'capture_devpts_mount',
+    )),
+    'config_setup': frozenset((
+        'write_daemon_json', 'write_client_json', 'stat_prepared_workspace',
+        'read_mount_namespace', 'verify_prepared_job', 'validate_docker_config',
+    )),
+}
+
+
+def preparation_operation_allowed(substage, operation):
+    return (type(substage) is str and type(operation) is str and
+            operation in _PREPARATION_OPERATIONS.get(substage, ()))
+
+
+class PreparationOperationFailure(RuntimeError):
+    """Path-free OSError summary for one fixed preparation operation."""
+
+    def __init__(self, substage, operation, error):
+        if not preparation_operation_allowed(substage, operation) or not isinstance(error, OSError):
+            raise ValueError('invalid preparation operation failure')
+        self.substage = substage
+        self.operation = operation
+        self.errno = error.errno if type(error.errno) is int and error.errno >= 0 else None
+        name = type(error).__name__
+        self.exception_name = name if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', name) else 'OSError'
+        super().__init__()
+
+
+def _prepare_operation(substage, operation, function, *args, **kwargs):
+    _need(preparation_operation_allowed(substage, operation), 'unknown internal preparation operation')
+    try:
+        return function(*args, **kwargs)
+    except OSError as error:
+        # Do not retain strerror/filename or the original exception as a cause.
+        raise PreparationOperationFailure(substage, operation, error) from None
+
+
 @dataclass(frozen=True)
 class OwnedJob:
     invocation_id: str
@@ -608,46 +668,71 @@ def prepare_owned_job(plan: JobPlan, *, ops=None) -> PreparedJob:
     ops = LinuxOps() if ops is None else ops
     owned = inspect_owned_job(plan, ops=ops)
     cg, root = owned.cgroup_path, plan.workspace
-    systemd_workspace_mount_id = _systemd_readwrite_workspace_mount_id(plan, ops)
-    _need(_identity(ops.stat(cg)) == owned.cgroup_identity and
-          _identity(ops.stat(root)) == owned.workspace_identity, 'identity drift before mutation')
-    ops.mkdir(cg + '/supervisor')
-    ops.write(cg + '/supervisor/cgroup.procs', str(ops.pid))
-    _need(not ops.read(cg + '/cgroup.procs').strip() and
-          ops.read('/proc/self/cgroup').strip() == '0::' + plan.cgroup + '/supervisor', 'failed to move launcher into leaf')
-    ops.write(cg + '/cgroup.subtree_control', '+cpu +io +memory +pids')
-    _need(set(ops.read(cg + '/cgroup.subtree_control').split()) == {'cpu', 'io', 'memory', 'pids'}, 'owned controllers not enabled')
-    ops.mkdir(cg + '/containers')
-    _need(not ops.read(cg + '/containers/cgroup.procs').strip(), 'container parent must be empty')
-    ops.write(cg + '/containers/cgroup.subtree_control', '+cpu +io +memory +pids')
-    _need(set(ops.read(cg + '/containers/cgroup.subtree_control').split()) == {'cpu', 'io', 'memory', 'pids'}, 'nested controllers not enabled')
-    ops.run(('mount', '--make-rprivate', '/'))
-    _need(_systemd_readwrite_workspace_mount_id(plan, ops) == systemd_workspace_mount_id,
+    systemd_workspace_mount_id = _prepare_operation(
+        'tmpfs_setup', 'read_systemd_workspace_mount', _systemd_readwrite_workspace_mount_id, plan, ops)
+    _need(_identity(_prepare_operation('cgroup_setup', 'stat_owned_cgroup', ops.stat, cg)) == owned.cgroup_identity and
+          _identity(_prepare_operation('cgroup_setup', 'stat_workspace', ops.stat, root)) == owned.workspace_identity,
+          'identity drift before mutation')
+    _prepare_operation('cgroup_setup', 'create_supervisor_cgroup', ops.mkdir, cg + '/supervisor')
+    _prepare_operation('cgroup_setup', 'move_launcher_to_supervisor', ops.write,
+                       cg + '/supervisor/cgroup.procs', str(ops.pid))
+    parent_procs = _prepare_operation('cgroup_setup', 'read_parent_cgroup_procs', ops.read, cg + '/cgroup.procs')
+    launcher_cgroup = _prepare_operation('cgroup_setup', 'read_launcher_cgroup', ops.read, '/proc/self/cgroup')
+    _need(not parent_procs.strip() and
+          launcher_cgroup.strip() == '0::' + plan.cgroup + '/supervisor', 'failed to move launcher into leaf')
+    _prepare_operation('cgroup_setup', 'enable_supervisor_controllers', ops.write,
+                       cg + '/cgroup.subtree_control', '+cpu +io +memory +pids')
+    supervisor_controllers = _prepare_operation('cgroup_setup', 'read_supervisor_controllers',
+                                                 ops.read, cg + '/cgroup.subtree_control')
+    _need(set(supervisor_controllers.split()) == {'cpu', 'io', 'memory', 'pids'}, 'owned controllers not enabled')
+    _prepare_operation('cgroup_setup', 'create_containers_cgroup', ops.mkdir, cg + '/containers')
+    containers_procs = _prepare_operation('cgroup_setup', 'read_containers_cgroup_procs',
+                                           ops.read, cg + '/containers/cgroup.procs')
+    _need(not containers_procs.strip(), 'container parent must be empty')
+    _prepare_operation('cgroup_setup', 'enable_container_controllers', ops.write,
+                       cg + '/containers/cgroup.subtree_control', '+cpu +io +memory +pids')
+    container_controllers = _prepare_operation('cgroup_setup', 'read_container_controllers',
+                                                ops.read, cg + '/containers/cgroup.subtree_control')
+    _need(set(container_controllers.split()) == {'cpu', 'io', 'memory', 'pids'}, 'nested controllers not enabled')
+    _prepare_operation('tmpfs_setup', 'make_mounts_private', ops.run, ('mount', '--make-rprivate', '/'))
+    current_workspace_mount_id = _prepare_operation(
+        'tmpfs_setup', 'verify_systemd_workspace_mount', _systemd_readwrite_workspace_mount_id, plan, ops)
+    _need(current_workspace_mount_id == systemd_workspace_mount_id,
           'systemd workspace mount identity drift before tmpfs')
     b = plan.budget
     options = f'size={b.tmpfs_bytes},nr_inodes={b.tmpfs_inodes},mode=0700,uid=0,gid=0,nodev,nosuid'
-    ops.run(('mount', '-t', 'tmpfs', '-o', options, plan.unit[:-8], root))
-    mount_id = _workspace_mount(plan, ops)
-    _need(not ops.listdir(root), 'new tmpfs not empty')
+    _prepare_operation('tmpfs_setup', 'mount_workspace_tmpfs', ops.run,
+                       ('mount', '-t', 'tmpfs', '-o', options, plan.unit[:-8], root))
+    mount_id = _prepare_operation('tmpfs_setup', 'verify_workspace_tmpfs', _workspace_mount, plan, ops)
+    workspace_entries = _prepare_operation('tmpfs_setup', 'list_workspace', ops.listdir, root)
+    _need(not workspace_entries, 'new tmpfs not empty')
     for name in ('dev', 'tmp', 'data', 'exec', 'client', 'home', 'cdi'):
-        ops.mkdir(root + '/' + name)
-    for name in ('pts', 'shm'):
-        ops.mkdir(root + '/dev/' + name)
+        _prepare_operation('tmpfs_setup', 'mkdir_workspace_' + name, ops.mkdir, root + '/' + name)
+    for name, operation in (('pts', 'mkdir_dev_pts'), ('shm', 'mkdir_dev_shm')):
+        _prepare_operation('device_creation', operation, ops.mkdir, root + '/dev/' + name)
     for name, major, minor in _SAFE_DEVICES:
-        ops.mknod(root + '/dev/' + name, major, minor)
+        _prepare_operation('device_creation', 'mknod_' + name,
+                           ops.mknod, root + '/dev/' + name, major, minor)
     for name, target in (('fd', '/proc/self/fd'), ('stdin', '/proc/self/fd/0'),
                          ('stdout', '/proc/self/fd/1'), ('stderr', '/proc/self/fd/2'), ('ptmx', 'pts/ptmx')):
-        ops.symlink(target, root + '/dev/' + name)
-    ops.run(('mount', '--bind', root + '/dev', '/dev'))
-    ops.run(('mount', '-o', 'remount,bind,rw,dev,nosuid', '/dev'))
-    ops.run(('mount', '-t', 'devpts', '-o', f'newinstance,ptmxmode=0666,mode=0620,max={b.tasks}', 'devpts', '/dev/pts'))
-    for target in ('/tmp', '/var/tmp'):
-        ops.run(('mount', '--bind', root + '/tmp', target))
-    dev_mount_id = _private_devices(plan, ops)
+        _prepare_operation('device_creation', 'symlink_' + name,
+                           ops.symlink, target, root + '/dev/' + name)
+    _prepare_operation('device_creation', 'bind_private_dev', ops.run,
+                       ('mount', '--bind', root + '/dev', '/dev'))
+    _prepare_operation('device_creation', 'remount_private_dev', ops.run,
+                       ('mount', '-o', 'remount,bind,rw,dev,nosuid', '/dev'))
+    _prepare_operation('device_creation', 'mount_private_devpts', ops.run,
+                       ('mount', '-t', 'devpts', '-o',
+                        f'newinstance,ptmxmode=0666,mode=0620,max={b.tasks}', 'devpts', '/dev/pts'))
+    for target, operation in (('/tmp', 'bind_tmp'), ('/var/tmp', 'bind_var_tmp')):
+        _prepare_operation('device_creation', operation, ops.run, ('mount', '--bind', root + '/tmp', target))
+    dev_mount_id = _prepare_operation('device_creation', 'verify_private_dev', _private_devices, plan, ops)
     config = {'features': {'containerd-snapshotter': False, 'cdi': False},
               'log-driver': 'none', 'live-restore': False}
-    ops.write(root + '/daemon.json', json.dumps(config, sort_keys=True) + '\n', create=True)
-    ops.write(root + '/client/config.json', '{}\n', create=True)
+    _prepare_operation('config_setup', 'write_daemon_json', ops.write,
+                       root + '/daemon.json', json.dumps(config, sort_keys=True) + '\n', create=True)
+    _prepare_operation('config_setup', 'write_client_json', ops.write,
+                       root + '/client/config.json', '{}\n', create=True)
     daemon = ('dockerd', '--config-file=' + root + '/daemon.json', '--data-root=' + root + '/data',
               '--exec-root=' + root + '/exec', '--pidfile=' + root + '/dockerd.pid',
               '--host=unix://' + root + '/docker.sock', '--storage-driver=vfs',
@@ -659,16 +744,22 @@ def prepare_owned_job(plan: JobPlan, *, ops=None) -> PreparedJob:
     environment = tuple(sorted({'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C', 'LANG': 'C',
                                 'HOME': root + '/home', 'TMPDIR': root + '/tmp',
                                 'XDG_CONFIG_HOME': root + '/home', 'XDG_RUNTIME_DIR': root + '/exec'}.items()))
-    ready = PreparedJob(owned, plan.cgroup + '/containers', _identity(ops.stat(root)), mount_id,
+    workspace_identity = _identity(_prepare_operation('config_setup', 'stat_prepared_workspace', ops.stat, root))
+    mount_namespace = _prepare_operation('config_setup', 'read_mount_namespace', ops.namespace, 'self', 'mnt')
+    tmp_mount_id = _prepare_operation('tmpfs_setup', 'capture_tmp_mount',
+                                      lambda: _visible_mount('/tmp', ops)[0][0])
+    var_tmp_mount_id = _prepare_operation('tmpfs_setup', 'capture_var_tmp_mount',
+                                          lambda: _visible_mount('/var/tmp', ops)[0][0])
+    devpts_mount_id = _prepare_operation('device_creation', 'capture_devpts_mount',
+                                         lambda: _visible_mount('/dev/pts', ops)[0][0])
+    ready = PreparedJob(owned, plan.cgroup + '/containers', workspace_identity, mount_id,
                         dev_mount_id, daemon,
                         ('docker', '--config', root + '/client', '--host', 'unix://' + root + '/docker.sock'),
-                        environment, ops.namespace('self', 'mnt'),
-                        _visible_mount('/tmp', ops)[0][0],
-                        _visible_mount('/var/tmp', ops)[0][0],
-                        _visible_mount('/dev/pts', ops)[0][0])
-    verify_prepared_job(plan, ready, pids=(ops.pid,), ops=ops)
+                        environment, mount_namespace, tmp_mount_id, var_tmp_mount_id, devpts_mount_id)
+    _prepare_operation('config_setup', 'verify_prepared_job',
+                       verify_prepared_job, plan, ready, pids=(ops.pid,), ops=ops)
     # Docker validates its real configuration/flags without starting the daemon.
-    ops.run(daemon + ('--validate',))
+    _prepare_operation('config_setup', 'validate_docker_config', ops.run, daemon + ('--validate',))
     return ready
 
 
