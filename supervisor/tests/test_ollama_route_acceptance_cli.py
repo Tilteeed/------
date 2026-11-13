@@ -359,6 +359,175 @@ class RouteAcceptanceTests(unittest.TestCase):
             'reason': 'policy_present', 'errno': None,
         })
 
+    def test_cleanup_confirms_veth_disappearance_after_delete_race(self):
+        import json
+        from scripts import ollama_route_linux as linux
+        from unittest.mock import Mock
+
+        link = 'bza' + 'a' * 12
+        listing = lambda *names: json.dumps([{'ifname': name} for name in names])
+        observations = iter((listing(link), listing('lo'), listing('lo')))
+        calls = []
+
+        def run(argv):
+            calls.append(list(argv))
+            if argv == ['ip', '-j', 'link', 'show']:
+                return next(observations)
+            if argv == ['ip', 'link', 'delete', link]:
+                raise RuntimeError('ephemeral link vanished before delete')
+            raise AssertionError('Unexpected cleanup command')
+
+        lab = linux.Lab.__new__(linux.Lab)
+        lab.guard = Mock()
+        lab.adapter = Mock()
+        lab.adapter.read.return_value = None
+        lab.proxy_adapter = Mock()
+        lab.proxy_adapter.read.return_value = None
+        lab.endpoint_on_router = False
+        lab.daemon = None
+        lab.processes, lab.holders, lab.links = [], {}, [link]
+        lab.containers, lab.networks = [], []
+        lab.temp = None
+        lab.run = Mock(side_effect=run)
+
+        # The delete command failed, but a fresh exact-name check proved the
+        # veth had already disappeared; final whole-lab verification also passes.
+        lab.cleanup()
+        self.assertEqual(calls.count(['ip', '-j', 'link', 'show']), 3)
+        self.assertEqual(calls.count(['ip', 'link', 'delete', link]), 1)
+
+    def test_cleanup_keeps_failure_when_veth_delete_is_refused_and_link_remains(self):
+        import json
+        from scripts import ollama_route_linux as linux
+        from unittest.mock import Mock
+
+        link = 'bza' + 'a' * 12
+        listing = json.dumps([{'ifname': name} for name in ('lo', link)])
+
+        def run(argv):
+            if argv == ['ip', '-j', 'link', 'show']:
+                return listing
+            if argv == ['ip', 'link', 'delete', link]:
+                raise RuntimeError('delete denied; raw output is not diagnostic data')
+            raise AssertionError('Unexpected cleanup command')
+
+        lab = linux.Lab.__new__(linux.Lab)
+        lab.guard = Mock()
+        lab.adapter = Mock()
+        lab.adapter.read.return_value = None
+        lab.proxy_adapter = Mock()
+        lab.proxy_adapter.read.return_value = None
+        lab.endpoint_on_router = False
+        lab.daemon = None
+        lab.processes, lab.holders, lab.links = [], {}, [link]
+        lab.containers, lab.networks = [], []
+        lab.temp = None
+        lab.run = Mock(side_effect=run)
+
+        with self.assertRaises(linux.CleanupFailure) as caught:
+            lab.cleanup()
+        failures = caught.exception.cleanup_failures
+        self.assertEqual(failures[0], {
+            'operation': 'delete_owned_link', 'exception': 'RuntimeError',
+            'reason': 'operation_failed', 'errno': None,
+            'substage': 'delete_link', 'resource_type': 'veth',
+        })
+        self.assertEqual(failures[1], {
+            'operation': 'delete_owned_link', 'exception': 'CleanupObservationFailure',
+            'reason': 'resources_present', 'errno': None,
+            'substage': 'verify_after_delete_failure', 'resource_type': 'veth',
+        })
+        self.assertEqual(failures[-1], {
+            'operation': 'verify_links_absent', 'exception': 'CleanupObservationFailure',
+            'reason': 'resources_present', 'errno': None,
+        })
+        self.assertNotIn('delete denied', str(caught.exception))
+
+    def test_cleanup_keeps_failure_when_post_delete_link_check_cannot_complete(self):
+        import json
+        from scripts import ollama_route_linux as linux
+        from unittest.mock import Mock
+
+        link = 'bza' + 'a' * 12
+        checks = 0
+
+        def run(argv):
+            nonlocal checks
+            if argv == ['ip', '-j', 'link', 'show']:
+                checks += 1
+                if checks == 1:
+                    return json.dumps([{'ifname': link}])
+                if checks == 2:
+                    raise RuntimeError('link readback unavailable')
+                return '[{"ifname":"lo"}]'
+            if argv == ['ip', 'link', 'delete', link]:
+                raise RuntimeError('delete returned an error')
+            raise AssertionError('Unexpected cleanup command')
+
+        lab = linux.Lab.__new__(linux.Lab)
+        lab.guard = Mock()
+        lab.adapter = Mock()
+        lab.adapter.read.return_value = None
+        lab.proxy_adapter = Mock()
+        lab.proxy_adapter.read.return_value = None
+        lab.endpoint_on_router = False
+        lab.daemon = None
+        lab.processes, lab.holders, lab.links = [], {}, [link]
+        lab.containers, lab.networks = [], []
+        lab.temp = None
+        lab.run = Mock(side_effect=run)
+
+        with self.assertRaises(linux.CleanupFailure) as caught:
+            lab.cleanup()
+        self.assertEqual(caught.exception.cleanup_failures, (
+            {
+                'operation': 'delete_owned_link', 'exception': 'RuntimeError',
+                'reason': 'operation_failed', 'errno': None,
+                'substage': 'delete_link', 'resource_type': 'veth',
+            },
+            {
+                'operation': 'delete_owned_link', 'exception': 'RuntimeError',
+                'reason': 'readback_failed', 'errno': None,
+                'substage': 'verify_after_delete_failure', 'resource_type': 'veth',
+            },
+        ))
+
+    def test_cleanup_reports_link_inventory_read_failure_substage(self):
+        from scripts import ollama_route_linux as linux
+        from unittest.mock import Mock
+
+        link = 'bza' + 'a' * 12
+        calls = []
+
+        def run(argv):
+            calls.append(list(argv))
+            if argv == ['ip', '-j', 'link', 'show']:
+                if len(calls) == 1:
+                    raise RuntimeError('link inventory unavailable')
+                return '[{"ifname":"lo"}]'
+            raise AssertionError('An unobserved link must not be deleted')
+
+        lab = linux.Lab.__new__(linux.Lab)
+        lab.guard = Mock()
+        lab.adapter = Mock()
+        lab.adapter.read.return_value = None
+        lab.proxy_adapter = Mock()
+        lab.proxy_adapter.read.return_value = None
+        lab.endpoint_on_router = False
+        lab.daemon = None
+        lab.processes, lab.holders, lab.links = [], {}, [link]
+        lab.containers, lab.networks = [], []
+        lab.temp = None
+        lab.run = Mock(side_effect=run)
+
+        with self.assertRaises(linux.CleanupFailure) as caught:
+            lab.cleanup()
+        self.assertEqual(caught.exception.cleanup_failures, ({
+            'operation': 'delete_owned_link', 'exception': 'RuntimeError',
+            'reason': 'readback_failed', 'errno': None,
+            'substage': 'list_links', 'resource_type': 'veth',
+        },))
+
     def test_public_cli_cannot_select_internal_entry_with_namespace_descriptors(self):
         from scripts import ollama_route_linux as linux
         from unittest.mock import Mock

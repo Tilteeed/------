@@ -36,6 +36,10 @@ CLEANUP_FAILURE_REASONS = frozenset((
     'firewall_operation_failed', 'policy_present', 'resources_present',
     'process_still_alive',
 ))
+CLEANUP_LINK_SUBSTAGES = frozenset((
+    'list_links', 'delete_link', 'verify_after_delete_failure',
+))
+CLEANUP_LINK_TYPES = frozenset(('veth',))
 
 
 class CleanupFailure(RuntimeError):
@@ -534,7 +538,7 @@ class Lab:
         self.guard()
         failures = []
 
-        def record(operation, error, *, reason=None):
+        def record(operation, error, *, reason=None, substage=None, resource_type=None):
             if reason is None:
                 reason = getattr(error, 'cleanup_reason', None)
             if type(reason) is not str or reason not in CLEANUP_FAILURE_REASONS:
@@ -552,8 +556,11 @@ class Lab:
             errno_value = getattr(error, 'errno', None)
             if type(errno_value) is not int or errno_value < 0 or errno_value > 65535:
                 errno_value = None
-            failures.append(dict(operation=operation, exception=exception,
-                                 reason=reason, errno=errno_value))
+            failure = dict(operation=operation, exception=exception,
+                           reason=reason, errno=errno_value)
+            if operation == 'delete_owned_link':
+                failure.update(substage=substage, resource_type=resource_type)
+            failures.append(failure)
 
         def attempt(operation, action, *, readback=False):
             try:
@@ -606,12 +613,48 @@ class Lab:
                     raise CleanupObservationFailure('process_still_alive')
             attempt(operation, stop_and_verify)
         # Stop target namespaces first; their veth counterparts disappear.
+        def current_link_names():
+            current = strict_json(self.run(['ip', '-j', 'link', 'show']))
+            if (type(current) is not list or len(current) > 65536
+                    or any(type(item) is not dict or type(item.get('ifname')) is not str
+                           or not item['ifname'] for item in current)):
+                raise CleanupObservationFailure('readback_failed')
+            names = [item['ifname'] for item in current]
+            if len(set(names)) != len(names):
+                raise CleanupObservationFailure('readback_failed')
+            return set(names)
+
+        def record_link_failure(error, substage, *, readback=False, reason=None):
+            if (reason is None and readback
+                    and not isinstance(error, (OSError, subprocess.TimeoutExpired))):
+                reason = 'readback_failed'
+            record('delete_owned_link', error, reason=reason, substage=substage,
+                   resource_type='veth')
+
         for link in reversed(self.links):
-            def delete_owned_link(name=link):
-                current = strict_json(self.run(['ip', '-j', 'link', 'show']))
-                if any(item['ifname'] == name for item in current):
-                    self.run(['ip', 'link', 'delete', name])
-            attempt('delete_owned_link', delete_owned_link)
+            try:
+                if link not in current_link_names():
+                    continue
+            except Exception as error:
+                record_link_failure(error, 'list_links', readback=True)
+                continue
+
+            try:
+                self.run(['ip', 'link', 'delete', link])
+            except Exception as delete_error:
+                try:
+                    still_present = link in current_link_names()
+                except Exception as verify_error:
+                    record_link_failure(delete_error, 'delete_link')
+                    record_link_failure(verify_error, 'verify_after_delete_failure',
+                                        readback=True)
+                    continue
+                if still_present:
+                    record_link_failure(delete_error, 'delete_link')
+                    record_link_failure(
+                        CleanupObservationFailure('resources_present'),
+                        'verify_after_delete_failure',
+                    )
         if self.temp:
             attempt('cleanup_workspace', self.temp.cleanup)
 

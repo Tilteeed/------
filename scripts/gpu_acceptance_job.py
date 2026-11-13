@@ -19,7 +19,8 @@ from scripts import gpu_acceptance_receipts as receipts
 from scripts import ollama_route_acceptance as route
 from scripts import proxy_packet_acceptance as base
 from scripts.ollama_route_linux import (
-    CLEANUP_FAILURE_OPERATIONS, CLEANUP_FAILURE_REASONS, Lab,
+    CLEANUP_FAILURE_OPERATIONS, CLEANUP_FAILURE_REASONS,
+    CLEANUP_LINK_SUBSTAGES, CLEANUP_LINK_TYPES, Lab,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,14 +73,24 @@ def _valid_cleanup_diagnostics(value):
     if type(value) is not list or not 1 <= len(value) <= 64:
         return False
     for item in value:
-        if (type(item) is not dict
-                or set(item) != {'operation', 'exception', 'reason', 'errno'}
+        if type(item) is not dict:
+            return False
+        base_fields = {'operation', 'exception', 'reason', 'errno'}
+        link_fields = base_fields | {'substage', 'resource_type'}
+        expected_fields = link_fields if item.get('operation') == 'delete_owned_link' else base_fields
+        if (set(item) != expected_fields
                 or type(item['operation']) is not str
                 or item['operation'] not in CLEANUP_FAILURE_OPERATIONS
                 or type(item['exception']) is not str
                 or re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', item['exception']) is None
                 or type(item['reason']) is not str
                 or item['reason'] not in CLEANUP_FAILURE_REASONS):
+            return False
+        if expected_fields == link_fields and (
+                type(item['substage']) is not str
+                or item['substage'] not in CLEANUP_LINK_SUBSTAGES
+                or type(item['resource_type']) is not str
+                or item['resource_type'] not in CLEANUP_LINK_TYPES):
             return False
         errno_value = item['errno']
         if errno_value is not None and (type(errno_value) is not int or not 0 <= errno_value <= 65535):

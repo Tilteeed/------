@@ -194,6 +194,9 @@ class JobBoundaryTests(unittest.TestCase):
              'reason': 'os_error', 'errno': 13},
             {'operation': 'verify_ollama_policy_absent', 'exception': 'FirewallError',
              'reason': 'readback_failed', 'errno': None},
+            {'operation': 'delete_owned_link', 'exception': 'RuntimeError',
+             'reason': 'operation_failed', 'errno': None,
+             'substage': 'delete_link', 'resource_type': 'veth'},
         ))
         output = io.StringIO()
         with contextlib.redirect_stderr(output):
@@ -202,9 +205,15 @@ class JobBoundaryTests(unittest.TestCase):
         self.assertEqual(records, [api._diagnostic('cleanup', error)])
         self.assertEqual(records[0]['cleanup_failures'][0]['operation'], 'remove_proxy_policy')
         self.assertEqual(records[0]['cleanup_failures'][1]['reason'], 'readback_failed')
+        self.assertEqual(records[0]['cleanup_failures'][2]['substage'], 'delete_link')
 
         forged = json.loads(output.getvalue().split(api._FAILURE_PREFIX, 1)[1])
         forged['cleanup_failures'][0]['operation'] = '/secret/path'
+        self.assertEqual(api._diagnostics_from_output(
+            api._FAILURE_PREFIX + json.dumps(forged)), [])
+
+        forged = json.loads(output.getvalue().split(api._FAILURE_PREFIX, 1)[1])
+        forged['cleanup_failures'][2]['resource_type'] = '/secret/path'
         self.assertEqual(api._diagnostics_from_output(
             api._FAILURE_PREFIX + json.dumps(forged)), [])
 
