@@ -322,6 +322,31 @@ class ChildInspectionTests(unittest.TestCase):
         self.assertFalse(ops.writes)
         self.assertFalse(any(c[0] == 'mount' or (c[0] == 'dockerd' and c != ('dockerd', '--version')) for c in ops.commands))
 
+    def test_device_allow_mismatch_reports_bounded_readback_and_stays_strict(self):
+        h, p, ops = fixture()
+        ops.props['DeviceAllow'] = '/dev/null rw'
+        with self.assertRaises(h.Rejected) as rejected:
+            h._unit_properties(p, ops)
+        message = str(rejected.exception)
+        self.assertIn("unit property mismatch: DeviceAllow (expected='', actual='/dev/null rw')", message)
+        self.assertLessEqual(len(message), 240)
+        self.assertEqual(ops.props['DevicePolicy'], 'closed')
+
+        # A long systemd readback is still rejected, and only a bounded prefix
+        # enters the diagnostic condition.
+        ops.props['DeviceAllow'] = 'x' * 4096
+        with self.assertRaises(h.Rejected) as rejected:
+            h._unit_properties(p, ops)
+        message = str(rejected.exception)
+        self.assertLessEqual(len(message), 240)
+        self.assertLess(len(message), 160)
+        self.assertNotIn('x' * 100, message)
+
+        ops.props['DeviceAllow'] = ''
+        ops.props['DevicePolicy'] = 'auto'
+        with self.assertRaisesRegex(h.Rejected, 'unit property mismatch: DevicePolicy'):
+            h._unit_properties(p, ops)
+
 
 class PreparationTests(unittest.TestCase):
     def test_visible_overmounts_accept_hidden_old_mountinfo_records(self):

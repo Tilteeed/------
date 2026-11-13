@@ -363,6 +363,16 @@ def _expected_properties(plan):
     return values
 
 
+def _bounded_property_value(value, *, limit=64):
+    """Format one systemd property value for a short, single-line diagnostic."""
+    if value is None:
+        return '<missing>'
+    rendered = repr(value)
+    if len(rendered) > limit:
+        return rendered[:limit - 3] + '...'
+    return rendered
+
+
 def _unit_properties(plan, ops, *, main_pid=None):
     names = tuple(_expected_properties(plan)) + ('MainPID', 'InvocationID', 'RuntimeMaxUSec',
              'TimeoutStopUSec', 'CPUQuotaPerSecUSec', 'CPUQuotaPeriodUSec')
@@ -373,7 +383,12 @@ def _unit_properties(plan, ops, *, main_pid=None):
         _need(bool(sep) and key not in props, 'ambiguous unit readback')
         props[key] = value
     for key, expected in _expected_properties(plan).items():
-        _need(props.get(key) == expected, 'unit property mismatch: ' + key)
+        observed = props.get(key)
+        if key == 'DeviceAllow' and observed != expected:
+            _need(False, 'unit property mismatch: DeviceAllow'
+                  + ' (expected=' + _bounded_property_value(expected)
+                  + ', actual=' + _bounded_property_value(observed) + ')')
+        _need(observed == expected, 'unit property mismatch: ' + key)
     b = plan.budget
     for key, expected in (('RuntimeMaxUSec', b.runtime_seconds * 1000000),
                           ('TimeoutStopUSec', b.stop_seconds * 1000000),
