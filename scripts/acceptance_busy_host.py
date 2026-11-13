@@ -350,8 +350,12 @@ class LinuxOps:
         import time
         env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C', 'LANG': 'C',
                'SYSTEMD_PAGER': '', 'SYSTEMD_COLORS': '0'}
-        with subprocess.Popen(tuple(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        with subprocess.Popen(tuple(argv), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, env=env, shell=False) as child:
+            # Close immediately to deliver EOF without opening /dev/null. During
+            # private /dev setup, /dev may temporarily be covered by a nodev tmpfs.
+            if child.stdin is not None:
+                child.stdin.close()
             output = bytearray()
             end = time.monotonic() + _DIAGNOSTIC_SECONDS
             try:

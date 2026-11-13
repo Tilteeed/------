@@ -61,7 +61,7 @@ class SyntheticLinux:
         self.h, self.plan = h, plan
         self.pid, self.uid = 701, 0
         self.invocation_id = 'b' * 32
-        self.commands, self.writes = [], []
+        self.commands, self.writes, self.events = [], [], []
         self.cg = '/sys/fs/cgroup' + plan.cgroup
         b, io = plan.budget, plan.budget.io
         self.files = {
@@ -177,6 +177,7 @@ class SyntheticLinux:
         import stat
         from types import SimpleNamespace
         parent, _, name = path.rpartition('/')
+        self.events.append(('mknod', name))
         self.children[parent].append(name)
         self.stats[path] = SimpleNamespace(st_mode=stat.S_IFCHR | 0o666, st_rdev=(major << 8) | minor)
 
@@ -225,6 +226,7 @@ class SyntheticLinux:
         if argv[:3] == ('bpftool', '-j', 'cgroup'):
             return self.bpf
         if argv[0] == 'mount':
+            self.events.append(('command', tuple(argv)))
             if argv[1:3] == ('-t', 'tmpfs'):
                 self.mounted = True
                 self.stats[self.plan.workspace].st_dev = 10
@@ -358,6 +360,76 @@ class VisibleMountAdapterTests(unittest.TestCase):
                              os.O_PATH | os.O_NOFOLLOW)
             ops.read.assert_called_once_with('/proc/self/fdinfo/37')
             closed.assert_called_once_with(37)
+
+
+class LinuxOpsCommandTests(unittest.TestCase):
+    def test_run_closes_pipe_stdin_without_opening_devnull(self):
+        import errno
+        import os
+        import selectors
+        import subprocess
+        from unittest.mock import patch
+
+        h = helper()
+        ops = h.LinuxOps.__new__(h.LinuxOps)
+        events = []
+
+        class Pipe:
+            def close(self):
+                events.append('stdin_closed')
+
+        class Stdout:
+            def fileno(self):
+                return 47
+
+        class Child:
+            stdin = Pipe()
+            stdout = Stdout()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                events.append('child_exit')
+
+            def wait(self, timeout=None):
+                events.append('child_wait')
+                return 0
+
+            def poll(self):
+                return 0
+
+        child = Child()
+
+        def popen(argv, **kwargs):
+            events.append('popen')
+            if kwargs['stdin'] is subprocess.DEVNULL:
+                raise PermissionError(errno.EACCES, 'Permission denied', '/dev/null')
+            if kwargs['stdin'] is not subprocess.PIPE:
+                raise AssertionError('stdin must be a pipe')
+            return child
+
+        class Selector:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def register(self, fileobj, event):
+                self.fileobj = fileobj
+
+            def select(self, timeout):
+                events.append('select')
+                return [(self.fileobj, selectors.EVENT_READ)]
+
+        with patch('subprocess.Popen', side_effect=popen), \
+             patch('selectors.DefaultSelector', Selector), \
+             patch.object(os, 'read', return_value=b''):
+            self.assertEqual(ops.run(('mount', '-o', 'remount,bind,rw,dev,nosuid', '/dev')), '')
+
+        self.assertLess(events.index('stdin_closed'), events.index('select'))
+        self.assertIn('child_wait', events)
 
 
 class ChildInspectionTests(unittest.TestCase):
@@ -594,6 +666,11 @@ class PreparationTests(unittest.TestCase):
         self.assertIn(('mount', '--make-rprivate', '/'), ops.commands)
         self.assertIn(('mount', '-t', 'tmpfs', '-o', 'size=67108864,nr_inodes=1024,mode=0700,uid=0,gid=0,nodev,nosuid',
                        'acceptance-' + 'a' * 32, p.workspace), ops.commands)
+        null_creation = ops.events.index(('mknod', 'null'))
+        private_dev_bind = ops.events.index(('command', ('mount', '--bind', p.workspace + '/dev', '/dev')))
+        private_dev_remount = ops.events.index(('command', ('mount', '-o', 'remount,bind,rw,dev,nosuid', '/dev')))
+        self.assertLess(null_creation, private_dev_bind)
+        self.assertLess(private_dev_bind, private_dev_remount)
         self.assertIn('--storage-driver=vfs', ready.daemon_argv)
         self.assertIn('--cgroup-parent=' + ready.container_cgroup_parent, ready.daemon_argv)
         self.assertIn('--exec-opt=native.cgroupdriver=cgroupfs', ready.daemon_argv)
