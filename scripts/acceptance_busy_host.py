@@ -350,7 +350,7 @@ def _expected_properties(plan):
     b, io = plan.budget, plan.budget.io
     values = dict(Id=plan.unit, LoadState='loaded', ActiveState='active', SubState='running',
                   Transient='yes', ControlGroup=plan.cgroup, Delegate='yes',
-                  DevicePolicy='closed', DeviceAllow='', PrivateDevices='no',
+                  DevicePolicy='closed', PrivateDevices='no',
                   PrivateMounts='yes', PrivateNetwork='no', ProtectSystem='strict',
                   ReadWritePaths=plan.workspace + ' /sys/fs/cgroup' + plan.cgroup,
                   KillMode='control-group',
@@ -363,14 +363,32 @@ def _expected_properties(plan):
     return values
 
 
-def _bounded_property_value(value, *, limit=64):
-    """Format one systemd property value for a short, single-line diagnostic."""
-    if value is None:
-        return '<missing>'
-    rendered = repr(value)
-    if len(rendered) > limit:
-        return rendered[:limit - 3] + '...'
-    return rendered
+def _verify_device_allow_empty(plan, ops):
+    """Read DeviceAllow as its typed D-Bus array; systemctl cannot print a(ss)."""
+    import shlex
+
+    # systemd 249 exposes DeviceAllow as a(ss). Query the Service interface
+    # directly so a missing/unprintable `systemctl show` line is never treated
+    # as an empty allow-list.
+    object_path = ('/org/freedesktop/systemd1/unit/' +
+                   plan.unit.replace('-', '_2d').replace('.', '_2e'))
+    text = ops.run((
+        'busctl', '--system', 'get-property', 'org.freedesktop.systemd1',
+        object_path, 'org.freedesktop.systemd1.Service', 'DeviceAllow',
+    ))
+    try:
+        parts = shlex.split(text)
+    except ValueError:
+        raise Rejected('malformed DeviceAllow D-Bus readback') from None
+    _need(len(parts) >= 2 and parts[0] == 'a(ss)' and
+          re.fullmatch(r'(?:0|[1-9][0-9]*)', parts[1]) is not None,
+          'missing or malformed DeviceAllow D-Bus property')
+    count = int(parts[1])
+    _need(count <= 4096 and len(parts) == 2 + count * 2,
+          'malformed DeviceAllow D-Bus entry list')
+    _need(count == 0,
+          'DeviceAllow explicit entry count mismatch: expected 0, actual ' + str(count))
+    return ''
 
 
 def _unit_properties(plan, ops, *, main_pid=None):
@@ -383,12 +401,8 @@ def _unit_properties(plan, ops, *, main_pid=None):
         _need(bool(sep) and key not in props, 'ambiguous unit readback')
         props[key] = value
     for key, expected in _expected_properties(plan).items():
-        observed = props.get(key)
-        if key == 'DeviceAllow' and observed != expected:
-            _need(False, 'unit property mismatch: DeviceAllow'
-                  + ' (expected=' + _bounded_property_value(expected)
-                  + ', actual=' + _bounded_property_value(observed) + ')')
-        _need(observed == expected, 'unit property mismatch: ' + key)
+        _need(props.get(key) == expected, 'unit property mismatch: ' + key)
+    props['DeviceAllow'] = _verify_device_allow_empty(plan, ops)
     b = plan.budget
     for key, expected in (('RuntimeMaxUSec', b.runtime_seconds * 1000000),
                           ('TimeoutStopUSec', b.stop_seconds * 1000000),

@@ -98,7 +98,7 @@ class SyntheticLinux:
             'Id': plan.unit, 'LoadState': 'loaded', 'ActiveState': 'active',
             'SubState': 'running', 'Transient': 'yes', 'MainPID': '701',
             'InvocationID': self.invocation_id, 'ControlGroup': plan.cgroup,
-            'Delegate': 'yes', 'DevicePolicy': 'closed', 'DeviceAllow': '',
+            'Delegate': 'yes', 'DevicePolicy': 'closed',
             'PrivateMounts': 'yes', 'PrivateNetwork': 'no', 'PrivateDevices': 'no',
             'ProtectSystem': 'strict', 'ReadWritePaths': plan.workspace + ' /sys/fs/cgroup' + plan.cgroup,
             'KillMode': 'control-group', 'OOMPolicy': 'kill', 'SendSIGKILL': 'yes',
@@ -109,6 +109,7 @@ class SyntheticLinux:
             'RuntimeDirectory': plan.unit[:-8], 'RuntimeDirectoryMode': '0700',
             'RuntimeDirectoryPreserve': 'no',
         }
+        self.device_allow = 'a(ss) 0\n'
         for name, value in [('IOReadBandwidthMax', io.read_bps), ('IOWriteBandwidthMax', io.write_bps),
                             ('IOReadIOPSMax', io.read_iops), ('IOWriteIOPSMax', io.write_iops)]:
             self.props[name] = io.device + ' ' + str(value)
@@ -213,6 +214,8 @@ class SyntheticLinux:
             return self.file_listing
         if argv[:2] == ('systemctl', 'show'):
             return '\n'.join(k + '=' + v for k, v in self.props.items())
+        if argv[:3] == ('busctl', '--system', 'get-property'):
+            return self.device_allow
         if argv == ('systemd-run', '--version'):
             return 'systemd 249 (249.11-synthetic)\n'
         if argv == ('dockerd', '--version'):
@@ -250,6 +253,47 @@ def fixture():
     return h, p, SyntheticLinux(h, p)
 
 
+class LinuxOpsReadTests(unittest.TestCase):
+    def test_os_release_canonical_symlink_is_followed_to_regular_target(self):
+        import errno
+        import io
+        import os
+        import stat
+        from types import SimpleNamespace
+        from unittest.mock import call, patch
+        h = helper()
+        ops = h.LinuxOps.__new__(h.LinuxOps)
+        data = b'ID=ubuntu\nVERSION_ID="22.04"\n'
+        flags = os.O_RDONLY | 0x20000
+        with patch.object(os, 'O_NOFOLLOW', 0x20000, create=True), \
+             patch.object(os, 'open', side_effect=(OSError(errno.ELOOP, 'symlink'), 42)) as opened, \
+             patch.object(os, 'readlink', return_value='../usr/lib/os-release') as readlink, \
+             patch.object(os, 'fstat', return_value=SimpleNamespace(st_mode=stat.S_IFREG | 0o644)), \
+             patch.object(os, 'fdopen', return_value=io.BytesIO(data)) as fdopen, \
+             patch.object(os, 'close') as closed:
+            self.assertEqual(ops.read('/etc/os-release'), data.decode())
+        self.assertEqual(opened.call_args_list, [
+            call('/etc/os-release', flags),
+            call('/usr/lib/os-release', flags),
+        ])
+        readlink.assert_called_once_with('/etc/os-release')
+        fdopen.assert_called_once_with(42, 'rb', closefd=False)
+        closed.assert_called_once_with(42)
+
+    def test_os_release_rejects_noncanonical_symlink_target(self):
+        import errno
+        import os
+        from unittest.mock import patch
+        h = helper()
+        ops = h.LinuxOps.__new__(h.LinuxOps)
+        with patch.object(os, 'O_NOFOLLOW', 0x20000, create=True), \
+             patch.object(os, 'open', side_effect=OSError(errno.ELOOP, 'symlink')) as opened, \
+             patch.object(os, 'readlink', return_value='/tmp/os-release'):
+            with self.assertRaisesRegex(h.Rejected, 'unsupported /etc/os-release symlink target'):
+                ops.read('/etc/os-release')
+        opened.assert_called_once_with('/etc/os-release', os.O_RDONLY | 0x20000)
+
+
 class VisibleMountAdapterTests(unittest.TestCase):
     def test_fdinfo_missing_malformed_or_duplicate_mount_id_closes_fd_and_rejects(self):
         import os
@@ -273,7 +317,7 @@ class VisibleMountAdapterTests(unittest.TestCase):
     def test_fdinfo_read_is_bounded_and_closes_path_fd_on_read_failure(self):
         import io
         import os
-        from unittest.mock import patch
+        from unittest.mock import call, patch
         h = helper()
         ops = h.LinuxOps.__new__(h.LinuxOps)
         for data, expected in ((b'mnt_id:\t47\n', '47'),
@@ -284,14 +328,15 @@ class VisibleMountAdapterTests(unittest.TestCase):
                      patch.object(os, 'O_CLOEXEC', 0x80000, create=True), \
                      patch.object(os, 'open', side_effect=(37, 38)) as opened, \
                      patch.object(os, 'close') as closed, \
-                     patch('builtins.open', return_value=io.BytesIO(data)):
+                     patch.object(os, 'fdopen', return_value=io.BytesIO(data)) as fdopen:
                     if expected is None:
                         with self.assertRaisesRegex(h.Rejected, 'diagnostic bound'):
                             ops.visible_mount_id('/dev')
                     else:
                         self.assertEqual(ops.visible_mount_id('/dev'), expected)
                     self.assertEqual(opened.call_args_list[1].args[0], '/proc/self/fdinfo/37')
-                    closed.assert_called_once_with(37)
+                    fdopen.assert_called_once_with(38, 'rb', closefd=False)
+                    self.assertEqual(closed.call_args_list, [call(38), call(37)])
 
     def test_fdinfo_uses_nofollow_path_fd_and_closes_it(self):
         import os
@@ -322,30 +367,37 @@ class ChildInspectionTests(unittest.TestCase):
         self.assertFalse(ops.writes)
         self.assertFalse(any(c[0] == 'mount' or (c[0] == 'dockerd' and c != ('dockerd', '--version')) for c in ops.commands))
 
-    def test_device_allow_mismatch_reports_bounded_readback_and_stays_strict(self):
+    def test_device_allow_requires_typed_empty_dbus_array_and_stays_strict(self):
         h, p, ops = fixture()
-        ops.props['DeviceAllow'] = '/dev/null rw'
-        with self.assertRaises(h.Rejected) as rejected:
-            h._unit_properties(p, ops)
-        message = str(rejected.exception)
-        self.assertIn("unit property mismatch: DeviceAllow (expected='', actual='/dev/null rw')", message)
-        self.assertLessEqual(len(message), 240)
+        # The systemctl output omits DeviceAllow; only a typed D-Bus empty
+        # array is accepted as proof that no explicit exception is configured.
+        observed = h._unit_properties(p, ops)
+        self.assertEqual(observed['DeviceAllow'], '')
         self.assertEqual(ops.props['DevicePolicy'], 'closed')
+        show = next(command for command in ops.commands if command[:2] == ('systemctl', 'show'))
+        self.assertNotIn('DeviceAllow', show[4])
+        busctl = next(command for command in ops.commands if command[:3] == ('busctl', '--system', 'get-property'))
+        self.assertEqual(busctl[-3:], (
+            self.path_for(p), 'org.freedesktop.systemd1.Service', 'DeviceAllow'))
 
-        # A long systemd readback is still rejected, and only a bounded prefix
-        # enters the diagnostic condition.
-        ops.props['DeviceAllow'] = 'x' * 4096
-        with self.assertRaises(h.Rejected) as rejected:
-            h._unit_properties(p, ops)
-        message = str(rejected.exception)
-        self.assertLessEqual(len(message), 240)
-        self.assertLess(len(message), 160)
-        self.assertNotIn('x' * 100, message)
+        for readback, reason in (
+            ('a(ss) 1 "/dev/fake" "rw"\n', 'count mismatch'),
+            ('a(ss) 0 trailing\n', 'entry list'),
+            ('s ""\n', 'D-Bus property'),
+            ('', 'D-Bus property'),
+        ):
+            ops.device_allow = readback
+            with self.subTest(readback=readback), self.assertRaisesRegex(h.Rejected, reason):
+                h._unit_properties(p, ops)
 
-        ops.props['DeviceAllow'] = ''
+        ops.device_allow = 'a(ss) 0\n'
         ops.props['DevicePolicy'] = 'auto'
         with self.assertRaisesRegex(h.Rejected, 'unit property mismatch: DevicePolicy'):
             h._unit_properties(p, ops)
+
+    @staticmethod
+    def path_for(plan):
+        return '/org/freedesktop/systemd1/unit/' + plan.unit.replace('-', '_2d').replace('.', '_2e')
 
 
 class PreparationTests(unittest.TestCase):
@@ -597,7 +649,7 @@ class RejectionTests(unittest.TestCase):
             lambda h, p, o: o.props.update(InvocationID='c' * 32),
             lambda h, p, o: o.props.update(Id='docker.service'),
             lambda h, p, o: o.props.update(ControlGroup='/foreign'),
-            lambda h, p, o: o.props.update(DeviceAllow='/dev/fake rw'),
+            lambda h, p, o: setattr(o, 'device_allow', 'a(ss) 1 "/dev/fake" "rw"'),
             lambda h, p, o: o.props.pop('RuntimeMaxUSec'),
             lambda h, p, o: o.props.update(ProtectSystem='no'),
             lambda h, p, o: o.files.update({o.cg + '/memory.max': 'max'}),
