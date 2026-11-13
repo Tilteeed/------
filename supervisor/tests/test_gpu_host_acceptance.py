@@ -236,6 +236,7 @@ class JobBoundaryTests(unittest.TestCase):
         with patch.object(api.resources, 'verify_prepared_job') as verify:
             lab.resource_check()
         self.assertEqual(verify.call_args.kwargs['pids'], (api.os.getpid(),))
+        self.assertTrue(verify.call_args.kwargs['unit_properties_via_dbus'])
 
     def test_resource_preparation_precedes_namespace_entry(self):
         from supervisor.tests.test_acceptance_busy_host import fixture

@@ -455,7 +455,136 @@ def _verify_device_allow_empty(plan, ops):
     return ''
 
 
-def _unit_properties(plan, ops, *, main_pid=None):
+_DBUS_UNIT_PROPERTY_SIGNATURES = {
+    'Id': 's', 'LoadState': 's', 'ActiveState': 's', 'SubState': 's',
+    'Transient': 'b', 'InvocationID': 'ay',
+}
+_DBUS_SERVICE_PROPERTY_SIGNATURES = {
+    'ControlGroup': 's', 'Delegate': 'b', 'DevicePolicy': 's',
+    'PrivateDevices': 'b', 'PrivateMounts': 'b', 'PrivateNetwork': 'b',
+    'ProtectSystem': 's', 'ReadWritePaths': 'as', 'KillMode': 's',
+    'OOMPolicy': 's', 'SendSIGKILL': 'b', 'MemoryMax': 't',
+    'MemorySwapMax': 't', 'TasksMax': 't', 'User': 's', 'Group': 's',
+    'RuntimeDirectory': 'as', 'RuntimeDirectoryMode': 'u',
+    'RuntimeDirectoryPreserve': 's', 'IOReadBandwidthMax': 'a(st)',
+    'IOWriteBandwidthMax': 'a(st)', 'IOReadIOPSMax': 'a(st)',
+    'IOWriteIOPSMax': 'a(st)', 'MainPID': 'u', 'RuntimeMaxUSec': 't',
+    'TimeoutStopUSec': 't', 'CPUQuotaPerSecUSec': 't',
+    'CPUQuotaPeriodUSec': 't',
+}
+
+
+def _parse_busctl_property(name, text, signature):
+    import shlex
+    try:
+        parts = shlex.split(text)
+    except ValueError:
+        raise Rejected('malformed D-Bus unit property: ' + name) from None
+    _need(bool(parts) and parts[0] == signature, 'D-Bus unit property type mismatch: ' + name)
+
+    def unsigned(token, maximum):
+        _need(re.fullmatch(r'(?:0|[1-9][0-9]*)', token) is not None,
+              'malformed D-Bus integer property: ' + name)
+        value = int(token)
+        _need(value <= maximum, 'out-of-range D-Bus integer property: ' + name)
+        return value
+
+    if signature == 's':
+        _need(len(parts) == 2, 'malformed D-Bus string property: ' + name)
+        return parts[1]
+    if signature == 'b':
+        _need(len(parts) == 2 and parts[1] in ('yes', 'true', 'on', '1', 'no', 'false', 'off', '0'),
+              'malformed D-Bus boolean property: ' + name)
+        return parts[1] in ('yes', 'true', 'on', '1')
+    if signature in ('u', 't'):
+        _need(len(parts) == 2, 'malformed D-Bus integer property: ' + name)
+        return unsigned(parts[1], (1 << (32 if signature == 'u' else 64)) - 1)
+    if signature in ('as', 'ay', 'a(st)'):
+        _need(len(parts) >= 2, 'malformed D-Bus array property: ' + name)
+        count = unsigned(parts[1], 4096)
+        if signature == 'as':
+            _need(len(parts) == 2 + count, 'malformed D-Bus string array: ' + name)
+            return tuple(parts[2:])
+        if signature == 'ay':
+            _need(len(parts) == 2 + count, 'malformed D-Bus byte array: ' + name)
+            return bytes(unsigned(item, 255) for item in parts[2:])
+        _need(len(parts) == 2 + count * 2, 'malformed D-Bus device limit array: ' + name)
+        return tuple((parts[2 + index * 2], unsigned(parts[3 + index * 2], (1 << 64) - 1))
+                     for index in range(count))
+    raise Rejected('unsupported D-Bus unit property type: ' + name)
+
+
+def _busctl_unit_properties(plan, ops, interface, signatures):
+    object_path = ('/org/freedesktop/systemd1/unit/' +
+                   plan.unit.replace('-', '_2d').replace('.', '_2e'))
+    names = tuple(signatures)
+    text = ops.run((
+        'busctl', '--system', 'get-property', 'org.freedesktop.systemd1',
+        object_path, interface, *names,
+    ))
+    lines = text.splitlines()
+    _need(len(lines) == len(names), 'incomplete D-Bus unit property readback')
+    return {name: _parse_busctl_property(name, line, signatures[name])
+            for name, line in zip(names, lines)}
+
+
+def _unit_properties_dbus(plan, ops, *, main_pid=None):
+    """Read the exact Unit/Service properties without depending on systemctl."""
+    unit = _busctl_unit_properties(plan, ops, 'org.freedesktop.systemd1.Unit',
+                                   _DBUS_UNIT_PROPERTY_SIGNATURES)
+    service = _busctl_unit_properties(plan, ops, 'org.freedesktop.systemd1.Service',
+                                      _DBUS_SERVICE_PROPERTY_SIGNATURES)
+    observed = dict(unit, **service)
+    signatures = dict(_DBUS_UNIT_PROPERTY_SIGNATURES, **_DBUS_SERVICE_PROPERTY_SIGNATURES)
+    expected = _expected_properties(plan)
+    for name, expected_text in expected.items():
+        signature = signatures[name]
+        if signature == 's':
+            expected_value = expected_text
+        elif signature == 'b':
+            _need(expected_text in ('yes', 'no'), 'invalid internal boolean expectation: ' + name)
+            expected_value = expected_text == 'yes'
+        elif signature == 'u':
+            expected_value = int(expected_text, 8) if name == 'RuntimeDirectoryMode' else int(expected_text)
+        elif signature == 't':
+            expected_value = int(expected_text)
+        elif signature == 'as':
+            expected_value = tuple(expected_text.split())
+        elif signature == 'a(st)':
+            device, amount = expected_text.rsplit(' ', 1)
+            expected_value = ((device, int(amount)),)
+        else:
+            raise Rejected('unsupported expected D-Bus property type: ' + name)
+        _need(observed.get(name) == expected_value, 'unit property mismatch: ' + name)
+
+    observed['DeviceAllow'] = _verify_device_allow_empty(plan, ops)
+    b = plan.budget
+    durations = (('RuntimeMaxUSec', b.runtime_seconds * 1000000),
+                 ('TimeoutStopUSec', b.stop_seconds * 1000000),
+                 ('CPUQuotaPerSecUSec', b.cpu_quota_percent * 10000),
+                 ('CPUQuotaPeriodUSec', 100000))
+    for name, expected_value in durations:
+        _need(service[name] == expected_value, 'unit duration mismatch: ' + name)
+    expected_pid = ops.pid if main_pid is None else main_pid
+    _need(type(expected_pid) is int and expected_pid > 0 and service['MainPID'] == expected_pid,
+          'transient MainPID identity mismatch')
+    invocation_id = unit['InvocationID']
+    _need(len(invocation_id) == 16 and invocation_id.hex() == ops.invocation_id,
+          'invocation identity mismatch')
+
+    # Preserve systemctl-shaped values for callers/tests; comparisons above use
+    # typed D-Bus values and never infer types from presentation strings.
+    result = dict(expected)
+    result['DeviceAllow'] = observed['DeviceAllow']
+    result.update({name: str(value) + 'us' for name, value in durations})
+    result['MainPID'] = str(service['MainPID'])
+    result['InvocationID'] = invocation_id.hex()
+    return result
+
+
+def _unit_properties(plan, ops, *, main_pid=None, via_dbus=False):
+    if via_dbus:
+        return _unit_properties_dbus(plan, ops, main_pid=main_pid)
     names = tuple(_expected_properties(plan)) + ('MainPID', 'InvocationID', 'RuntimeMaxUSec',
              'TimeoutStopUSec', 'CPUQuotaPerSecUSec', 'CPUQuotaPeriodUSec')
     text = ops.run(('systemctl', 'show', '--no-pager', '--all', '--property=' + ','.join(names), '--', plan.unit))
@@ -792,11 +921,12 @@ def rebind_prepared_namespace(plan: JobPlan, prepared: PreparedJob, *,
                       tmp_mount_id=_visible_mount('/tmp', ops)[0][0],
                       var_tmp_mount_id=_visible_mount('/var/tmp', ops)[0][0],
                       devpts_mount_id=_visible_mount('/dev/pts', ops)[0][0])
-    verify_prepared_job(plan, rebound, pids=(ops.pid,), ops=ops)
+    verify_prepared_job(plan, rebound, pids=(ops.pid,), ops=ops, unit_properties_via_dbus=True)
     return rebound
 
 
-def verify_prepared_job(plan: JobPlan, prepared: PreparedJob, *, pids=(), container_pids=(), ops=None) -> None:
+def verify_prepared_job(plan: JobPlan, prepared: PreparedJob, *, pids=(), container_pids=(),
+                        ops=None, unit_properties_via_dbus=False) -> None:
     """Read back limits, identities, mounts and explicit live descendant PIDs.
 
     Supply dockerd, managed containerd and each container's host PID. The parent
@@ -809,7 +939,7 @@ def verify_prepared_job(plan: JobPlan, prepared: PreparedJob, *, pids=(), contai
     ops = LinuxOps() if ops is None else ops
     _need(ops.namespace('self', 'mnt') == prepared.mount_namespace,
           'prepared mount namespace drift')
-    _unit_properties(plan, ops, main_pid=prepared.owned.main_pid)
+    _unit_properties(plan, ops, main_pid=prepared.owned.main_pid, via_dbus=unit_properties_via_dbus)
     _need(prepared.owned.invocation_id == ops.invocation_id, 'prepared invocation drift')
     _need(prepared.owned.cgroup_path == '/sys/fs/cgroup' + plan.cgroup and
           _identity(ops.stat(prepared.owned.cgroup_path)) == prepared.owned.cgroup_identity, 'owned cgroup replaced')

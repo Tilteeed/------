@@ -62,6 +62,8 @@ class SyntheticLinux:
         self.pid, self.uid = 701, 0
         self.invocation_id = 'b' * 32
         self.commands, self.writes, self.events = [], [], []
+        self.systemctl_available = True
+        self.busctl_overrides = {}
         self.cg = '/sys/fs/cgroup' + plan.cgroup
         b, io = plan.budget, plan.budget.io
         self.files = {
@@ -121,6 +123,43 @@ class SyntheticLinux:
 
     def visible_mount_id(self, path):
         return self.visible_ids[path]
+
+    def busctl_property(self, interface, name):
+        import json
+        if name in self.busctl_overrides:
+            return self.busctl_overrides[name]
+        if name == 'DeviceAllow':
+            return self.device_allow
+        value = self.props[name]
+        if interface == 'org.freedesktop.systemd1.Unit':
+            if name == 'InvocationID':
+                return 'ay 16 ' + ' '.join(str(byte) for byte in bytes.fromhex(value))
+            if name == 'Transient':
+                return 'b yes' if value == 'yes' else 'b no'
+            return 's ' + json.dumps(value)
+        if name in ('Delegate', 'PrivateDevices', 'PrivateMounts', 'PrivateNetwork', 'SendSIGKILL'):
+            return 'b yes' if value == 'yes' else 'b no'
+        if name in ('ReadWritePaths', 'RuntimeDirectory'):
+            values = value.split()
+            return 'as ' + str(len(values)) + ''.join(' ' + json.dumps(item) for item in values)
+        if name == 'RuntimeDirectoryMode':
+            return 'u ' + str(int(value, 8))
+        if name.startswith('IO'):
+            device, amount = value.rsplit(' ', 1)
+            return 'a(st) 1 ' + json.dumps(device) + ' ' + amount
+        if name in ('MainPID',):
+            return 'u ' + value
+        if name in ('MemoryMax', 'MemorySwapMax', 'TasksMax'):
+            return 't ' + value
+        if name == 'RuntimeMaxUSec':
+            return 't 60000000'
+        if name == 'TimeoutStopUSec':
+            return 't 5000000'
+        if name == 'CPUQuotaPerSecUSec':
+            return 't 250000'
+        if name == 'CPUQuotaPeriodUSec':
+            return 't 100000'
+        return 's ' + json.dumps(value)
 
     def clone_mount_namespace(self):
         """Model CLONE_NEWNS: all mount IDs change, backing identities do not."""
@@ -216,9 +255,12 @@ class SyntheticLinux:
                 raise self.h.Rejected('diagnostic command failed: systemctl')
             return self.file_listing
         if argv[:2] == ('systemctl', 'show'):
+            if not self.systemctl_available:
+                raise self.h.Rejected('systemctl unavailable in synthetic private PID namespace')
             return '\n'.join(k + '=' + v for k, v in self.props.items())
         if argv[:3] == ('busctl', '--system', 'get-property'):
-            return self.device_allow
+            interface = argv[5]
+            return '\n'.join(self.busctl_property(interface, name) for name in argv[6:])
         if argv == ('systemd-run', '--version'):
             return 'systemd 249 (249.11-synthetic)\n'
         if argv == ('dockerd', '--version'):
@@ -683,6 +725,58 @@ class PreparationTests(unittest.TestCase):
 
 
 class NamespaceRebindTests(unittest.TestCase):
+    def test_rebind_uses_unit_and_service_dbus_when_systemctl_is_unavailable(self):
+        h, p, ops = fixture()
+        ready = h.prepare_owned_job(p, ops=ops)
+        parent_namespace = ops.namespace('self', 'mnt')
+        ops.clone_mount_namespace()
+        ops.pid = 1
+        ops.files['/proc/1/cgroup'] = ops.files['/proc/self/cgroup']
+        ops.systemctl_available = False
+        command_start = len(ops.commands)
+
+        child = h.rebind_prepared_namespace(p, ready,
+            parent_mnt_namespace=parent_namespace, ops=ops)
+
+        commands = ops.commands[command_start:]
+        self.assertFalse(any(command[:2] == ('systemctl', 'show') for command in commands))
+        property_calls = [command for command in commands
+                          if command[:3] == ('busctl', '--system', 'get-property')]
+        self.assertEqual(len(property_calls), 3)
+        self.assertEqual(property_calls[0][5], 'org.freedesktop.systemd1.Unit')
+        self.assertEqual(property_calls[1][5], 'org.freedesktop.systemd1.Service')
+        self.assertEqual(property_calls[2][-1], 'DeviceAllow')
+        self.assertEqual(child.mount_namespace, 'mnt:[3]')
+
+        # Resource limits are still read back from the actual cgroup files.
+        ops.files[ops.cg + '/memory.max'] = 'max'
+        with self.assertRaisesRegex(h.Rejected, 'kernel bound mismatch: memory.max'):
+            h.verify_prepared_job(p, child, pids=(1,), ops=ops, unit_properties_via_dbus=True)
+
+    def test_dbus_rebind_keeps_service_identity_and_policy_checks_strict(self):
+        cases = (
+            ('DevicePolicy', 'auto', 'unit property mismatch: DevicePolicy'),
+            ('ControlGroup', '/foreign', 'unit property mismatch: ControlGroup'),
+            ('MainPID', '702', 'transient MainPID identity mismatch'),
+            ('InvocationID', 'c' * 32, 'invocation identity mismatch'),
+        )
+        for property_name, changed_value, reason in cases:
+            with self.subTest(property=property_name):
+                h, p, ops = fixture()
+                ready = h.prepare_owned_job(p, ops=ops)
+                command_start = len(ops.commands)
+                parent_namespace = ops.namespace('self', 'mnt')
+                ops.clone_mount_namespace()
+                ops.pid = 1
+                ops.files['/proc/1/cgroup'] = ops.files['/proc/self/cgroup']
+                ops.systemctl_available = False
+                ops.props[property_name] = changed_value
+                with self.assertRaisesRegex(h.Rejected, reason):
+                    h.rebind_prepared_namespace(p, ready,
+                        parent_mnt_namespace=parent_namespace, ops=ops)
+                self.assertFalse(any(command[:2] == ('systemctl', 'show')
+                                     for command in ops.commands[command_start:]))
+
     def test_child_rebind_accepts_fresh_ids_and_preserves_frozen_backing_and_owner(self):
         h, p, ops = fixture()
         ready = h.prepare_owned_job(p, ops=ops)

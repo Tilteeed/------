@@ -245,7 +245,7 @@ class BoundedLabMixin(Lab):
         # After daemon exit, namespace exit and manager/cgroup absence are the
         # authoritative descendant teardown proof; stale PID numbers are not.
         resources.verify_prepared_job(self.job_plan, self.prepared_job,
-            pids=tuple(pids), container_pids=container_pids)
+            pids=tuple(pids), container_pids=container_pids, unit_properties_via_dbus=True)
         self._acceptance_stage = previous_stage
 
     def prepare_runtime(self):
