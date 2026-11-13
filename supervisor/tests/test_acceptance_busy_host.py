@@ -714,6 +714,8 @@ class PreparationTests(unittest.TestCase):
         self.assertLess(null_creation, private_dev_bind)
         self.assertLess(private_dev_bind, private_dev_remount)
         self.assertIn('--storage-driver=vfs', ready.daemon_argv)
+        self.assertEqual(ready.daemon_argv[:6],
+                         ('unshare', '--mount', '--propagation', 'private', '--', 'dockerd'))
         self.assertIn('--cgroup-parent=' + ready.container_cgroup_parent, ready.daemon_argv)
         self.assertIn('--exec-opt=native.cgroupdriver=cgroupfs', ready.daemon_argv)
         self.assertIn('--host=unix://' + p.workspace + '/docker.sock', ready.daemon_argv)

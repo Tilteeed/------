@@ -866,7 +866,10 @@ def prepare_owned_job(plan: JobPlan, *, ops=None) -> PreparedJob:
                        root + '/daemon.json', json.dumps(config, sort_keys=True) + '\n', create=True)
     _prepare_operation('config_setup', 'write_client_json', ops.write,
                        root + '/client/config.json', '{}\n', create=True)
-    daemon = ('dockerd', '--config-file=' + root + '/daemon.json', '--data-root=' + root + '/data',
+    # Docker makes its data-root shared during startup. Keep those mounts in a
+    # separate, initially private mount namespace, not the verifier's namespace.
+    daemon = ('unshare', '--mount', '--propagation', 'private', '--',
+              'dockerd', '--config-file=' + root + '/daemon.json', '--data-root=' + root + '/data',
               '--exec-root=' + root + '/exec', '--pidfile=' + root + '/dockerd.pid',
               '--host=unix://' + root + '/docker.sock', '--storage-driver=vfs',
               '--exec-opt=native.cgroupdriver=cgroupfs', '--cgroup-parent=' + plan.cgroup + '/containers',
@@ -892,7 +895,7 @@ def prepare_owned_job(plan: JobPlan, *, ops=None) -> PreparedJob:
     _prepare_operation('config_setup', 'verify_prepared_job',
                        verify_prepared_job, plan, ready, pids=(ops.pid,), ops=ops)
     # Docker validates its real configuration/flags without starting the daemon.
-    _prepare_operation('config_setup', 'validate_docker_config', ops.run, daemon + ('--validate',))
+    _prepare_operation('config_setup', 'validate_docker_config', ops.run, daemon[5:] + ('--validate',))
     return ready
 
 

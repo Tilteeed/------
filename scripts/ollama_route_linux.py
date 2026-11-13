@@ -30,11 +30,12 @@ CLEANUP_FAILURE_OPERATIONS = frozenset((
     'remove_owned_container', 'remove_owned_network', 'verify_daemon_empty',
     'stop_holder', 'stop_lab_process', 'delete_owned_link', 'cleanup_workspace',
     'verify_ollama_policy_absent', 'verify_proxy_policy_absent', 'verify_links_absent',
+    'verify_cleanup_resources', 'cleanup_recovery',
 ))
 CLEANUP_FAILURE_REASONS = frozenset((
     'operation_failed', 'os_error', 'timeout', 'readback_failed',
     'firewall_operation_failed', 'policy_present', 'resources_present',
-    'process_still_alive',
+    'process_still_alive', 'invariant_failed',
 ))
 CLEANUP_LINK_SUBSTAGES = frozenset((
     'list_links', 'delete_link', 'verify_after_delete_failure',

@@ -20,7 +20,7 @@ from scripts import ollama_route_acceptance as route
 from scripts import proxy_packet_acceptance as base
 from scripts.ollama_route_linux import (
     CLEANUP_FAILURE_OPERATIONS, CLEANUP_FAILURE_REASONS,
-    CLEANUP_LINK_SUBSTAGES, CLEANUP_LINK_TYPES, Lab,
+    CLEANUP_LINK_SUBSTAGES, CLEANUP_LINK_TYPES, CleanupFailure, Lab,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -322,6 +322,45 @@ class BoundedLabMixin(Lab):
     prepared_job: resources.PreparedJob
     managed_containerd_pid: int | None
 
+    def cleanup(self):
+        try:
+            self.resource_check()
+        except Exception as initial_error:
+            def failure(operation, error, reason):
+                name = type(error).__name__
+                if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', name) is None:
+                    name = 'Exception'
+                number = getattr(error, 'errno', None)
+                if type(number) is not int or not 0 <= number <= 65535:
+                    number = None
+                return dict(operation=operation, exception=name, reason=reason, errno=number)
+
+            failures = [failure('verify_cleanup_resources', initial_error, 'invariant_failed')]
+            try:
+                self.guard()
+            except Exception as error:
+                failures.append(failure('cleanup_recovery', error, 'operation_failed'))
+                raise CleanupFailure(failures) from None
+            # These are direct child process objects recorded by this lab.
+            # No Docker, nftables or network command runs without rechecking
+            # the full resource invariants in the normal cleanup path.
+            for process in reversed(self.processes):
+                operation = ('stop_holder' if any(process is holder
+                             for holder in getattr(self, 'holders', {}).values())
+                             else 'stop_lab_process')
+                try:
+                    route.stop(process)
+                except Exception as error:
+                    failures.append(failure(operation, error, 'operation_failed'))
+            try:
+                super().cleanup()
+            except CleanupFailure as error:
+                failures.extend(error.cleanup_failures)
+            except Exception as error:
+                failures.append(failure('cleanup_recovery', error, 'operation_failed'))
+            raise CleanupFailure(failures) from None
+        return super().cleanup()
+
     def resource_check(self, *, container_pids=()):
         previous_stage = getattr(self, '_acceptance_stage', 'resource_verification')
         self._acceptance_stage = 'resource_verification'
@@ -373,6 +412,10 @@ class BoundedLabMixin(Lab):
         return process
 
     def verify_daemon_ready(self):
+        daemon_mount = os.readlink('/proc/' + str(self.daemon.pid) + '/ns/mnt')
+        if (re.fullmatch(r'mnt:\[[1-9][0-9]*\]', daemon_mount) is None
+                or daemon_mount == self.prepared_job.mount_namespace):
+            raise RuntimeError('Private daemon mount namespace proof failed')
         info = route.strict_json(self.dc(['info', '--format', '{{json .}}']))
         if (info.get('CgroupDriver') != 'cgroupfs' or info.get('CgroupVersion') != '2'
                 or info.get('Driver') != 'vfs'

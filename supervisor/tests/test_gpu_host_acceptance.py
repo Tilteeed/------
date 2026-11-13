@@ -292,6 +292,58 @@ class JobBoundaryTests(unittest.TestCase):
         self.assertEqual(verify.call_args.kwargs['pids'], (api.os.getpid(),))
         self.assertTrue(verify.call_args.kwargs['unit_properties_via_dbus'])
 
+    def test_daemon_readiness_rejects_unisolated_or_malformed_mount_namespace(self):
+        from unittest.mock import Mock, patch
+        from types import SimpleNamespace
+        api = importlib.import_module('scripts.gpu_acceptance_job')
+        lab = object.__new__(api.BoundedLabMixin)
+        lab.daemon = SimpleNamespace(pid=123)
+        lab.prepared_job = SimpleNamespace(mount_namespace='mnt:[42]')
+        lab.dc = Mock()
+        for mount in ('mnt:[42]', 'invalid'):
+            with self.subTest(mount=mount), patch.object(api.os, 'readlink', return_value=mount):
+                with self.assertRaisesRegex(RuntimeError, 'mount namespace proof failed'):
+                    lab.verify_daemon_ready()
+                lab.dc.assert_not_called()
+
+    def test_cleanup_stops_owned_children_after_resource_failure_and_still_fails_closed(self):
+        from unittest.mock import Mock, patch
+        api = importlib.import_module('scripts.gpu_acceptance_job')
+        events = []
+
+        lab = object.__new__(api.BoundedLabMixin)
+        child = object()
+        lab.processes, lab.holders = [child], {}
+        lab.resource_check = Mock(side_effect=RuntimeError('private detail'))
+        lab.guard = Mock(side_effect=lambda: events.append('boundary'))
+        with patch.object(api.route, 'stop', side_effect=lambda p: events.append('stop')), \
+             patch.object(api.Lab, 'cleanup', side_effect=lambda: events.append('guarded_cleanup')):
+            with self.assertRaises(api.CleanupFailure) as caught:
+                lab.cleanup()
+        self.assertEqual(events, ['boundary', 'stop', 'guarded_cleanup'])
+        self.assertEqual(caught.exception.cleanup_failures, ({
+            'operation': 'verify_cleanup_resources', 'exception': 'RuntimeError',
+            'reason': 'invariant_failed', 'errno': None,
+        },))
+        self.assertTrue(api._valid_cleanup_diagnostics(list(caught.exception.cleanup_failures)))
+        self.assertNotIn('private detail', str(caught.exception))
+
+    def test_cleanup_does_not_run_recovery_if_namespace_guard_fails(self):
+        from unittest.mock import Mock, patch
+        api = importlib.import_module('scripts.gpu_acceptance_job')
+
+        lab = object.__new__(api.BoundedLabMixin)
+        lab.processes, lab.holders = [object()], {}
+        lab.resource_check = Mock(side_effect=RuntimeError('resource failure'))
+        lab.guard = Mock(side_effect=RuntimeError('boundary failure'))
+        with patch.object(api.route, 'stop') as stop, patch.object(api.Lab, 'cleanup') as parent_cleanup:
+            with self.assertRaises(api.CleanupFailure) as caught:
+                lab.cleanup()
+        stop.assert_not_called()
+        parent_cleanup.assert_not_called()
+        self.assertEqual([item['operation'] for item in caught.exception.cleanup_failures],
+                         ['verify_cleanup_resources', 'cleanup_recovery'])
+
     def test_resource_preparation_precedes_namespace_entry(self):
         from supervisor.tests.test_acceptance_busy_host import fixture
         api = importlib.import_module('scripts.gpu_acceptance_job')
