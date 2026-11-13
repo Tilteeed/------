@@ -193,9 +193,29 @@ class LinuxOps:
         self.invocation_id = os.environ.get('INVOCATION_ID', '')
 
     def read(self, path):
+        import errno
         import os
-        with open(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), 'rb', closefd=True) as stream:
-            data = stream.read(_READ_LIMIT + 1)
+        import stat
+
+        flags = os.O_RDONLY | os.O_NOFOLLOW
+        try:
+            fd = os.open(path, flags)
+        except OSError as error:
+            if path != '/etc/os-release' or error.errno != errno.ELOOP:
+                raise
+            # Ubuntu ships /etc/os-release as this canonical relative symlink.
+            # Follow only that known target, then open it with O_NOFOLLOW too.
+            target = os.readlink(path)
+            if target not in ('../usr/lib/os-release', '/usr/lib/os-release'):
+                raise Rejected('unsupported /etc/os-release symlink target') from None
+            fd = os.open('/usr/lib/os-release', flags)
+        try:
+            if path == '/etc/os-release':
+                _need(stat.S_ISREG(os.fstat(fd).st_mode), 'OS release file must be regular')
+            with os.fdopen(fd, 'rb', closefd=False) as stream:
+                data = stream.read(_READ_LIMIT + 1)
+        finally:
+            os.close(fd)
         _need(len(data) <= _READ_LIMIT, 'readback exceeds diagnostic bound')
         return data.decode('utf-8', 'strict')
 
