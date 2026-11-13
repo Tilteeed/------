@@ -204,6 +204,12 @@ class SyntheticLinux:
         if argv[:2] == ('systemctl', 'list-units'):
             return self.unit_listing
         if argv[:2] == ('systemctl', 'list-unit-files'):
+            if '--' in argv and not any(
+                row.split() and row.split()[0] == self.plan.unit
+                for row in self.file_listing.splitlines()
+            ):
+                # systemctl list-unit-files <missing-unit> exits with status 1.
+                raise self.h.Rejected('diagnostic command failed: systemctl')
             return self.file_listing
         if argv[:2] == ('systemctl', 'show'):
             return '\n'.join(k + '=' + v for k, v in self.props.items())
@@ -540,9 +546,21 @@ class PublicAPITests(unittest.TestCase):
 
     def test_absence_check_rejects_loaded_or_installed_unit(self):
         h, p, ops = fixture()
-        ops.unit_listing, ops.file_listing = '', ''
+        similar_name = p.unit[:-8] + '-other.service'
+        ops.unit_listing = ''
+        ops.file_listing = f'{similar_name} static\nother.service enabled\n'
         h.assert_unit_absent(p, ops=ops)
-        for loaded, installed in [('acceptance exists', ''), ('', 'installed static')]:
+        self.assertEqual(
+            ops.commands,
+            [
+                ('systemctl', 'list-units', '--all', '--full', '--no-legend', '--no-pager', '--', p.unit),
+                ('systemctl', 'list-unit-files', '--all', '--full', '--no-legend', '--no-pager'),
+            ],
+        )
+        for loaded, installed in [
+            (f'{p.unit} loaded active running', ''),
+            ('', f'{p.unit} static'),
+        ]:
             ops.unit_listing, ops.file_listing = loaded, installed
             with self.subTest(loaded=loaded, installed=installed), self.assertRaises(h.Rejected):
                 h.assert_unit_absent(p, ops=ops)

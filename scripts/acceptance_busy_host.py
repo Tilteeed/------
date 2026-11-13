@@ -135,9 +135,25 @@ def assert_unit_absent(plan: JobPlan, *, ops=None) -> None:
     name. This API does not start anything or mutate manager configuration.
     """
     ops = LinuxOps() if ops is None else ops
-    for action in ('list-units', 'list-unit-files'):
-        argv = ('systemctl', action, '--all', '--full', '--no-legend', '--no-pager', '--', plan.unit)
-        _need(not ops.run(argv).strip(), 'unit name already loaded or installed')
+    loaded = ops.run((
+        'systemctl', 'list-units', '--all', '--full',
+        '--no-legend', '--no-pager', '--', plan.unit,
+    ))
+    _need(not loaded.strip(), 'unit name already loaded')
+
+    # list-unit-files <unknown-name> exits with code 1, which is expected for
+    # a fresh UUID. Enumerate installed units and compare the unit-name column.
+    installed = ops.run((
+        'systemctl', 'list-unit-files', '--all', '--full',
+        '--no-legend', '--no-pager',
+    ))
+    _need(
+        not any(
+            row.split() and row.split()[0] == plan.unit
+            for row in installed.splitlines()
+        ),
+        'unit name already installed',
+    )
 
 
 # Diagnostic limits, not workload resource defaults.

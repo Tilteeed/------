@@ -117,6 +117,12 @@ caller Docker/network mutation is used.
 
 ## Local corrections and remaining kernel acceptance
 
+The unsolicited endpoint-to-Gateway NEW-connection probe binds the endpoint
+address, but does not pin TCP source port 11434. Its failure alone therefore
+does not independently demonstrate the `established` guard for that exact
+service-port tuple; renderer/readback and portable regressions are not a
+substitute for this specific real-packet negative case.
+
 The production Ollama manifest now uses the same stable chain grouping as the
 production adapter and base proxy manifest. A RED→GREEN portable comparison
 checks exact adapter normalization and preserves allow-before-deny order inside
