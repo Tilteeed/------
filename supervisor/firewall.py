@@ -334,23 +334,27 @@ class NftablesAdapter:
             table, handle, chains, rules = None, None, [], []
             for item in items:
                 if type(item) is not dict or len(item) != 1:
-                    continue
+                    raise ValueError
                 kind, value = next(iter(item.items()))
-                if kind == 'metainfo':
-                    continue
                 if type(value) is not dict:
                     raise ValueError
-                if kind == 'table' and value.get('family') == family and value.get('name') == self.table_name:
-                    if table is not None:
+                if kind == 'metainfo':
+                    continue
+                # A table-scoped detail response must not hide foreign or unknown objects.
+                if kind == 'table':
+                    if (value.get('family') != family or value.get('name') != self.table_name
+                            or table is not None):
                         raise ValueError
                     handle, table = value.get('handle'), self._without_handle(value)
-                elif value.get('family') == family and value.get('table') == self.table_name:
+                elif kind in {'chain', 'rule'}:
+                    if value.get('family') != family or value.get('table') != self.table_name:
+                        raise ValueError
                     if kind == 'chain':
                         chains.append(self._without_handle(value))
-                    elif kind == 'rule':
-                        rules.append(self._normalise_rule(self._without_handle(value)))
                     else:
-                        raise ValueError
+                        rules.append(self._normalise_rule(self._without_handle(value)))
+                else:
+                    raise ValueError
             if type(handle) is not int or handle <= 0 or table is None:
                 raise ValueError
             manifest = {'tables': {family: {
@@ -385,6 +389,8 @@ class NftablesAdapter:
                 return 'ether type'
             if item['protocol'] == 'tcp' and item['field'] in {'dport', 'sport'}:
                 return 'tcp ' + item['field']
+            if item['protocol'] == 'arp' and item['field'] in {'saddr ip', 'daddr ip', 'operation'}:
+                return 'arp ' + item['field']
         if key == 'ct' and type(item) is dict and set(item) == {'key'} and item['key'] == 'state':
             return 'ct state'
         raise ValueError
@@ -418,6 +424,12 @@ class NftablesAdapter:
                     raise ValueError
             elif lvalue in {'tcp dport', 'tcp sport'}:
                 if type(right) is not int or not 1 <= right <= 65535:
+                    raise ValueError
+            elif lvalue in {'arp saddr ip', 'arp daddr ip'}:
+                if type(right) is not str or str(ipaddress.IPv4Address(right)) != right:
+                    raise ValueError
+            elif lvalue == 'arp operation':
+                if type(right) is not str or right not in {'request', 'reply'}:
                     raise ValueError
             elif lvalue == 'ct state':
                 if right != 'established':

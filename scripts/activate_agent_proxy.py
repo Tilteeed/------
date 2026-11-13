@@ -8,12 +8,15 @@ import argparse
 import os
 from pathlib import Path
 import re
+import secrets
 import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from scripts import proxy_packet_acceptance as contract
+from scripts.ollama_route_acceptance import command, strict_json
 from supervisor.firewall_acceptance import (
     build_firewall_acceptance_receipt,
     machine_id_sha256,
@@ -25,17 +28,12 @@ _IMAGE = re.compile(r'sha256:[0-9a-f]{64}\Z')
 
 
 def _run_check(label, argv):
-    # Child harnesses bound their Docker/nft commands. Do not impose an outer
-    # kill timeout: interrupting a child would bypass its cleanup path.
+    # Reuse the bounded pipe/process helper. Allow the private wrapper's 600s
+    # namespace deadline plus teardown time before this outer fail-safe expires.
     try:
-        result = subprocess.run(
-            argv, cwd=ROOT, stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            shell=False, check=False)
-    except OSError:
-        raise RuntimeError(label + ' could not start') from None
-    if result.returncode != 0:
-        raise RuntimeError(label + ' failed; no acceptance receipt was written')
+        return strict_json(command(argv, timeout=660))
+    except (OSError, RuntimeError, ValueError, RecursionError, subprocess.SubprocessError):
+        raise RuntimeError(label + ' failed or returned invalid JSON; no acceptance receipt was written') from None
 
 
 def main(argv=None):
@@ -46,6 +44,8 @@ def main(argv=None):
                         help='Second explicit, disjoint RFC1918 IPv4 pool')
     parser.add_argument('--probe-image', required=True,
                         help='Already-local immutable sha256 image; never pulled')
+    parser.add_argument('--image-archive', required=True,
+                        help='Explicit local image archive for the private daemon; never pulled')
     parser.add_argument('--state-dir', default='/var/lib/personal-agent-supervisor',
                         help='Root-controlled Supervisor state directory')
     parser.add_argument('--execute', action='store_true',
@@ -59,27 +59,33 @@ def main(argv=None):
     if _IMAGE.fullmatch(args.probe_image) is None:
         parser.error('--probe-image must be an immutable sha256 digest')
     try:
+        archive = Path(args.image_archive)
+        if not archive.is_absolute() or not archive.is_file() or archive.is_symlink():
+            raise ValueError('Explicit existing absolute image archive required (no symlinks or pulls)')
         validate_acceptance_state_path(args.state_dir)
         # Reuse the receipt's strict pool validator before running privileged probes.
         build_firewall_acceptance_receipt(
             '0' * 64, args.agent_pool, args.frontend_pool, accepted_at_unix=1)
         host_digest = machine_id_sha256()
-        _run_check('isolated Linux route/nftables acceptance', [
-            sys.executable, str(ROOT / 'scripts' / 'linux_proxy_isolated_check.py'),
-            '--agent-pool', args.agent_pool,
-            '--frontend-pool', args.frontend_pool,
-        ])
-        print('PASS: isolated Linux route/nftables acceptance')
-        _run_check('live Docker packet-isolation acceptance', [
-            sys.executable, str(ROOT / 'scripts' / 'linux_docker_proxy_acceptance.py'),
-            '--agent-pool', args.agent_pool,
-            '--frontend-pool', args.frontend_pool,
-            '--probe-image', args.probe_image,
-            '--execute', '--confirm-disposable-host',
-        ])
-        print('PASS: live Docker packet-isolation acceptance')
-        if machine_id_sha256() != host_digest:
-            raise ValueError('Host identity changed during acceptance; no receipt written')
+        config = contract.binding(args.agent_pool, args.frontend_pool, host_digest)
+        caller = str(os.stat('/proc/self/ns/net').st_ino)
+        for check in contract.CHECKS:
+            run_id = secrets.token_hex(16)
+            child = [sys.executable, str(ROOT / 'scripts' / (check + '.py')),
+                     '--agent-pool', args.agent_pool,
+                     '--frontend-pool', args.frontend_pool,
+                     '--execute', '--confirm-disposable-host', '--run-id', run_id]
+            if check == 'linux_docker_proxy_acceptance':
+                child += ['--probe-image', args.probe_image, '--image-archive', args.image_archive]
+            report = contract.validate_report(_run_check(check, child), config, check, run_id)
+            if (report['caller_netns_inode'] != caller
+                    or str(os.stat('/proc/self/ns/net').st_ino) != caller
+                    or machine_id_sha256() != host_digest):
+                raise ValueError('Caller namespace or host identity changed; no receipt written')
+            print('PASS: ' + check)
+        if (machine_id_sha256() != host_digest
+                or str(os.stat('/proc/self/ns/net').st_ino) != caller):
+            raise ValueError('Caller namespace or host identity changed; no receipt written')
         receipt = write_firewall_acceptance_receipt(
             args.state_dir, args.agent_pool, args.frontend_pool,
             expected_host_id_sha256=host_digest)

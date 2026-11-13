@@ -5,8 +5,10 @@ has been produced.** Portable tests validate contracts, rejection and argv only.
 
 **Not authorized for an in-use GPU server.** Do not supply
 `--confirm-disposable-host` on a host with existing workloads. The base proxy
-Docker check and the route private-daemon check have different safety boundaries;
-neither is an approved busy-host procedure. See
+and route checks now both use private labs, but these disposable entrypoints
+are not approved busy-host procedures. The separate `gpu_host_acceptance.py`
+connects the bounded job and dual-candidate workflow; its real Linux path is
+still unaccepted. See
 [the GPU-host acceptance proposal](GPU_HOST_ACCEPTANCE_PLAN.md) for the separate,
 unapproved staged plan, resource/isolation prerequisites and receipt boundaries.
 A disposable VM receipt must not be transferred or rebound to the GPU host.
@@ -82,7 +84,8 @@ routes are added in independently proven container namespaces so even internal
 Sidecar networks have reachable negative controls; absence of a route cannot
 masquerade as a firewall pass.
 
-Each check executes 22 HTTP-over-TCP probes, including successful exact Ollama
+Each route check executes 44 HTTP-over-TCP probes across routed and host-local
+topologies, including successful exact Ollama
 requests with complete nonce-bound multi-packet response bodies, wrong port,
 foreign destination, host access, other Gateway/Sidecar, Sidecar-to-Ollama,
 unsolicited reverse connections, both allowed local agent/frontend pairs, and
@@ -117,18 +120,23 @@ caller Docker/network mutation is used.
 The production Ollama manifest now uses the same stable chain grouping as the
 production adapter and base proxy manifest. A RED→GREEN portable comparison
 checks exact adapter normalization and preserves allow-before-deny order inside
-each chain. No readback relaxation or nft rule allowance was added. Docker
+each chain. That serialization correction adds no rule allowance and does not
+relax readback; the separate version-2 ARP correction is described below. Docker
 inspection accepts only absent/empty/null default `IPAM.Options` in addition to
 exact required creation fields; foreign IPAM options, labels or addresses fail.
 
 Every allowed enforced transaction also starts with flushed IPv4 neighbour
 caches in the isolated router, targets and clients. Structured reports must
 include that evidence. This prevents unenforced controls from hiding a cold-path
-ARP problem. The current route bridge's input/output drop rules have no explicit
-ARP exception; the cold-path run may therefore expose a real policy failure.
-Do not add permanent neighbour entries or weaken a check to obtain a receipt:
-that case must remain FAIL until the production policy is separately corrected
-and the complete real acceptance is rerun.
+ARP problem. Route policy version 2 now permits only exact Gateway/router ARP
+request/reply pairs on the owned bridge input/output path; other ARP peers and
+forwarding remain denied. Old version-1 route receipts no longer match. This
+has synthetic negative/renderer regressions, not a real cold-path PASS.
+The same endpoint is moved to the isolated router loopback for a separate
+host-local matrix with actual address/local-route readback and unsolicited
+host-local reverse controls. Do not add permanent neighbour entries or weaken
+a check to obtain a receipt: any kernel failure remains FAIL until its actual
+cause is corrected and complete real acceptance is rerun.
 
 Real namespace/nftables/Docker behavior, including namespace permissions,
 installed nft syntax and nested runtime/cgroup support, still requires an

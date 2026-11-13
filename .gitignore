@@ -18,3 +18,5 @@ htmlcov/
 .DS_Store
 # Private GPU-server inventory; local only, never commit host-specific data.
 /docs/GPU_SERVER_PRIVATE.md
+/docs/GPU_DEPLOYMENT_PRIVATE.md
+/supervisor/gpu-acceptance.local.json

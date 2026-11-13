@@ -189,100 +189,49 @@ class FirewallAcceptanceReceiptTests(unittest.TestCase):
 
     def test_linux_precheck_forwards_the_same_explicit_pools_into_netns(self):
         from scripts import linux_proxy_isolated_check as precheck
-        process = SimpleNamespace(
-            returncode=0, communicate=lambda timeout: (b'PASS: isolated', None))
-        with (
-            patch.object(precheck.sys, 'platform', 'linux'),
-            patch.object(precheck.shutil, 'which', return_value='/usr/bin/mock'),
-            patch.object(precheck.os, 'stat', return_value=SimpleNamespace(st_ino=77)),
-            patch.object(precheck.subprocess, 'Popen', return_value=process) as popen,
-        ):
-            self.assertEqual(precheck._new_network_namespace(
-                self.AGENT_POOL, self.FRONTEND_POOL), 'PASS: isolated')
-        argv = popen.call_args.args[0]
-        self.assertEqual(argv[argv.index('--agent-pool') + 1], self.AGENT_POOL)
-        self.assertEqual(argv[argv.index('--frontend-pool') + 1], self.FRONTEND_POOL)
+        argv = ['--agent-pool', self.AGENT_POOL, '--frontend-pool', self.FRONTEND_POOL,
+                '--execute', '--confirm-disposable-host']
+        # The public wrapper now delegates to the guarded private namespace
+        # transport. No removed host-network helper is resurrected for a test.
+        with patch.object(precheck, 'private_main', return_value=0) as private:
+            self.assertEqual(precheck.main(argv), 0)
+        forwarded = private.call_args.args[0]
+        self.assertEqual(forwarded[forwarded.index('--agent-pool') + 1], self.AGENT_POOL)
+        self.assertEqual(forwarded[forwarded.index('--frontend-pool') + 1], self.FRONTEND_POOL)
+        self.assertEqual(private.call_args.kwargs, {'docker': False})
 
     def test_linux_precheck_passes_explicit_pools_to_namespace_runner(self):
-        import contextlib
-        import io
         from scripts import linux_proxy_isolated_check as precheck
-        output = io.StringIO()
-        with (
-            patch.object(precheck.sys, 'platform', 'linux'),
-            patch.object(precheck, '_new_network_namespace', return_value='PASS') as run_namespace,
-            contextlib.redirect_stdout(output),
-        ):
-            status = precheck.main([
-                '--agent-pool', self.AGENT_POOL,
-                '--frontend-pool', self.FRONTEND_POOL,
-            ])
-        self.assertEqual(status, 0)
-        run_namespace.assert_called_once_with(self.AGENT_POOL, self.FRONTEND_POOL)
+        argv = ['--agent-pool', self.AGENT_POOL, '--frontend-pool', self.FRONTEND_POOL,
+                '--execute', '--confirm-disposable-host']
+        with patch.object(precheck, 'private_main', return_value=1) as private:
+            self.assertEqual(precheck.main(argv), 1)
+        private.assert_called_once_with(argv, docker=False)
 
     def test_activation_script_records_receipt_only_after_both_checks_pass(self):
-        import contextlib
-        import io
-        from pathlib import Path
-        from scripts import activate_agent_proxy
-        events = []
-        commands = []
-        def run_check(label, argv):
-            events.append(label)
-            commands.append(argv)
-        def write_receipt(*_args, **_kwargs):
-            events.append('receipt')
-            return Path('/var/lib/personal-agent-supervisor/firewall-acceptance.json')
-        output = io.StringIO()
-        with (
-            patch.object(activate_agent_proxy.sys, 'platform', 'linux'),
-            patch.object(activate_agent_proxy.os, 'geteuid', return_value=0, create=True),
-            patch.object(activate_agent_proxy, 'validate_acceptance_state_path'),
-            patch.object(activate_agent_proxy, 'machine_id_sha256', return_value=self.HOST),
-            patch.object(activate_agent_proxy, '_run_check', side_effect=run_check),
-            patch.object(activate_agent_proxy, 'write_firewall_acceptance_receipt',
-                         side_effect=write_receipt),
-            contextlib.redirect_stdout(output),
-        ):
-            status = activate_agent_proxy.main([
-                '--agent-pool', self.AGENT_POOL,
-                '--frontend-pool', self.FRONTEND_POOL,
-                '--probe-image', 'sha256:' + 'c' * 64,
-                '--execute', '--confirm-disposable-host',
-            ])
+        from supervisor.tests.test_activate_agent_proxy import SyntheticActivationTests
+        synthetic = SyntheticActivationTests(methodName='runTest')
+        status, commands, writer, archive = synthetic.invoke()
         self.assertEqual(status, 0)
-        self.assertEqual(events, [
-            'isolated Linux route/nftables acceptance',
-            'live Docker packet-isolation acceptance', 'receipt',
-        ])
         self.assertEqual(len(commands), 2)
+        writer.assert_called_once()
+        requested = synthetic.argv()
         for command in commands:
-            self.assertEqual(command[command.index('--agent-pool') + 1], self.AGENT_POOL)
-            self.assertEqual(command[command.index('--frontend-pool') + 1], self.FRONTEND_POOL)
+            for flag in ('--agent-pool', '--frontend-pool'):
+                self.assertEqual(command[command.index(flag) + 1], requested[requested.index(flag) + 1])
+            self.assertIn('--execute', command)
+            self.assertIn('--confirm-disposable-host', command)
+        self.assertEqual(commands[1][commands[1].index('--image-archive') + 1], archive)
 
     def test_activation_script_never_records_receipt_after_a_failed_check(self):
-        import contextlib
-        import io
-        from scripts import activate_agent_proxy
-        output = io.StringIO()
-        with (
-            patch.object(activate_agent_proxy.sys, 'platform', 'linux'),
-            patch.object(activate_agent_proxy.os, 'geteuid', return_value=0, create=True),
-            patch.object(activate_agent_proxy, 'validate_acceptance_state_path'),
-            patch.object(activate_agent_proxy, 'machine_id_sha256', return_value=self.HOST),
-            patch.object(activate_agent_proxy, '_run_check',
-                         side_effect=[None, RuntimeError('synthetic failed check')]),
-            patch.object(activate_agent_proxy, 'write_firewall_acceptance_receipt') as writer,
-            contextlib.redirect_stdout(output),
-            contextlib.redirect_stderr(output),
-        ):
-            status = activate_agent_proxy.main([
-                '--agent-pool', self.AGENT_POOL,
-                '--frontend-pool', self.FRONTEND_POOL,
-                '--probe-image', 'sha256:' + 'c' * 64,
-                '--execute', '--confirm-disposable-host',
-            ])
+        from supervisor.tests.test_activate_agent_proxy import SyntheticActivationTests
+        synthetic = SyntheticActivationTests(methodName='runTest')
+        def failed_second_check(report, index):
+            if index == 1:
+                report['cleanup'] = False
+        status, commands, writer, _ = synthetic.invoke(mutate=failed_second_check)
         self.assertEqual(status, 1)
+        self.assertEqual(len(commands), 2)
         writer.assert_not_called()
 
     def test_configure_requires_receipt_before_selecting_agent_proxy_default(self):

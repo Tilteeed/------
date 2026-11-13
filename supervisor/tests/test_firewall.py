@@ -124,6 +124,49 @@ class NftablesAdapterTests(unittest.TestCase):
         drift['enabled'] = True
         self.assertNotEqual(adapter.read(), expected)
 
+    def test_table_readback_rejects_objects_that_would_be_silently_omitted(self):
+        from supervisor.ollama_firewall import expected_ollama_ruleset
+        from supervisor.tests.test_ollama_firewall import route
+
+        # Entirely synthetic JSON, not an installed nft/kernel serialization.
+        manifests = (expected_ruleset((network(),)), expected_ollama_ruleset((route(),)))
+        for desired in manifests:
+            for family, table in desired['tables'].items():
+                name = table['table']['name']
+                adapter = NftablesAdapter(table_name=name)
+                objects = [
+                    {'metainfo': {'json_schema_version': 1}},
+                    {'table': {**table['table'], 'handle': 17}},
+                    *({'chain': {**chain, 'handle': i + 30}}
+                      for i, chain in enumerate(table['chains'])),
+                    *({'rule': {**rule, 'handle': i + 100, 'index': i}}
+                      for i, rule in enumerate(table['rules'])),
+                ]
+                observed, handle = adapter._normalise_table(
+                    json.dumps({'nftables': objects}), family)
+                self.assertEqual(observed['tables'][family], table)
+                self.assertEqual(handle, 17)
+                wrong_family = 'bridge' if family == 'inet' else 'inet'
+                invalid_objects = (
+                    None, [], 'unknown', {},
+                    {'rule': {**table['rules'][0]}, 'unknown': {}},
+                    {'metainfo': None},
+                    {'unknown': {}},
+                    {'unknown': {'family': family, 'table': name}},
+                    {'rule': {'expr': [{'accept': None}]}},
+                    {'rule': {**table['rules'][0], 'family': wrong_family}},
+                    {'rule': {**table['rules'][0], 'table': 'foreign'}},
+                    {'chain': {**table['chains'][0], 'family': wrong_family}},
+                    {'chain': {**table['chains'][0], 'table': 'foreign'}},
+                    {'table': {**table['table'], 'family': wrong_family, 'handle': 18}},
+                    {'table': {**table['table'], 'name': 'foreign', 'handle': 18}},
+                )
+                for extra in invalid_objects:
+                    with self.subTest(table=name, family=family, extra=extra):
+                        with self.assertRaises(FirewallError):
+                            adapter._normalise_table(
+                                json.dumps({'nftables': [*objects, extra]}), family)
+
     def test_nft_readback_normalises_prefix_objects_for_ip_source_and_destination(self):
         adapter = NftablesAdapter()
         expected, handle = adapter._normalise_table(

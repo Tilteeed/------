@@ -1,8 +1,8 @@
 # Проект безопасной приёмки на используемом GPU-сервере
 
-**Статус: проект для согласования. Режим приёмки на занятом хосте НЕ реализован и НЕ разрешён к запуску этим документом.**
+**Статус: код busy-host цепочки подключён локально; настоящая Linux/Docker приёмка НЕ выполнена. Документ остаётся проектом для согласования, не разрешением на запуск на занятом сервере.**
 
-Основание: локальное чтение исходников на `main`, HEAD `819d0d1aea7599879abbab7d3a9e90262687d83b`. Конфигурация GPU-сервера не обследовалась; SSH, firewall inspection, запуск Docker/nftables, обращение к Ollama и системные изменения не выполнялись.
+Исходная версия плана опиралась на `main`, HEAD `819d0d1aea7599879abbab7d3a9e90262687d83b`; описание текущей локальной доработки обновлено ниже. Конфигурация GPU-сервера повторно не обследовалась; SSH, firewall inspection, запуск Docker/nftables, обращение к Ollama и системные изменения не выполнялись.
 
 Цель: сначала подтвердить сетевую семантику на отдельном одноразовом Linux-стенде, затем разработать и отдельно согласовать ограниченный режим приёмки на фактическом GPU-хосте. Проверка не должна изменять рабочие Docker-объекты, Ollama, действующие правила/маршруты/интерфейсы, DB, пользовательские каталоги и квоты.
 
@@ -10,19 +10,19 @@
 
 | Механизм | Что делает текущий код | Решение для используемого GPU-сервера |
 |---|---|---|
-| `activate_agent_proxy.py` → `linux_proxy_isolated_check.py` + `linux_docker_proxy_acceptance.py` | Второй check вызывает обычный `docker` без принудительного отдельного daemon socket, создаёт тестовые Docker-объекты и использует `NftablesAdapter()` в окружении вызывающего процесса | Непригоден без доработки: тест может обратиться к рабочему Docker/context и caller nftables |
+| `activate_agent_proxy.py` → `linux_proxy_isolated_check.py` + `linux_docker_proxy_acceptance.py` | Оба checks переведены на независимую proxy-only private lab; Docker check использует отдельный daemon/socket и явный image archive; disposable оркестратор валидирует JSON evidence | Disposable opt-in не разрешает запуск на занятом хосте; для него предназначен отдельный resource-bounded entrypoint после его реальной приёмки |
 | `activate_ollama_route.py` → два route checks | Уже предусмотрены private net/mount/PID namespaces, отдельный nested daemon, socket/data-root/exec-root, локальный HTTP target и cleanup | Это не готовый busy-host режим: совокупные resource/cgroup/storage границы всего запуска и отсутствие влияния на занятый хост ещё не приняты |
 | `firewall-acceptance.json` | Независимая приёмка `agent_proxy_v1`, привязанная к fingerprint хоста и двум пулам | Не заменяется route receipt |
 | `ollama-route-acceptance.json` | Отдельная приёмка `agent_ollama_v1`, привязанная также к Ollama endpoint, интерфейсу и Ollama pool | Не заменяет base receipt |
 
-**Нельзя передавать `--confirm-disposable-host` на используемом сервере, переименовывать этот флаг ради обхода ограничения или считать отдельный Docker socket достаточным доказательством безопасности.** Сегодня согласованной команды для busy-host приёмки в проекте нет. Команды ниже намеренно не приводятся.
+**Нельзя передавать `--confirm-disposable-host` на используемом сервере, переименовывать этот флаг ради обхода ограничения или считать отдельный Docker socket достаточным доказательством безопасности.** Новый `scripts/gpu_host_acceptance.py` имеет read-only `--check-config` и отдельно закрытый `--execute --approve-busy-host --allow-host-inspection`. Он связывает четыре fixed checks с transient units, strict resource proof, private packet labs и двумя candidate receipts. `supervisor/gpu-acceptance.example.json` намеренно незаполнен и отклоняется до согласования всех полей. Наличие кода не означает Linux PASS или разрешение выполнить его здесь. Конкретный приватный runbook хранится локально в игнорируемом `docs/GPU_DEPLOYMENT_PRIVATE.md`.
 
 ## 2. Этап A — воспроизведение ARP и полная packet-приёмка на отдельном стенде
 
 1. Отдельно согласовать disposable Linux VM и её ресурсы. Создание VM на занятом GPU-сервере само по себе требует согласия; предпочтительный первый стенд — вне этого сервера. GPU passthrough и реальные модели не нужны.
 2. Выполнить обе независимые приёмки с действительными Linux namespaces, Docker и nftables. Portable/fake тесты их не заменяют.
 3. Для каждого разрешённого потока очистить neighbour caches после установки политики и проверить реальный полный HTTP/TCP обмен. Для каждого запрещённого потока требовать успешный контроль до и после BEZR enforcement, точный readback политики и ожидаемый отказ только при enforcement.
-4. Если холодный разрешённый поток не проходит, зафиксировать причину в изолированной лаборатории. Отсутствие явного ARP exception в текущих bridge input/output — известный кандидат, а не заявленный результат реального прогона.
+4. Если холодный разрешённый поток не проходит, зафиксировать причину в изолированной лаборатории. В текущем renderer добавлены узкие ARP request/reply Gateway↔router и route policy version 2; старые receipts закрыты. Это исправление проверено synthetic regressions, но реальный cold-path результат ещё не получен.
 5. Если подтверждена ошибка политики, исправлять production renderer, а не тест: определить минимально необходимые ARP request/reply для точной пары Gateway↔bridge gateway; сохранить интерфейсные, адресные и межэкземплярные границы. Добавить отрицательные проверки посторонних адресов/направлений. Не добавлять безусловное разрешение всего ARP, static neighbours или прогрев для получения PASS.
 6. После изменения политики проверить renderer/normalizer/readback, отрицательные regression tests и необходимость изменения policy version; старое доказательство не должно автоматически удостоверять изменённые правила. Повторить полную реальную приёмку обоих профилей.
 
@@ -30,10 +30,10 @@
 
 ## 3. Что нужно реализовать до этапа B на GPU-хосте
 
-Все пункты ниже — требования к будущему режиму, а не утверждение о наличии готовой реализации.
+Все пункты ниже — критерии допуска и реальной приёмки режима. Локально подключённый код не считается доказательством их выполнения на Linux.
 
 - Отдельный явно разрешаемый режим для занятого хоста. Существующий disposable gate остаётся без ослабления. Нет автоматического fallback к прежним скриптам.
-- Оба независимых набора проверок запускаются в проверяемой private лаборатории. Base Docker check необходимо адаптировать: обычные вызовы default Docker/context и caller `NftablesAdapter()` не допускаются.
+- Оба независимых набора проверок должны запускаться в проверяемой private лаборатории. Base Docker check адаптирован локально: обычные вызовы default Docker/context и caller `NftablesAdapter()` не допускаются.
 - Отдельные net/mount/PID namespaces с FD-bound проверкой типов/идентичностей до каждой мутации, private procfs и nonshared mount propagation. Не переносить физические NIC, не подключать lab veth к host namespace, не использовать host network и не публиковать host ports. Имена интерфейсов и адреса endpoint моделируются только внутри lab.
 - Все Docker CLI получают единственный явный private socket. Не наследовать рабочие `DOCKER_HOST`, context, CLI/daemon config, proxy settings, containerd socket, plugins и runtime/CDI configuration. Не монтировать production Docker socket, `/var/lib/docker` или рабочие каталоги.
 - Ограничить **весь запуск**, включая wrapper, dockerd, containerd, контейнеры, HTTP-серверы и потомков: CPU, RAM, swap, PIDs, I/O, диск/inodes и общее время. Проверять принадлежность всех процессов разрешённому subtree; контейнерных `--memory/--pids-limit` недостаточно для этого проектного требования. Если нужная делегация/контроллеры недоступны — BLOCKED, без перестройки host cgroups или перезапуска сервисов.
@@ -45,7 +45,7 @@
 
 ### Отдельное условие: host-local или routed Ollama
 
-До реализации определить фактическую топологию: Ollama IP принадлежит самому Docker-хосту или это routed destination. Текущая route lab моделирует endpoint через veth target; в production renderer существуют также host-local `inet input/output` allowances. Нельзя считать routed-only evidence доказательством host-local пути.
+Для deployment определить фактическую топологию: Ollama IP принадлежит самому Docker-хосту или это routed destination. Route lab теперь последовательно проверяет оба варианта: veth-routed endpoint и тот же exact endpoint на loopback router namespace с readback фактического local route. В production renderer существуют отдельные host-local `inet input/output` allowances. Настоящий host-local packet PASS ещё не получен; нельзя считать synthetic evidence или routed-only результат его заменой.
 
 Матрица и отчёт должны явно подтверждать выбранный вариант, включая cold-neighbour и отрицательные проверки. Если нужный вариант не покрыт — BLOCKED. Если для фиксации режима нужны новые поля отчёта/receipt, версии и строгие loaders меняются явно с негативными тестами, а не обходом текущей схемы.
 
@@ -101,7 +101,7 @@
 | Image archive и immutable image ID | Не предоставлены для этой процедуры |
 | Root-controlled candidate receipt directory | Не согласован |
 | Ответственный за run/аварийную остановку и разрешённые baseline данные | Не заданы |
-| Код и приёмка busy-host режима | Не выполнены |
+| Код и приёмка busy-host режима | Цепочка подключена локально; реальные Linux, systemd/resource и packet checks не выполнены |
 
 До закрытия этих условий итог **BLOCKED**. Согласование проекта процедуры не означает разрешения «запустить всё»; разрешения на preflight, временные системные объекты, испытания и публикацию candidate receipts должны быть явными и ограниченными.
 
@@ -114,7 +114,7 @@
 ## Основание по коду проекта
 
 - `scripts/activate_agent_proxy.py`: `main()`, `_run_check()` — два base checks и запись host-bound receipt.
-- `scripts/linux_docker_proxy_acceptance.py`: `_docker_json()`, `_plans()`, `main()` — обычный Docker CLI, caller `NftablesAdapter()`, disposable gate.
+- `scripts/linux_docker_proxy_acceptance.py`: публичный disposable wrapper независимой private proxy lab; прежние caller-Docker helpers удалены. Busy-host вход — `scripts/gpu_host_acceptance.py`, transport — `scripts/gpu_acceptance_job.py`, containment — `scripts/acceptance_busy_host.py`.
 - `scripts/ollama_route_linux.py`: `validate_lab_boundary()`, `daemon_argv()`, `Lab.guard()`, `Lab.exercise()` — существующие private-lab механизмы, но не доказанный busy-host режим.
 - `scripts/activate_ollama_route.py` — независимая route orchestration.
 - `supervisor/firewall_acceptance.py` и `supervisor/ollama_firewall.py` — строгие host/config bindings и отдельные loaders; `expected_ollama_ruleset()` содержит routed и host-local ветки, а также текущие bridge drops.

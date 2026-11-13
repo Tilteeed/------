@@ -34,6 +34,14 @@ def route(instance_id='a' * 32, subnet='10.98.0.0/29',
 
 
 class OllamaFirewallPolicyTests(unittest.TestCase):
+    def test_old_policy_receipt_fails_after_cold_arp_policy_change(self):
+        from supervisor.ollama_firewall import build_ollama_route_receipt, ollama_route_receipt_matches
+        args = ('a'*64, '10.240.0.0/13', '10.248.0.0/13', '172.20.0.0/16', '10.99.0.10', 'ens18')
+        receipt = build_ollama_route_receipt(*args, accepted_at_unix=123)
+        self.assertTrue(ollama_route_receipt_matches(receipt, *args))
+        receipt['policy_version'] = 1
+        self.assertFalse(ollama_route_receipt_matches(receipt, *args))
+
     def test_route_policy_rejects_non_rfc1918_target_and_inconsistent_network_identity(self):
         from supervisor.ollama_firewall import OllamaRoutePolicy
 

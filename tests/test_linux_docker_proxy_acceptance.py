@@ -1,8 +1,7 @@
 """Unit tests for the disposable Docker acceptance harness."""
 import unittest
-from unittest.mock import patch
-
-from scripts import linux_docker_proxy_acceptance as acceptance
+from scripts.ollama_route_acceptance import network_argv
+from scripts.ollama_route_linux import verify_network_readback
 
 
 class DockerAcceptanceNetworkTests(unittest.TestCase):
@@ -19,19 +18,14 @@ class DockerAcceptanceNetworkTests(unittest.TestCase):
             'Name': name,
             'Options': options,
             'Labels': labels,
-            'IPAM': {'Config': [ipam]},
+            'Driver': 'bridge', 'Internal': True, 'EnableIPv6': False, 'Attachable': False,
+            'IPAM': {'Driver': 'default', 'Config': [ipam]},
         }
-        observed = {
-            'Id': 'network-id', 'Name': name, 'Driver': 'bridge',
-            'Internal': True, 'EnableIPv6': False, 'Options': options,
-            'Labels': labels, 'IPAM': {'Config': [ipam]},
-        }
-        resources = {'networks': []}
-        with patch.object(acceptance, '_run', return_value='network-id') as run, \
-                patch.object(acceptance, '_docker_json', return_value=[observed]):
-            result = acceptance._network_create(payload, resources)
-
-        argv = run.call_args.args[0]
+        observed = dict(payload, Id='network-id')
+        # Exercise the actual private-daemon builder/readback, not the removed
+        # caller-Docker mutation helper. This remains synthetic evidence.
+        argv = network_argv(payload)
+        verify_network_readback(observed, 'network-id', payload)
         options_sent = [argv[index + 1] for index, arg in enumerate(argv[:-1])
                         if arg == '--opt']
         labels_sent = [argv[index + 1] for index, arg in enumerate(argv[:-1])
@@ -40,8 +34,10 @@ class DockerAcceptanceNetworkTests(unittest.TestCase):
                          [f'{key}={value}' for key, value in sorted(options.items())])
         self.assertEqual(labels_sent,
                          [f'{key}={value}' for key, value in sorted(labels.items())])
-        self.assertEqual(result, ('network-id', name))
-        self.assertEqual(resources['networks'], ['network-id'])
+        self.assertEqual(argv[-1], name)
+        self.assertIn('--internal', argv)
+        self.assertEqual(argv[argv.index('--subnet') + 1], ipam['Subnet'])
+        self.assertEqual(argv[argv.index('--gateway') + 1], ipam['Gateway'])
 
 
 if __name__ == '__main__':

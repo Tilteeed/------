@@ -26,7 +26,7 @@ OLLAMA_PORT = 11434
 TABLE_NAME = 'agent_ollama_v1'
 TABLE_COMMENT = 'BEZR managed firewall agent_ollama_v1 v1'
 OLLAMA_ROUTE_RECEIPT_FILENAME = 'ollama-route-acceptance.json'
-OLLAMA_FIREWALL_POLICY_VERSION = 1
+OLLAMA_FIREWALL_POLICY_VERSION = 2
 OLLAMA_ROUTE_REQUIRED_CHECKS = (
     'linux_ollama_route_check', 'linux_docker_ollama_route_acceptance')
 INET_PRIORITY = -20
@@ -380,6 +380,20 @@ def expected_ollama_ruleset(routes):
                     _match(_tcp('sport'), OLLAMA_PORT),
                     _match(_ct('state'), 'established'),
                 ], 'accept', comment + ' bridge output return'))
+                # Cold neighbour discovery only between this Gateway and its
+                # router address. Never allow ARP forwarding or other peers.
+                for chain, interface, source, destination in (
+                    ('input', 'ibrname', item.gateway_ip, item.gateway),
+                    ('output', 'obrname', item.gateway, item.gateway_ip),
+                ):
+                    for operation in ('request', 'reply'):
+                        rules.append(_rule(family, chain, [
+                            _match(_meta(interface), item.bridge),
+                            _match({'payload': {'protocol': 'ether', 'field': 'type'}}, 'arp'),
+                            _match({'payload': {'protocol': 'arp', 'field': 'saddr ip'}}, source),
+                            _match({'payload': {'protocol': 'arp', 'field': 'daddr ip'}}, destination),
+                            _match({'payload': {'protocol': 'arp', 'field': 'operation'}}, operation),
+                        ], 'accept', comment + ' bridge arp ' + chain + ' ' + operation))
             for item in policies:
                 rules.append(_rule(family, 'input', [
                     _match(_meta('ibrname'), item.bridge)], 'drop',

@@ -15,7 +15,7 @@
 Для нового disposable Linux/Docker-хоста сначала после отдельного согласия оператора выполнить оркестратор (A и B ниже по runbook выполняются последовательно внутри него):
 
 ```bash
-sudo python3 scripts/activate_agent_proxy.py --agent-pool <EXPLICIT_RFC1918_AGENT_TEST_POOL> --frontend-pool <EXPLICIT_RFC1918_FRONTEND_TEST_POOL> --probe-image sha256:<64_HEX_LOCAL_PYTHON3_IMAGE_ID> --state-dir /var/lib/personal-agent-supervisor --execute --confirm-disposable-host
+sudo python3 scripts/activate_agent_proxy.py --agent-pool <EXPLICIT_RFC1918_AGENT_TEST_POOL> --frontend-pool <EXPLICIT_RFC1918_FRONTEND_TEST_POOL> --probe-image sha256:<64_HEX_LOCAL_PYTHON3_IMAGE_ID> --image-archive <ABSOLUTE_OPERATOR_PROVIDED_IMAGE_ARCHIVE> --state-dir /var/lib/personal-agent-supervisor --execute --confirm-disposable-host
 ```
 
 Оркестратор требует Linux, root, уже установленный `ip`/`nft`/`unshare`/Docker и уже локальный immutable probe image; ничего не устанавливает и не скачивает. Если любой из двух проверочных этапов завершается ошибкой, новый receipt не записывается. После двух `PASS` он атомарно создаёт/обновляет `firewall-acceptance.json` с владельцем `root:root`, mode `0600`, внутри root-owned каталога `0700`. Receipt содержит только SHA256 от `/etc/machine-id` (не исходный ID), версию firewall policy, оба точных test pools и имена пройденных этапов. Копия на другой host, изменение pools или policy version закрывают gate. Это локальная root-admin attestation, а не подпись от недоверенного root.

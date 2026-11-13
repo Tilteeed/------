@@ -10,8 +10,8 @@ Runbook и скрипты подготовлены локально. Они **н
 
 ## Скрипты
 
-1. `scripts/linux_proxy_isolated_check.py` — изолированный Linux network-namespace precheck. Использует реальные `ip -j` и `nft -a -j`, synthetic Docker inspection fixture; проверяет retained routes, включая оба `/29` broadcast destinations, повторную подготовку/restore и nft JSON/readback. Не доказывает Docker data plane.
-2. `scripts/linux_docker_proxy_acceptance.py` — два синтетических owner-топология на настоящем Docker Engine. Требует уже имеющийся локально immutable `sha256:` probe image с Python 3. Создаёт только временные containers и `pa-agent-*`/`pa-front-*` internal bridges с неповторимыми instance IDs; проверяет IPAM, static IP, точные Docker labels/membership, реальные bridge routes и `_retained_proxy_network_has_foreign_host_route()`, разрешённые пары, межпользовательские/host/routed отказы и nft readback. Скрипт откажется работать, если `agent_proxy_v1` nft tables уже существуют. Внутри disposable acceptance process создаётся `FirewallManager(..., semantics_validated=True)` только для запуска проверки; source constant и production gate не меняются. Это не испытание настоящего OpenClaw/WebUI.
+1. `scripts/linux_proxy_isolated_check.py` — независимая proxy-only packet lab в private net/mount/PID namespaces, без synthetic Docker API. Реальные `ip`/`nft`, HTTP controls до/после enforcement, cold neighbour caches и строгий JSON readback; 36 потоков. Это не Docker data-plane доказательство и не прежний retained-route scaffold.
+2. `scripts/linux_docker_proxy_acceptance.py` — та же независимая матрица на настоящих контейнерах отдельного nested daemon, не caller Docker. Нужны явный image archive и immutable `sha256:` image ID с Python 3; pull запрещён. Проверяются canonical IPAM/options/labels и live membership, свои разрешённые пары и cross-owner/host/external отказы; baseline Ollama table не используется для получения base PASS. Это не испытание настоящего OpenClaw/WebUI. Проверки retained-route ownership остаются отдельными регрессиями, не заявляются результатом этой новой матрицы.
 3. `scripts/control_ui_two_user_acceptance.py` — live HTTPS API/handoff проверки двумя синтетическими BEZR-пользователями: разные owner origins, pairing list, cookie handoff, отказ чужой host-сессии и запрет браузерного доступа к Admin RPC/private pairing route. Создаёт краткоживущие BEZR Control UI sessions; запускать только на свежей тестовой БД. Токены берутся из environment, не печатаются и не записываются.
 
 ### Контракт pairing API
@@ -38,10 +38,10 @@ Gateway-интеграция закреплена на OpenClaw commit `7c124389
 В disposable VM, с правами, необходимыми для `unshare`:
 
 ```bash
-python3 scripts/linux_proxy_isolated_check.py --agent-pool <EXPLICIT_RFC1918_AGENT_TEST_POOL> --frontend-pool <EXPLICIT_RFC1918_FRONTEND_TEST_POOL>
+sudo python3 scripts/linux_proxy_isolated_check.py --agent-pool <EXPLICIT_RFC1918_AGENT_TEST_POOL> --frontend-pool <EXPLICIT_RFC1918_FRONTEND_TEST_POOL> --execute --confirm-disposable-host
 ```
 
-Ожидать явный `PASS`; скрипт сам сообщает, что Docker API в этой фазе synthetic и production gate остаётся закрыт. При несовпадении сохранить ограниченный вывод/наблюдаемые prefix objects и фактический `nft -a -j` результат. Не менять `_normalise_table()` и не ослаблять сравнение до подтверждения формата по фактическому JSON.
+Ожидать exit 0 и полный structured JSON report с controls/readback/cold-neighbour/cleanup evidence; отдельный запуск receipt не создаёт. Это настоящая namespace packet lab без Docker daemon, а не synthetic Docker API. При несовпадении сохранить ограниченный приватный вывод и фактический `nft -a -j` результат. Не ослаблять сравнение ради PASS.
 
 ### B. Настоящие Docker networks, nftables и packet isolation
 
@@ -52,6 +52,7 @@ sudo python3 scripts/linux_docker_proxy_acceptance.py \
   --agent-pool <EXPLICIT_RFC1918_AGENT_TEST_POOL> \
   --frontend-pool <EXPLICIT_RFC1918_FRONTEND_TEST_POOL> \
   --probe-image sha256:<64_HEX_LOCAL_IMAGE_ID> \
+  --image-archive <ABSOLUTE_OPERATOR_PROVIDED_IMAGE_ARCHIVE> \
   --execute --confirm-disposable-host
 ```
 
@@ -60,7 +61,7 @@ sudo python3 scripts/linux_docker_proxy_acceptance.py \
 Отдельный запуск A и B — диагностика и не записывает activation receipt. Для него выполнить оркестратор, который повторяет оба теста на том же disposable host и создаёт receipt только при двух `PASS`:
 
 ```bash
-sudo python3 scripts/activate_agent_proxy.py --agent-pool <SAME_AGENT_POOL> --frontend-pool <SAME_FRONTEND_POOL> --probe-image sha256:<64_HEX_LOCAL_IMAGE_ID> --state-dir /var/lib/personal-agent-supervisor --execute --confirm-disposable-host
+sudo python3 scripts/activate_agent_proxy.py --agent-pool <SAME_AGENT_POOL> --frontend-pool <SAME_FRONTEND_POOL> --probe-image sha256:<64_HEX_LOCAL_IMAGE_ID> --image-archive <ABSOLUTE_OPERATOR_PROVIDED_IMAGE_ARCHIVE> --state-dir /var/lib/personal-agent-supervisor --execute --confirm-disposable-host
 ```
 
 Если любой этап завершается ошибкой, новая запись не создаётся. Receipt привязан к SHA256 machine-id, policy version и точным pools; после него `configure_supervisor.py` может принять `--network-profile-default agent_proxy_v1`, но только с теми же pools и явным Control UI domain. Это открывает только firewall semantics gate, не завершает C/D и не подтверждает production UI.

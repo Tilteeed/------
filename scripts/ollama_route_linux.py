@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 from scripts.ollama_route_acceptance import (
-    CHECKS, binding, command, make_plan, network_argv, network_specs, proxy_policy, new_report, stop,
+    CHECKS, TOPOLOGIES, topology_evidence, binding, command, make_plan, network_argv, network_specs, proxy_policy, new_report, stop,
     strict_json, validate_report,
 )
 from supervisor.docker_engine import DockerEngine
@@ -179,6 +179,8 @@ class Lab:
         self.policies, self.probes, self.addresses = make_plan(config)
         self.holders, self.processes, self.links, self.containers, self.networks = {}, [], [], [], []
         self.daemon = None
+        self.topology = 'routed'
+        self.endpoint_on_router = False
         self.socket = None
         self.temp = None
         self.adapter = NftablesAdapter(table_name=TABLE_NAME, runner=self.run,
@@ -236,11 +238,30 @@ class Lab:
         self.run(self.ns(role, ['ip', 'link', 'set', peer, 'up']))
         self.run(['ip', 'link', 'set', local, 'up'])
 
+    def prepare_runtime(self):
+        self.run(['mount', '-t', 'tmpfs', '-o', 'mode=755,size=64m', 'tmpfs', '/run'])
+
+    def daemon_workspace_valid(self, base):
+        return base.is_absolute() and not base.is_symlink() and base.name.startswith('bezr-ollama-')
+
+    def daemon_command(self, base):
+        (base / 'daemon.json').write_text('{}\n')
+        return daemon_argv(base, self.args.run_id)
+
+    def verify_daemon_ready(self):
+        pass
+
+    def container_options(self):
+        return []
+
+    def verify_started_container(self, data):
+        pass
+
     def setup(self):
         self.guard()
-        # Mount namespace is private (unshare --propagation private). All /run
-        # sockets, netns mounts and daemon runtime state remain disposable.
-        self.run(['mount', '-t', 'tmpfs', '-o', 'mode=755,size=64m', 'tmpfs', '/run'])
+        # Disposable callers get their own /run; bounded jobs override this hook
+        # to preserve the already-mounted, resource-capped private workspace.
+        self.prepare_runtime()
         self.run(['ip', 'link', 'set', 'lo', 'up'])
         self.guard()
         Path('/proc/sys/net/ipv4/ip_forward').write_text('1\n')
@@ -295,11 +316,10 @@ class Lab:
     def setup_docker(self):
         self.guard()
         base = Path(self.args.lab_dir)
-        if not base.is_absolute() or base.is_symlink() or not base.name.startswith('bezr-ollama-'):
+        if not self.daemon_workspace_valid(base):
             raise RuntimeError('Private outer-owned daemon workspace required')
         self.socket = str(base / 'docker.sock')
-        (base / 'daemon.json').write_text('{}\n')
-        self.daemon = self.spawn(daemon_argv(base, self.args.run_id))
+        self.daemon = self.spawn(self.daemon_command(base))
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
@@ -311,6 +331,7 @@ class Lab:
                 time.sleep(.2)
         else:
             raise RuntimeError('Private nested dockerd startup timed out')
+        self.verify_daemon_ready()
         self.dc(['image', 'load', '--input', self.args.image_archive], timeout=120)
         observed = strict_json(self.dc(['image', 'inspect', self.args.probe_image]))
         if len(observed) != 1 or observed[0].get('Id') != self.args.probe_image:
@@ -331,7 +352,7 @@ class Lab:
                 '--ip', address, '--name', 'bezr-' + role,
                 '--cap-drop=ALL', '--security-opt=no-new-privileges', '--read-only',
                 '--pids-limit', '64', '--memory', '128m', '--entrypoint', 'python3',
-                self.args.probe_image, '-c', SERVER, self.args.run_id]).strip()
+                *self.container_options(), self.args.probe_image, '-c', SERVER, self.args.run_id]).strip()
             self.containers.append(container)
             for other_id, other_plan, other_address in attachments[1:]:
                 self.dc(['network', 'connect', '--ip', other_address, other_id, container])
@@ -346,6 +367,7 @@ class Lab:
                 if endpoint['NetworkID'] != expected_id or endpoint['IPAddress'] != expected_address:
                     raise RuntimeError('Live container endpoint identity readback failed')
             pid = data['State']['Pid']
+            self.verify_started_container(data)
             if type(pid) is not int or pid <= 0 or inode(pid) in (self.router, self.caller):
                 raise RuntimeError('Container namespace isolation proof failed')
             # Internal proxy networks intentionally lack external routes. Add a
@@ -357,12 +379,53 @@ class Lab:
             self.run(['nsenter', '--target', str(pid), '--net', '--',
                       'ip', 'route', 'replace', 'default', 'via', plan['gateway']])
 
+    def set_topology(self, topology):
+        """Move the same endpoint, not the policy, then prove its actual placement.
+
+        Both listeners already exist. The foreign-IP target stays routed in both
+        cases. No static neighbours or cache priming substitute for discovery.
+        """
+        self.guard()
+        evidence = topology_evidence(self.config, topology)
+        endpoint = self.args.endpoint
+        if topology != self.topology:
+            if self.topology != 'routed' or topology != 'host-local':
+                raise RuntimeError('Unsupported lab topology transition')
+            self.run(['ip', 'route', 'delete', endpoint + '/32', 'via', '169.254.254.2',
+                      'dev', self.args.interface])
+            self.run(self.ns('target', ['ip', 'address', 'delete', endpoint + '/32', 'dev', 'bzrtarget']))
+            # Track before mutation so interrupted/partial setup cannot skip cleanup.
+            self.endpoint_on_router = True
+            self.run(['ip', 'address', 'add', endpoint + '/32', 'dev', 'lo'])
+            self.topology = topology
+        inventories = {
+            'router': strict_json(self.run(['ip', '-j', '-4', 'address', 'show'])),
+            'target': strict_json(self.run(self.ns('target', ['ip', '-j', '-4', 'address', 'show']))),
+        }
+        for role, inventory in inventories.items():
+            placements = [(link['ifname'], address['prefixlen'])
+                          for link in inventory for address in link.get('addr_info', [])
+                          if address.get('family') == 'inet' and address.get('local') == endpoint]
+            expected = [(evidence['endpoint_interface'], 32)] if role == evidence['endpoint_namespace'] else []
+            if placements != expected:
+                raise RuntimeError('Endpoint topology address readback mismatch')
+        routes = strict_json(self.run(['ip', '-j', '-4', 'route', 'get', endpoint]))
+        if (type(routes) is not list or len(routes) != 1
+                or routes[0].get('dst') != endpoint
+                or routes[0].get('type', 'unicast') != evidence['route_type']
+                or routes[0].get('dev') != evidence['route_interface']
+                or routes[0].get('gateway') != (None if topology == 'host-local' else '169.254.254.2')):
+            raise RuntimeError('Endpoint topology route readback mismatch')
+        return evidence
+
     def transaction(self, spec):
         role = spec['source']
         client = ['python3' if self.docker and role not in ('target',) else sys.executable,
                   '-c', CLIENT, spec['destination'], str(spec['port']), self.args.run_id,
                   self.args.endpoint if role == 'target' else '']
-        if self.docker and role != 'target':
+        if role == 'target' and spec['topology'] == 'host-local':
+            text = self.run(client, timeout=6)
+        elif self.docker and role != 'target':
             text = self.dc(['exec', 'bezr-' + role, *client], timeout=6)
         else:
             text = self.run(self.ns(role, client), timeout=6)
@@ -406,33 +469,35 @@ class Lab:
     def exercise(self):
         report = new_report(self.config, CHECKS[int(self.docker)], self.args.run_id,
                             str(self.caller), str(self.router))
-        self.set_policy(False)
-        # Wait for actual HTTP listener readiness; no timeout can become a pass.
-        for spec in self.probes:
-            deadline = time.monotonic() + 5
-            while not self.transaction(spec):
-                if time.monotonic() >= deadline:
-                    raise RuntimeError('Listening positive control unreachable: ' + spec['name'])
-                time.sleep(.05)
-        self.set_policy(True)
-        report['policy_readback'] = True
-        for spec in self.probes:
-            # Reinstall/read exact canonical policy for EVERY probe. Controls
-            # differ only by deleting our two owned tables in this private lab.
+        for topology in TOPOLOGIES:
             self.set_policy(False)
-            before = self.transaction(spec)
+            evidence = self.set_topology(topology)
+            probes = [spec for spec in self.probes if spec['topology'] == topology]
+            # Actual listener readiness in THIS topology, never a timeout pass.
+            for spec in probes:
+                deadline = time.monotonic() + 5
+                while not self.transaction(spec):
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError('Listening positive control unreachable: ' + topology + ' ' + spec['name'])
+                    time.sleep(.05)
+            for spec in probes:
+                # Controls change only our two owned policies, not topology.
+                self.set_policy(False)
+                before = self.transaction(spec)
+                self.set_policy(True)
+                if spec['allow']:
+                    self.flush_neighbors()
+                enforced = self.transaction(spec)
+                self.set_policy(False)
+                after = self.transaction(spec)
+                if not before or not after or enforced is not spec['allow']:
+                    raise RuntimeError('Packet acceptance failed: ' + topology + ' ' + spec['name'])
+                report['probes'].append(dict(name=spec['name'], spec=spec, before=before,
+                                             enforced=enforced, after=after))
             self.set_policy(True)
-            if spec['allow']:
-                self.flush_neighbors()
-            enforced = self.transaction(spec)
-            self.set_policy(False)
-            after = self.transaction(spec)
-            if not before or not after or enforced is not spec['allow']:
-                raise RuntimeError('Packet acceptance failed: ' + spec['name'])
-            report['probes'].append(dict(name=spec['name'], spec=spec, before=before,
-                                         enforced=enforced, after=after))
-        self.set_policy(True)
-        report['cold_neighbors'] = True
+            evidence['policy_readback'] = evidence['cold_neighbors'] = True
+            report['topologies'].append(evidence)
+        report['policy_readback'] = report['cold_neighbors'] = True
         return report
 
     def cleanup(self):
@@ -444,6 +509,15 @@ class Lab:
             except Exception as error:
                 errors.append(type(error).__name__)
         attempt(lambda: self.set_policy(False))
+        if getattr(self, 'endpoint_on_router', False):
+            def remove_local_endpoint():
+                self.run(['ip', 'address', 'delete', self.args.endpoint + '/32', 'dev', 'lo'])
+                addresses = strict_json(self.run(['ip', '-j', '-4', 'address', 'show', 'dev', 'lo']))
+                if any(address.get('local') == self.args.endpoint
+                       for link in addresses for address in link.get('addr_info', [])):
+                    raise RuntimeError('Owned router endpoint remains after cleanup')
+                self.endpoint_on_router = False
+            attempt(remove_local_endpoint)
         if self.daemon and self.daemon.poll() is None:
             for container in reversed(self.containers):
                 attempt(lambda c=container: self.dc(['rm', '--force', c], timeout=15))

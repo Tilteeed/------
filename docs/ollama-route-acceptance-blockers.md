@@ -17,8 +17,8 @@ Do not bypass the loader or manufacture a receipt.
 
 ## Acceptance still required
 
-A controlled operator run must, on an explicitly authorized disposable Linux
-VM, independently exercise the actual Ollama rules with real packets in both a
+A controlled operator run must independently exercise the actual Ollama rules
+with real packets in both a
 separate network namespace and a real Docker topology. It must verify allowed
 and denied traffic, including established return paths, wrong source,
 destination and port, and isolation from other bridges and the host. Failed
@@ -27,8 +27,16 @@ that each denied target is reachable when its restriction is absent and that
 the intended rules are installed and read back. The test must not contact the
 real Ollama endpoint or alter the production host's network state.
 
-The orchestrator must refuse execution without explicit disposable-host
-confirmation, validate all route inputs, ensure both real checks succeed,
+Disposable Linux-VM checks remain useful rehearsal, but cannot authorize the
+physical GPU host or provide transferable receipts. On an already-used host,
+use only the separately approved bounded busy-host workflow described in
+`GPU_HOST_ACCEPTANCE_PLAN.md`; never repurpose disposable-host confirmation.
+The local production policy v2 now contains narrow ARP exemptions and the
+matrix covers routed and host-local endpoints with cold neighbours. Their
+actual kernel behavior remains unaccepted.
+
+The selected orchestrator must enforce its exact execution approval,
+validate all route inputs, ensure both independent real checks succeed,
 recheck host identity and binding inputs before writing, and fail closed on
 errors or drift. Cleanup and timeouts must not endanger unrelated resources.
 No claim of real Linux, Docker, or packet acceptance follows from mocked tests.

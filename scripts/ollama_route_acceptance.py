@@ -14,6 +14,7 @@ from supervisor.firewall import EndpointPair, NetworkPolicy, expected_ruleset as
 from supervisor.ollama_firewall import (OllamaRoutePolicy, build_ollama_route_receipt,
                                         expected_ollama_ruleset)
 
+TOPOLOGIES = ('routed', 'host-local')
 CHECKS = ('linux_ollama_route_check', 'linux_docker_ollama_route_acceptance')
 LIMIT = 262144
 
@@ -101,7 +102,8 @@ def make_plan(config):
         add(f'sidecar{index}_own_web', f'side{index}', f'web{index}', allow=True)
         add(f'sidecar{index}_other_web', f'side{index}', f'web{3-index}')
         add(f'unsolicited_target_gateway{index}', 'target', f'gw{index}')
-    return tuple(policies), probes, addresses
+    return tuple(policies), [dict(spec, topology=topology)
+                             for topology in TOPOLOGIES for spec in probes], addresses
 
 
 def policy_digest(config):
@@ -109,11 +111,22 @@ def policy_digest(config):
     return hashlib.sha256(json.dumps(rules, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
+def topology_evidence(config, topology):
+    if topology not in TOPOLOGIES:
+        raise ValueError('Unsupported packet topology')
+    local = topology == 'host-local'
+    return dict(topology=topology, endpoint_namespace='router' if local else 'target',
+                endpoint_interface='lo' if local else 'bzrtarget',
+                route_type='local' if local else 'unicast',
+                route_interface='lo' if local else config['egress_interface'],
+                policy_readback=False, cold_neighbors=False)
+
+
 def new_report(config, check, run_id, caller_inode, router_inode) -> dict[str, Any]:
-    return dict(schema_version=1, check=check, run_id=run_id, binding=config,
+    return dict(schema_version=2, check=check, run_id=run_id, binding=config,
                 policy_sha256=policy_digest(config), caller_netns_inode=caller_inode,
                 router_netns_inode=router_inode, policy_readback=False, cleanup=False,
-                cold_neighbors=False, probes=[])
+                cold_neighbors=False, topologies=[], probes=[])
 
 
 def exact_json(left, right):
@@ -134,6 +147,10 @@ def validate_report(report, config, check, run_id):
     if (report['cleanup'] is not True or report['policy_readback'] is not True
             or report['cold_neighbors'] is not True):
         raise ValueError('Acceptance cleanup or canonical policy readback missing')
+    topologies = [dict(topology_evidence(config, topology), policy_readback=True, cold_neighbors=True)
+                  for topology in TOPOLOGIES]
+    if type(report['topologies']) is not list or not exact_json(report['topologies'], topologies):
+        raise ValueError('Incomplete or mismatched endpoint topology evidence')
     probes = make_plan(config)[1]
     if type(report['probes']) is not list or len(report['probes']) != len(probes):
         raise ValueError('Incomplete packet probe inventory')

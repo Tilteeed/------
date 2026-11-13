@@ -16,3 +16,7 @@ node_modules
 .cache
 .build
 artifacts
+# Private GPU inventory/runbook/site approval must never enter image contexts.
+docs/GPU_SERVER_PRIVATE.md
+docs/GPU_DEPLOYMENT_PRIVATE.md
+supervisor/gpu-acceptance.local.json

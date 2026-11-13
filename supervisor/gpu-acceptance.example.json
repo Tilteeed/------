@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "site": {
+    "agent_network_pool": null,
+    "frontend_network_pool": null,
+    "ollama_network_pool": null,
+    "ollama_endpoint_ip": null,
+    "egress_interface": null
+  },
+  "budget": {
+    "cpu_quota_percent": null,
+    "memory_bytes": null,
+    "swap_bytes": null,
+    "tasks": null,
+    "runtime_seconds": null,
+    "stop_seconds": null,
+    "tmpfs_bytes": null,
+    "tmpfs_inodes": null,
+    "io": {
+      "device": null,
+      "major": null,
+      "minor": null,
+      "read_bps": null,
+      "write_bps": null,
+      "read_iops": null,
+      "write_iops": null
+    }
+  },
+  "probe_image": null,
+  "image_archive": null,
+  "production_docker_socket": null,
+  "candidate_dir": null
+}

@@ -26,10 +26,42 @@ class RouteAcceptanceTests(unittest.TestCase):
                 self.assertTrue(state['cold'], 'Positive controls must not prime allowed-path ARP/cache evidence')
                 state['cold'] = False
             return spec['allow'] if state['enabled'] else True
+        selected = []
+        def select(topology):
+            self.assertFalse(state['enabled'], 'Move endpoint only with owned policies removed')
+            selected.append(topology)
+            state['topology'] = topology
+            return route.topology_evidence(lab.config, topology)
+        lab.set_topology = select
         lab.set_policy, lab.flush_neighbors, lab.transaction = policy, flush, transaction
         report = lab.exercise()
+        self.assertEqual(selected, ['routed', 'host-local'])
+        self.assertEqual([t['topology'] for t in report['topologies']], selected)
+        self.assertTrue(all(t['policy_readback'] and t['cold_neighbors'] for t in report['topologies']))
         self.assertEqual(state['flushes'], sum(p['allow'] for p in lab.probes))
         self.assertIs(report['cold_neighbors'], True)
+
+    def test_each_topology_requires_exact_placement_and_its_complete_probe_inventory(self):
+        import copy
+        report = self.synthetic_report()
+        report['topologies'] = [
+            dict(topology='routed', endpoint_namespace='target', endpoint_interface='bzrtarget',
+                 route_type='unicast', route_interface='ens18', policy_readback=True, cold_neighbors=True),
+            dict(topology='host-local', endpoint_namespace='router', endpoint_interface='lo',
+                 route_type='local', route_interface='lo', policy_readback=True, cold_neighbors=True)]
+        route.validate_report(report, self.config(), route.CHECKS[0], 'b'*32)
+        for mutate in (lambda r: r['topologies'].pop(),
+                       lambda r: r['topologies'].reverse(),
+                       lambda r: r['topologies'][1].update(endpoint_namespace='target'),
+                       lambda r: r['topologies'][0].update(route_interface='wrong'),
+                       lambda r: r['topologies'][1].update(policy_readback=False),
+                       lambda r: r['topologies'][0].update(cold_neighbors=False),
+                       lambda r: r['probes'].__delitem__(slice(22, None)),
+                       lambda r: r['probes'][22]['spec'].update(topology='routed')):
+            bad = copy.deepcopy(report)
+            mutate(bad)
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                route.validate_report(bad, self.config(), route.CHECKS[0], 'b'*32)
 
     def test_binding_rejects_overlapping_pool_before_running_checks(self):
         with self.assertRaises(ValueError):
@@ -61,8 +93,9 @@ class RouteAcceptanceTests(unittest.TestCase):
     def test_plan_covers_real_transactions_and_both_isolated_pairs(self):
         policies, probes, addresses = route.make_plan(self.config())
         self.assertEqual(len(policies), 2)
-        self.assertEqual(len(probes), 22)
-        self.assertEqual(sum(p['allow'] for p in probes), 6)
+        self.assertEqual(len(probes), 44)
+        self.assertEqual(sum(p['allow'] for p in probes), 12)
+        self.assertEqual([p['topology'] for p in probes], ['routed']*22 + ['host-local']*22)
         self.assertEqual(addresses['target'], '192.168.40.10')
         for p in policies:
             self.assertEqual(p.egress_interface, 'ens18')
@@ -121,6 +154,9 @@ class RouteAcceptanceTests(unittest.TestCase):
         config = self.config()
         report = route.new_report(config, check, run_id, '10', '11')
         report['cleanup'] = report['policy_readback'] = report['cold_neighbors'] = True
+        report['topologies'] = [dict(route.topology_evidence(config, topology),
+                                     policy_readback=True, cold_neighbors=True)
+                                for topology in route.TOPOLOGIES]
         report['probes'] = [{'name': spec['name'], 'spec': spec, 'before': True,
                              'enforced': spec['allow'], 'after': True}
                             for spec in route.make_plan(config)[1]]
