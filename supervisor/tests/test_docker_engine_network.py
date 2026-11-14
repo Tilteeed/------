@@ -1563,9 +1563,14 @@ class DockerEngineNetworkTests(unittest.TestCase):
                             control_ui_origin='https://' + instance_id + '.agents.example.test')
         payload = engine._payload(
             instance_id, spec, None,
-            {'Id': 'sha256:' + 'a' * 64, 'Config': {'Env': [], 'Entrypoint': [], 'WorkingDir': ''}},
+            {'Id': 'sha256:' + 'a' * 64, 'Config': {
+                'Env': [], 'Entrypoint': ['/usr/local/bin/docker-entrypoint.sh'], 'WorkingDir': ''}},
             proxy_network=plan['agent'])
         env = dict(item.split('=', 1) for item in payload['Env'])
+        self.assertEqual(payload['Entrypoint'], ['node'])
+        self.assertEqual(payload['Cmd'], ['dist/index.js', 'gateway', '--bind', 'lan', '--port', '18789'])
+        self.assertEqual(env['OPENCLAW_CONFIG_READONLY'], '1')
+        self.assertIs(payload['HostConfig']['ReadonlyRootfs'], True)
         self.assertNotIn('OPENCLAW_GATEWAY_TOKEN', env)
         self.assertEqual(payload['HostConfig']['NetworkMode'], plan['agent']['name'])
         self.assertEqual(payload['NetworkingConfig']['EndpointsConfig'][plan['agent']['name']]

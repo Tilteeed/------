@@ -44,6 +44,18 @@ from .runtime_store import RuntimeStore, StoreError, canonical
 from .workspace_files import RetainedWorkspace, WorkspaceFileError
 
 
+class _BoundedUnixServer(getattr(socketserver, 'UnixStreamServer', socketserver.BaseServer)):
+    # Browsers request many Control UI assets at once. The stdlib default of
+    # five queued connections makes valid bursts fail before authentication.
+    # Requests remain sequential and the queue remains bounded.
+    request_queue_size = 128
+
+    def get_request(self):
+        connection, address = super().get_request()
+        connection.settimeout(30)
+        return connection, address
+
+
 class ServiceError(Exception):
     admission_reasons: tuple[str, ...] = ()
     def __init__(self, code, status=409):
@@ -2053,17 +2065,12 @@ def serve(config):
         prepare_socket(socket_path)
         prepare_socket(admin_socket_path)
 
-        class UnixServer(socketserver.UnixStreamServer):
+        class UnixServer(_BoundedUnixServer):
             def service_actions(self):
                 # The main server drives recovery. The admin server inherits
                 # this class but must never run a second recovery scheduler.
                 if self is server:
                     _retry_recovery(controller, recovery_stop)
-
-            def get_request(self):
-                connection, address = super().get_request()
-                connection.settimeout(30)
-                return connection, address
 
         class ThreadedAdminServer(socketserver.ThreadingMixIn, UnixServer):
             daemon_threads = True

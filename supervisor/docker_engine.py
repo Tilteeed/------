@@ -2803,9 +2803,11 @@ class DockerEngine:
         else:
             network_mode = 'none' if spec['version'] == 1 else self._network_name(instance_id)
         payload = {
-            'Image': self.image, 'User': '1000:1000', 'Cmd': list(self._CMD),
+            'Image': self.image, 'User': '1000:1000',
+            'Cmd': list(self._CMD[1:] if proxy_profile else self._CMD),
             'Env': [k + '=' + v for k, v in sorted(environment.items())],
-            'Entrypoint': image_info['Config'].get('Entrypoint') or [],
+            'Entrypoint': (['node'] if proxy_profile else
+                           image_info['Config'].get('Entrypoint') or []),
             'WorkingDir': image_info['Config'].get('WorkingDir') or '',
             'Healthcheck': dict(self._HEALTH), 'StopTimeout': 10,
             'Tty': False, 'OpenStdin': False, 'StdinOnce': False,

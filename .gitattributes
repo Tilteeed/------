@@ -4,3 +4,4 @@
 *.jpeg binary
 *.ico binary
 *.woff2 binary
+/images/acceptance/*.tar binary

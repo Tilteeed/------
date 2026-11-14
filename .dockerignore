@@ -20,3 +20,5 @@ artifacts
 docs/GPU_SERVER_PRIVATE.md
 docs/GPU_DEPLOYMENT_PRIVATE.md
 supervisor/gpu-acceptance.local.json
+# The acceptance fixture is not a WebUI build input.
+images/acceptance

@@ -47,6 +47,7 @@ node --test tests/ui-state.test.mjs
 - `tests/` — исполняемые проверки.
 - `Dockerfile`, `compose.yaml` — сборка и запуск веба без Docker socket.
 - `upstream.lock.json` — версии, commit и digest.
+- `images/acceptance/` — проверочный Docker-образ для приёмки, отдельно от образа агента; состав и SHA-256 описаны в [images/acceptance/README.md](images/acceptance/README.md).
 - `docs/requirements.md`, `docs/architecture.md`, `docs/deployment.md` — требования, архитектура, развёртывание.
 
 ## Доставка на ВМ
