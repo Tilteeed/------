@@ -1,0 +1,24 @@
+{
+  "profile_path": "/var/lib/personal-agent-supervisor/deployment.json",
+  "state_dir": "/var/lib/personal-agent-supervisor",
+  "socket_path": "/run/personal-agent-supervisor/control.sock",
+  "token_file": "/var/lib/personal-agent-supervisor/service.token",
+  "image": "sha256:011a54c216af99895c727aff3c8e2a33b99a1952badf70e37a29793e83b9a056",
+  "capacity_ram_bytes": 38654705664,
+  "capacity_cpu_millicores": 18000,
+  "capacity_disk_bytes": 85899345920,
+  "disk_floor_bytes": 10737418240,
+  "network_profile_default": "agent_proxy_v1",
+  "control_ui_domain": "agents.bezr.space",
+  "agent_network_pool": "172.24.0.0/24",
+  "frontend_network_pool": "172.24.1.0/24",
+  "ollama": {
+    "base_url": "http://172.24.3.1:11434",
+    "default_model_id": "qwen3.5:9b",
+    "context_tokens": 16384,
+    "max_tokens": 2048,
+    "think": false
+  },
+  "ollama_network_pool": "172.24.2.0/24",
+  "ollama_egress_interface": "ens1f0"
+}

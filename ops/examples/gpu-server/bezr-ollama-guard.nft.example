@@ -1,0 +1,7 @@
+# Example for this site only. Never run `flush ruleset` on a shared host.
+add table inet bezr_ollama_guard
+flush table inet bezr_ollama_guard
+add chain inet bezr_ollama_guard input { type filter hook input priority -25; policy accept; }
+add rule inet bezr_ollama_guard input iifname "lo" ip daddr 172.24.3.1 accept
+add rule inet bezr_ollama_guard input iifname "bzo*" ip saddr 172.24.2.0/24 ip daddr 172.24.3.1 tcp dport 11434 accept
+add rule inet bezr_ollama_guard input ip daddr 172.24.3.1 drop

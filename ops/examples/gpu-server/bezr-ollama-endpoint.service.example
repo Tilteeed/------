@@ -1,0 +1,13 @@
+[Unit]
+Description=BEZR Ollama local endpoint and firewall
+After=local-fs.target nftables.service
+Before=nginx.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/ip -4 address replace 172.24.3.1/32 dev lo
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/bezr-ollama-guard.nft
+
+[Install]
+WantedBy=multi-user.target

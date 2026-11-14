@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "site": {
+    "agent_network_pool": "172.24.0.0/24",
+    "frontend_network_pool": "172.24.1.0/24",
+    "ollama_network_pool": "172.24.2.0/24",
+    "ollama_endpoint_ip": "172.24.3.1",
+    "egress_interface": "ens1f0"
+  },
+  "budget": {
+    "cpu_quota_percent": 200,
+    "memory_bytes": 4294967296,
+    "swap_bytes": 0,
+    "tasks": 512,
+    "runtime_seconds": 240,
+    "stop_seconds": 20,
+    "tmpfs_bytes": 2147483648,
+    "tmpfs_inodes": 131072,
+    "io": {
+      "device": "/dev/sdd",
+      "major": 8,
+      "minor": 48,
+      "read_bps": 41943040,
+      "write_bps": 41943040,
+      "read_iops": 300,
+      "write_iops": 300
+    }
+  },
+  "probe_image": "sha256:801f33cfdb491fe6d751bbb99d9925edb7175e49fab758ad44c56e288e5abb9a",
+  "image_archive": "/mnt/sdd/bezr-acceptance-probe/probe.tar",
+  "production_docker_socket": "/run/docker.sock",
+  "candidate_dir": "/mnt/sdd/bezr-acceptance/candidate-REPLACE-ME"
+}

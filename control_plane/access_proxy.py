@@ -377,6 +377,43 @@ def create_control_ui_access_proxy(store, runtime, *, public_origin, control_ui_
     if transport is None:
         transport = AiohttpSidecarTransport()
 
+    # Coalesce only concurrent live lookups of the same owner/instance. Every
+    # request independently validates its session first; completed results are
+    # never cached. A cancelled client must not cancel the shared live proof.
+    pending_lookups = {}
+
+    async def resolve_live_target(owner_id, instance_id):
+        observed = await run_in_threadpool(runtime.get, owner_id)
+        info = observed.get('runtime') if type(observed) is dict else None
+        if type(info) is not dict:
+            raise HTTPException(404, 'Not found', headers={'Cache-Control': 'no-store'})
+        if (info.get('state') != 'running' or info.get('gateway') != 'ready'
+                or info.get('network_profile') != 'agent_proxy_v1'
+                or info.get('instance_id') != instance_id):
+            raise HTTPException(404, 'Not found', headers={'Cache-Control': 'no-store'})
+        target = await run_in_threadpool(target_resolver, owner_id, instance_id)
+        if inspect.isawaitable(target):
+            target = await target
+        return validate_proxy_target(target)
+
+    async def shared_live_target(owner_id, instance_id):
+        key = (asyncio.get_running_loop(), owner_id, instance_id)
+        task = pending_lookups.get(key)
+        if task is None or task.done():
+            if len(pending_lookups) >= 128:
+                raise RuntimeError('Too many pending Control UI lookups')
+            task = asyncio.create_task(resolve_live_target(owner_id, instance_id))
+            pending_lookups[key] = task
+
+            def forget(completed):
+                if pending_lookups.get(key) is completed:
+                    pending_lookups.pop(key, None)
+                if not completed.cancelled():
+                    completed.exception()
+
+            task.add_done_callback(forget)
+        return await asyncio.shield(task)
+
     async def authorize(scope, method, *, websocket=False):
         binding = _host_binding(scope, domain)
         if not ready or binding is None or origin_configured is None:
@@ -404,18 +441,7 @@ def create_control_ui_access_proxy(store, runtime, *, public_origin, control_ui_
         owner_id = session['owner_id']
         client_ip = _request_client_ip(scope)
         try:
-            observed = await run_in_threadpool(runtime.get, owner_id)
-            info = observed.get('runtime') if type(observed) is dict else None
-            if type(info) is not dict:
-                raise HTTPException(404, 'Not found', headers={'Cache-Control': 'no-store'})
-            if (info.get('state') != 'running' or info.get('gateway') != 'ready'
-                    or info.get('network_profile') != 'agent_proxy_v1'
-                    or info.get('instance_id') != instance_id):
-                raise HTTPException(404, 'Not found', headers={'Cache-Control': 'no-store'})
-            target = await run_in_threadpool(target_resolver, owner_id, instance_id)
-            if inspect.isawaitable(target):
-                target = await target
-            target = validate_proxy_target(target)
+            target = await shared_live_target(owner_id, instance_id)
         except HTTPException:
             raise
         except Exception:
