@@ -61,6 +61,26 @@ class RuntimeNetworkProfileTests(unittest.TestCase):
                 with self.assertRaises(StoreError):
                     reopened.update_ollama_model_id(second, 'unsupported:model')
 
+    def test_admin_context_is_seeded_once_and_updates_with_model_atomically(self):
+        from supervisor.runtime_store import StoreError
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'runtime.sqlite3'
+            model = 'qwen3.5:9b'
+            with closing(RuntimeStore(path, 'site-v1', 'a' * 64)) as store:
+                self.assertEqual(store.seed_ollama_model_id(model), model)
+                self.assertEqual(store.seed_ollama_context_tokens(16384), 16384)
+                self.assertEqual(store.seed_ollama_context_tokens(8192), 16384)
+                self.assertTrue(store.update_ollama_selection(model, model, 16384, 65536))
+                self.assertEqual(store.ollama_context_tokens(), 65536)
+                self.assertFalse(store.update_ollama_selection(model, model, 65536, 65536))
+                with self.assertRaises(StoreError) as conflict:
+                    store.update_ollama_selection(model, model, 16384, 32768)
+                self.assertEqual(conflict.exception.code, 'admin_config_conflict')
+
+            with closing(RuntimeStore(path, 'site-v1', 'a' * 64)) as reopened:
+                self.assertEqual(reopened.ollama_model_id(), model)
+                self.assertEqual(reopened.ollama_context_tokens(), 65536)
+
     def test_old_database_is_not_mutated_implicitly(self):
         from supervisor.runtime_store import StoreError
         with tempfile.TemporaryDirectory() as tmp:

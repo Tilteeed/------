@@ -18,7 +18,7 @@ MODEL_NAMES = {
 OLLAMA_PORT = 11434
 OLLAMA_API_KEY_MARKER = 'ollama-local'
 _MAX_URL_LENGTH = 300
-_SUPPORTED_CONTEXT_TOKENS = frozenset({8192, 16384})
+SUPPORTED_CONTEXT_TOKENS = frozenset({8192, 16384, 32768, 65536})
 _RFC1918 = tuple(ipaddress.IPv4Network(value) for value in (
     '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))
 
@@ -64,7 +64,7 @@ def validate_ollama_config(value) -> OllamaConfig:
     if type(model_id) is not str or model_id not in MODEL_NAMES:
         raise ValueError('Unsupported Ollama model')
     context_tokens, max_tokens = value['context_tokens'], value['max_tokens']
-    if (type(context_tokens) is not int or context_tokens not in _SUPPORTED_CONTEXT_TOKENS
+    if (type(context_tokens) is not int or context_tokens not in SUPPORTED_CONTEXT_TOKENS
             or type(max_tokens) is not int or not 1 <= max_tokens <= context_tokens):
         raise ValueError('Invalid Ollama context or generation limit')
     if type(value['think']) is not bool:

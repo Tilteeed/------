@@ -13,7 +13,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from .ollama_config import MODEL_NAMES
+from .ollama_config import MODEL_NAMES, SUPPORTED_CONTEXT_TOKENS
 
 
 class StoreError(Exception):
@@ -58,6 +58,9 @@ class RuntimeStore:
                 CREATE TABLE IF NOT EXISTS admin_settings (
                     key TEXT PRIMARY KEY CHECK(key='ollama_default_model_id'),
                     value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS ollama_context_setting (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    context_tokens INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS instances (
                     id TEXT PRIMARY KEY, actor TEXT NOT NULL, active INTEGER NOT NULL,
                     state TEXT NOT NULL, settings TEXT NOT NULL, revision INTEGER NOT NULL,
@@ -151,6 +154,69 @@ class RuntimeStore:
                 (new_model_id, expected_model_id)).rowcount
             if changed != 1:
                 raise StoreError('admin_config_conflict')
+            return True
+
+    def ollama_context_tokens(self):
+        with self.lock:
+            row = self.db.execute(
+                'SELECT context_tokens FROM ollama_context_setting WHERE id=1').fetchone()
+            if row is None:
+                return None
+            value = row['context_tokens']
+            if type(value) is not int or value not in SUPPORTED_CONTEXT_TOKENS:
+                raise StoreError('admin_config_invalid')
+            return value
+
+    def seed_ollama_context_tokens(self, context_tokens):
+        if type(context_tokens) is not int or context_tokens not in SUPPORTED_CONTEXT_TOKENS:
+            raise StoreError('invalid_admin_context')
+        with self.transaction():
+            self.db.execute(
+                'INSERT OR IGNORE INTO ollama_context_setting(id,context_tokens) VALUES(1,?)',
+                (context_tokens,))
+            row = self.db.execute(
+                'SELECT context_tokens FROM ollama_context_setting WHERE id=1').fetchone()
+            value = row['context_tokens'] if row else None
+            if type(value) is not int or value not in SUPPORTED_CONTEXT_TOKENS:
+                raise StoreError('admin_config_invalid')
+            return value
+
+    def update_ollama_selection(self, expected_model_id, new_model_id,
+                                expected_context_tokens, new_context_tokens):
+        if (type(expected_model_id) is not str or expected_model_id not in MODEL_NAMES
+                or type(new_model_id) is not str or new_model_id not in MODEL_NAMES
+                or type(expected_context_tokens) is not int
+                or expected_context_tokens not in SUPPORTED_CONTEXT_TOKENS
+                or type(new_context_tokens) is not int
+                or new_context_tokens not in SUPPORTED_CONTEXT_TOKENS):
+            raise StoreError('invalid_admin_selection')
+        with self.transaction():
+            model = self.db.execute(
+                "SELECT value FROM admin_settings WHERE key='ollama_default_model_id'").fetchone()
+            context = self.db.execute(
+                'SELECT context_tokens FROM ollama_context_setting WHERE id=1').fetchone()
+            if model is None or context is None:
+                raise StoreError('admin_config_uninitialized')
+            current = (model['value'], context['context_tokens'])
+            expected = (expected_model_id, expected_context_tokens)
+            target = (new_model_id, new_context_tokens)
+            if current == target:
+                return False
+            if current != expected:
+                raise StoreError('admin_config_conflict')
+            if new_model_id != expected_model_id:
+                changed = self.db.execute(
+                    "UPDATE admin_settings SET value=? WHERE key='ollama_default_model_id' AND value=?",
+                    (new_model_id, expected_model_id)).rowcount
+                if changed != 1:
+                    raise StoreError('admin_config_conflict')
+            if new_context_tokens != expected_context_tokens:
+                changed = self.db.execute(
+                    'UPDATE ollama_context_setting SET context_tokens=? '
+                    'WHERE id=1 AND context_tokens=?',
+                    (new_context_tokens, expected_context_tokens)).rowcount
+                if changed != 1:
+                    raise StoreError('admin_config_conflict')
             return True
 
     @staticmethod

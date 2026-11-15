@@ -36,8 +36,8 @@ def synthetic_ollama_host_inventory(plan, extra_routes=()):
 
 class DockerEngineNetworkTests(unittest.TestCase):
     @staticmethod
-    def _sidecar_image_info(image_id, env=()):
-        return {'Id': image_id, 'Config': {'Env': list(env)}}
+    def _sidecar_image_info(image_id, env=(), labels=None):
+        return {'Id': image_id, 'Config': {'Env': list(env), 'Labels': labels}}
 
     def test_ollama_egress_bridge_is_per_instance_external_but_gateway_only(self):
         instance_id = '7' * 32
@@ -2141,6 +2141,55 @@ class DockerEngineNetworkTests(unittest.TestCase):
         serialized = json.dumps(payload)
         self.assertNotIn('WEBUI_SECRET_KEY=xxx', serialized)
         self.assertNotIn('OPENAI_API_KEY=yyy', serialized)
+
+    def test_proxy_sidecar_labels_match_exact_image_label_union(self):
+        engine = DockerEngine('sha256:' + 'a' * 64)
+        instance_id = 'd' * 32
+        image_id = 'sha256:' + 'e' * 64
+        inherited = {
+            'org.opencontainers.image.version': '2026.9.7',
+            'com.docker.compose.project': 'webui',
+        }
+        image_info = self._sidecar_image_info(image_id, labels=inherited)
+        plan = engine._proxy_network_plan(
+            instance_id, agent_network_pool='10.248.0.0/24',
+            frontend_network_pool='10.249.0.0/24')
+        payload = engine._proxy_sidecar_payload(
+            instance_id, owner_id='owner-d',
+            control_ui_origin='https://' + instance_id + '.agents.example.test',
+            gateway_ip=plan['agent']['gateway_ip'],
+            listen_ip=plan['frontend']['sidecar_ip'], image_id=image_id,
+            host_path='/srv/agent-data/' + instance_id, plan=plan,
+            image_info=image_info)
+
+        self.assertEqual(payload['Labels']['org.opencontainers.image.version'], '2026.9.7')
+        self.assertEqual(payload['Labels']['com.docker.compose.project'], 'webui')
+        sidecar_id = 'f' * 64
+        row = {'Id': sidecar_id, 'Names': ['/pa-proxy-' + instance_id]}
+        observed = {
+            'Id': sidecar_id, 'Image': image_id,
+            'Config': {'Labels': copy.deepcopy(payload['Labels'])},
+        }
+
+        def request(method, path, payload=None, *, ok=(200,)):
+            if method == 'GET' and path.startswith('/containers/json?'):
+                return [row]
+            if method == 'GET' and path == '/containers/' + sidecar_id + '/json':
+                return observed
+            if method == 'GET' and path == '/images/' + image_id.replace(':', '%3A') + '/json':
+                return image_info
+            raise AssertionError((method, path))
+
+        engine._request = request
+        self.assertEqual(engine._list_proxy_sidecars(), {instance_id: observed})
+
+        observed['Config']['Labels']['org.unapproved.label'] = 'extra'
+        with self.assertRaises(DockerEngineError):
+            engine._list_proxy_sidecars()
+        del observed['Config']['Labels']['org.unapproved.label']
+        observed['Config']['Labels']['org.opencontainers.image.version'] = 'unexpected'
+        with self.assertRaises(DockerEngineError):
+            engine._list_proxy_sidecars()
 
     def test_proxy_sidecar_payload_rejects_invalid_image_environment_metadata(self):
         engine = DockerEngine('sha256:' + 'a' * 64)

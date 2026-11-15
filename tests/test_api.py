@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from control_plane import api
 from control_plane.policy import validate_agent_input
-from control_plane.runtime import RuntimeRejected, SupervisorClient
+from control_plane.runtime import RuntimeRejected, RuntimeUnavailable, SupervisorClient
 from control_plane.store import DraftStore, InvalidControlUiTicket
 
 
@@ -62,6 +62,32 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(sent, {'path': '/v1/actions', 'payload': {
             **request, 'actor_id': 'alice'}})
 
+    def test_supervisor_model_client_validates_model_and_context_contract(self):
+        client = SupervisorClient('unused.sock', 'unused.token')
+        sent = []
+        def response(path, payload, *, response_kind='runtime', response_limit=65536):
+            sent.append((path, payload, response_kind))
+            if payload == {'action': 'status'}:
+                return {'model_id': 'qwen3.5:9b', 'context_tokens': 16384}
+            return {'status': 'updated', 'previous_model_id': 'qwen3.5:9b',
+                    'previous_context_tokens': 16384,
+                    'model_id': 'qwen3.5:9b', 'context_tokens': 65536,
+                    'updated_instances': 2, 'restart_pending': 0}
+        client._request = response
+        self.assertEqual(client.ollama_model_status(), {
+            'model_id': 'qwen3.5:9b', 'context_tokens': 16384})
+        result = client.change_ollama_model('qwen3.5:9b', 'qwen3.5:9b', 16384, 65536)
+        self.assertEqual(result['context_tokens'], 65536)
+        self.assertEqual(sent[-1], ('/v1/admin/ollama/model', {
+            'expected_model_id': 'qwen3.5:9b', 'new_model_id': 'qwen3.5:9b',
+            'expected_context_tokens': 16384, 'new_context_tokens': 65536,
+        }, 'json'))
+
+        client._request = lambda *_args, **_kwargs: {
+            'model_id': 'qwen3.5:9b', 'context_tokens': 131072}
+        with self.assertRaises(RuntimeUnavailable):
+            client.ollama_model_status()
+
     def test_unauthenticated_requests_are_denied(self):
         self.assertEqual(self.client.get(self.base).status_code, 401)
         self.assertEqual(self.client.get(self.base, headers={"X-OpenWebUI-User-Id": "alice"}).status_code, 401)
@@ -85,6 +111,60 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(data["runtime"]["state"], "not_connected")
         self.assertEqual(response.headers["cache-control"], "no-store")
         self.assertNotIn("token", data)
+
+    def test_ollama_model_control_is_only_available_to_authenticated_admin(self):
+        class Runtime:
+            selected = 'qwen3.5:9b'
+            context = 16384
+            changes = []
+
+            def ollama_model_status(self):
+                return {'model_id': self.selected, 'context_tokens': self.context}
+
+            def change_ollama_model(self, expected, new, expected_context, new_context):
+                self.changes.append((expected, new, expected_context, new_context))
+                if expected != self.selected:
+                    raise RuntimeRejected(409, 'admin_config_conflict', 'conflict')
+                previous = self.selected
+                previous_context = self.context
+                self.selected = new
+                self.context = new_context
+                return {'status': 'updated', 'previous_model_id': previous,
+                        'previous_context_tokens': previous_context,
+                        'model_id': new, 'context_tokens': new_context,
+                        'updated_instances': 2, 'restart_pending': 0}
+
+        runtime = Runtime()
+        app = FastAPI()
+        app.include_router(api.create_router(verified_test_user, self.store, runtime=runtime))
+        client = TestClient(app)
+        self.addCleanup(client.close)
+        path = '/api/v1/agent-platform/admin/ollama/model'
+        admin = {'Authorization': 'Bearer admin-session'}
+
+        denied = client.get(path, headers=self.alice)
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(runtime.changes, [])
+
+        status = client.get(path, headers=admin)
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()['model_id'], 'qwen3.5:9b')
+        self.assertEqual(status.json()['context_tokens'], 16384)
+        self.assertEqual(status.json()['context_options'], [8192, 16384, 32768, 65536])
+        self.assertEqual(len(status.json()['models']), 2)
+        self.assertEqual(status.headers['cache-control'], 'no-store')
+
+        selected = 'hf.co/DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF:Q4_K_M'
+        payload = {'expected_model_id': 'qwen3.5:9b', 'new_model_id': selected,
+                   'expected_context_tokens': 16384, 'new_context_tokens': 65536}
+        self.assertEqual(client.post(path, json=payload, headers=self.alice).status_code, 403)
+        changed = client.post(path, json=payload, headers=admin)
+        self.assertEqual(changed.status_code, 200)
+        self.assertEqual(changed.json()['model_id'], selected)
+        self.assertEqual(runtime.changes, [('qwen3.5:9b', selected, 16384, 65536)])
+        invalid = client.post(path, json={**payload, 'new_context_tokens': 131072}, headers=admin)
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(len(runtime.changes), 1)
 
     def test_settings_save_uses_server_identity_and_remains_private(self):
         payload = {"settings": {"name": "Личный агент", "instructions": "Только мои данные"}, "revision": 0}

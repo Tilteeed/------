@@ -1,0 +1,8 @@
+# Install as /etc/systemd/system/ollama.service.d/bezr.conf
+[Service]
+# Keep the selected GPU model warm, but keep only one model resident.
+Environment="OLLAMA_KEEP_ALIVE=24h"
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
+Environment="OLLAMA_MAX_QUEUE=4"
+# The BEZR GPU acceptance profile uses two simultaneous agent sessions.
+Environment="OLLAMA_NUM_PARALLEL=2"

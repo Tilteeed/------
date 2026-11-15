@@ -12,6 +12,10 @@ let conflict = false;
 let dirty = false;
 let identityEpoch = 0;
 let currentUser = '';
+let currentRole = '';
+let adminModelBusy = false;
+let adminCurrentModel = null;
+let adminCurrentContext = null;
 let runtimeData = { state: 'not_connected' };
 let capabilities = {};
 let connected = false;
@@ -391,6 +395,12 @@ function controls() {
   $('reload').disabled = workspaceLocked;
   $('refresh-runtime').disabled = !authenticated || workspaceLocked;
   $('refresh-events').disabled = !authenticated || workspaceLocked || eventsBusy;
+  $('ollama-admin-model').disabled = !authenticated || currentRole !== 'admin' || adminModelBusy;
+  $('ollama-admin-context').disabled = !authenticated || currentRole !== 'admin' || adminModelBusy;
+  $('ollama-admin-apply').disabled = !authenticated || currentRole !== 'admin' || adminModelBusy
+    || !adminCurrentModel || adminCurrentContext === null
+    || ($('ollama-admin-model').value === adminCurrentModel
+      && Number($('ollama-admin-context').value) === adminCurrentContext);
   $('open-agent').disabled = !authenticated || workspaceLocked || controlUi.busy
     || controlUi.loading || !controlUi.available;
   $('control-ui-pairing').hidden = !authenticated || !controlUi.available;
@@ -449,6 +459,13 @@ function revoke() {
   authenticated = false;
   identityEpoch += 1;
   currentUser = '';
+  currentRole = '';
+  adminCurrentModel = null;
+  adminCurrentContext = null;
+  $('ollama-admin-panel').hidden = true;
+  $('ollama-admin-model').replaceChildren();
+  $('ollama-admin-context').replaceChildren();
+  $('ollama-admin-status').textContent = 'Настройка доступна только администратору.';
   connected = false;
   runtimeData = { state: 'not_connected' };
   capabilities = {};
@@ -487,7 +504,8 @@ async function request(path = '', method = 'GET', payload, signal) {
   else signal?.addEventListener('abort', abort, { once: true });
   const timeout = setTimeout(abort, 130000);
   try {
-    const response = await fetch(`${apiRoot}${path}`, {
+    const requestRoot = path.startsWith('/admin/') ? '/api/v1/agent-platform' : apiRoot;
+    const response = await fetch(`${requestRoot}${path}`, {
       method,
       mode: 'same-origin',
       credentials: 'omit',
@@ -755,6 +773,93 @@ async function loadEvents() {
   }
 }
 
+async function refreshAdminModel(epoch = identityEpoch) {
+  if (!authenticated || currentRole !== 'admin' || adminModelBusy) return;
+  adminModelBusy = true;
+  $('ollama-admin-status').textContent = 'Читаем выбранную модель…';
+  controls();
+  try {
+    const data = await request('/admin/ollama/model');
+    if (!authenticated || epoch !== identityEpoch) return;
+    if (typeof data.model_id !== 'string' || !Array.isArray(data.models)
+        || data.models.length < 1 || data.models.length > 8
+        || !Number.isSafeInteger(data.context_tokens)
+        || !Array.isArray(data.context_options) || data.context_options.length < 1
+        || data.context_options.length > 4) throw { status: 0 };
+    const options = document.createDocumentFragment();
+    let selected = false;
+    for (const model of data.models) {
+      if (!model || typeof model.id !== 'string' || typeof model.name !== 'string') throw { status: 0 };
+      const option = document.createElement('option');
+      option.value = model.id;
+      option.textContent = model.name;
+      if (model.id === data.model_id) { option.selected = true; selected = true; }
+      options.append(option);
+    }
+    if (!selected) throw { status: 0 };
+    const contexts = document.createDocumentFragment();
+    let contextSelected = false;
+    for (const tokens of data.context_options) {
+      if (![8192, 16384, 32768, 65536].includes(tokens)) throw { status: 0 };
+      const option = document.createElement('option');
+      option.value = String(tokens);
+      option.textContent = `${tokens / 1024}K tokens`;
+      if (tokens === data.context_tokens) { option.selected = true; contextSelected = true; }
+      contexts.append(option);
+    }
+    if (!contextSelected) throw { status: 0 };
+    adminCurrentModel = data.model_id;
+    adminCurrentContext = data.context_tokens;
+    $('ollama-admin-model').replaceChildren(options);
+    $('ollama-admin-context').replaceChildren(contexts);
+    $('ollama-admin-status').textContent = 'Текущая модель подтверждена сервером.';
+  } catch (error) {
+    if (epoch !== identityEpoch) return;
+    adminCurrentModel = null;
+    $('ollama-admin-status').textContent = errorView(error.status || 0, error.body).message;
+    if (error.status === 401 || error.status === 403) showError(error);
+  } finally {
+    adminModelBusy = false;
+    controls();
+  }
+}
+
+async function applyAdminModel() {
+  if (!authenticated || currentRole !== 'admin' || adminModelBusy || !adminCurrentModel) return;
+  const nextModel = $('ollama-admin-model').value;
+  const nextContext = Number($('ollama-admin-context').value);
+  if (!Number.isSafeInteger(nextContext) || adminCurrentContext === null
+      || (nextModel === adminCurrentModel && nextContext === adminCurrentContext)) return;
+  if (!window.confirm('Изменение модели или контекста перезапустит работающие агенты. Их файлы и история сохранятся. Продолжить?')) return;
+  const epoch = identityEpoch;
+  adminModelBusy = true;
+  $('ollama-admin-status').textContent = 'Применяем модель; работающие агенты перезапускаются…';
+  controls();
+  try {
+    const result = await request('/admin/ollama/model', 'POST', {
+      expected_model_id: adminCurrentModel,
+      new_model_id: nextModel,
+      expected_context_tokens: adminCurrentContext,
+      new_context_tokens: nextContext,
+    });
+    if (!authenticated || epoch !== identityEpoch) return;
+    $('ollama-admin-status').textContent = result.restart_pending > 0
+      ? `Выбор сохранён; ${result.restart_pending} агент(а) ожидают восстановления.`
+      : 'Модель применена; при первом запросе она может загрузиться в память.';
+    adminCurrentModel = result.model_id;
+    adminCurrentContext = result.context_tokens;
+    $('ollama-admin-model').value = result.model_id;
+    $('ollama-admin-context').value = String(result.context_tokens);
+  } catch (error) {
+    if (epoch !== identityEpoch) return;
+    $('ollama-admin-status').textContent = errorView(error.status || 0, error.body).message;
+    if (error.status === 401 || error.status === 403) showError(error);
+  } finally {
+    adminModelBusy = false;
+    controls();
+  }
+}
+
 async function load() {
   if (busy) return;
   if (dirty && !window.confirm('Перечитать настройки с сервера? Несохранённые изменения будут потеряны.')) return;
@@ -772,9 +877,12 @@ async function load() {
     authenticated = true;
     identityEpoch += 1;
     currentUser = data.user.id;
+    currentRole = data.user.role === 'admin' ? 'admin' : 'user';
+    $('ollama-admin-panel').hidden = currentRole !== 'admin';
     $('identity').textContent = data.user.name;
     renderRuntime(data);
     if (pageVisible) readinessPoll.start();
+    if (currentRole === 'admin') void refreshAdminModel(identityEpoch);
     void refreshControlUiStatus(identityEpoch);
     void loadEvents();
   } catch (error) {
@@ -887,6 +995,9 @@ for (const button of document.querySelectorAll('[data-action]')) {
   button.addEventListener('click', () => submitAction(button, button.dataset.action));
 }
 $('open-agent').addEventListener('click', openAgent);
+$('ollama-admin-model').addEventListener('change', controls);
+$('ollama-admin-context').addEventListener('change', controls);
+$('ollama-admin-apply').addEventListener('click', applyAdminModel);
 $('refresh-pairing').addEventListener('click', () => refreshControlUiPairing());
 $('refresh-runtime').addEventListener('click', async () => {
   if (!authenticated || busy) return;

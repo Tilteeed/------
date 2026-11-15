@@ -12,6 +12,7 @@ from .policy import require_owner, validate_agent_input
 from .store import RevisionConflict, LaunchRateLimited
 from .runtime import RuntimeRejected, RuntimeUnavailable
 from .access_proxy import ControlUiPairingError, _request_client_ip, validate_proxy_target
+from supervisor.ollama_config import MODEL_NAMES, SUPPORTED_CONTEXT_TOKENS
 
 
 def _workspace_path(value, *, allow_empty=False):
@@ -110,6 +111,12 @@ def create_router(verified_user, store, *, public_origin: str | None = None, run
             raise HTTPException(403, "Invalid user identity") from None
         return user
 
+    def administrator(user=Depends(actor)):
+        if user.role != 'admin':
+            raise HTTPException(403, {'code': 'admin_required',
+                                      'message': 'Требуются права администратора.'})
+        return user
+
     @router.get("/me")
     def get_me(response: Response, user=Depends(actor)):
         response.headers["Cache-Control"] = "no-store"
@@ -150,6 +157,61 @@ def create_router(verified_user, store, *, public_origin: str | None = None, run
         if runtime is None:
             raise HTTPException(503, {"code": "runtime_not_connected", "message": "Supervisor недоступен."})
         return runtime
+
+    @router.get('/admin/ollama/model')
+    async def get_admin_ollama_model(response: Response, user=Depends(administrator)):
+        client = require_runtime()
+        try:
+            current = await run_in_threadpool(client.ollama_model_status)
+        except RuntimeUnavailable:
+            raise HTTPException(503, {'code': 'supervisor_unavailable',
+                                      'message': 'Настройки модели сейчас недоступны.'}) from None
+        except RuntimeRejected as error:
+            raise HTTPException(error.status, {'code': error.code,
+                                               'message': error.message}) from None
+        response.headers['Cache-Control'] = 'no-store'
+        return {'model_id': current['model_id'],
+                'context_tokens': current['context_tokens'],
+                'context_options': sorted(SUPPORTED_CONTEXT_TOKENS),
+                'models': [
+            {'id': model_id, 'name': name}
+            for model_id, name in sorted(MODEL_NAMES.items())
+        ]}
+
+    @router.post('/admin/ollama/model')
+    async def set_admin_ollama_model(request: Request, response: Response,
+                                     user=Depends(administrator)):
+        payload = await mutation_body(request)
+        model_fields = {'expected_model_id', 'new_model_id'}
+        context_fields = model_fields | {'expected_context_tokens', 'new_context_tokens'}
+        if (type(payload) is not dict or set(payload) not in (model_fields, context_fields)
+                or type(payload.get('expected_model_id')) is not str
+                or payload['expected_model_id'] not in MODEL_NAMES
+                or type(payload.get('new_model_id')) is not str
+                or payload['new_model_id'] not in MODEL_NAMES):
+            raise HTTPException(400, {'code': 'invalid_model_selection',
+                                      'message': 'Выберите модель из списка.'})
+        if set(payload) == context_fields and (
+                type(payload.get('expected_context_tokens')) is not int
+                or payload['expected_context_tokens'] not in SUPPORTED_CONTEXT_TOKENS
+                or type(payload.get('new_context_tokens')) is not int
+                or payload['new_context_tokens'] not in SUPPORTED_CONTEXT_TOKENS):
+            raise HTTPException(400, {'code': 'invalid_context_selection',
+                                      'message': 'Выберите размер контекста из списка.'})
+        client = require_runtime()
+        try:
+            result = await run_in_threadpool(
+                client.change_ollama_model,
+                payload['expected_model_id'], payload['new_model_id'],
+                payload.get('expected_context_tokens'), payload.get('new_context_tokens'))
+        except RuntimeUnavailable:
+            raise HTTPException(503, {'code': 'supervisor_unavailable',
+                                      'message': 'Supervisor не смог применить модель.'}) from None
+        except RuntimeRejected as error:
+            raise HTTPException(error.status, {'code': error.code,
+                                               'message': error.message}) from None
+        response.headers['Cache-Control'] = 'no-store'
+        return result
 
     def control_ui_instance(owner_id):
         if runtime is None:

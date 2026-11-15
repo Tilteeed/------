@@ -1236,6 +1236,33 @@ class DockerEngine:
             EndpointPair(agent['sidecar_ip'], agent['gateway_ip']),
             EndpointPair(frontend['web_ip'], frontend['sidecar_ip']))
 
+    def _proxy_sidecar_labels(self, instance_id, spec, image_info):
+        """Build the exact label map Docker will expose for a BEZR sidecar.
+
+        Docker carries image labels into container inspection. Preserve those
+        labels explicitly while ensuring the BEZR ownership/spec labels win.
+        An exact comparison against this merged map rejects arbitrary additions.
+        """
+        instance_id = self._instance(instance_id)
+        config = image_info.get('Config') if type(image_info) is dict else None
+        inherited = config.get('Labels') if type(config) is dict else None
+        if inherited is None:
+            inherited = {}
+        if (type(inherited) is not dict or len(inherited) > 256
+                or any(type(key) is not str or not key or len(key) > 256
+                       or any(ord(char) <= 32 or ord(char) == 127 for char in key)
+                       or type(value) is not str or len(value) > 4096
+                       for key, value in inherited.items())):
+            raise DockerEngineError('Invalid sidecar image labels')
+        labels = dict(inherited)
+        labels.update({
+            self.INSTANCE_LABEL: instance_id,
+            self.SIDECAR_ROLE_LABEL: self.SIDECAR_ROLE,
+            self.SIDECAR_SPEC_LABEL: self._json(spec),
+            self.SIDECAR_CONFIG_LABEL: self._hash(spec),
+        })
+        return labels
+
     def _proxy_sidecar_payload(self, instance_id, *, owner_id, control_ui_origin,
                                gateway_ip, listen_ip, image_id, host_path, plan,
                                image_info=None):
@@ -1279,11 +1306,6 @@ class DockerEngine:
             'gateway_ip': gateway_ip, 'listen_ip': listen_ip,
             'host_path': host_path, 'agent': plan['agent'], 'frontend': plan['frontend'],
         }
-        labels = {
-            self.INSTANCE_LABEL: instance_id, self.SIDECAR_ROLE_LABEL: self.SIDECAR_ROLE,
-            self.SIDECAR_SPEC_LABEL: self._json(spec),
-            self.SIDECAR_CONFIG_LABEL: self._hash(spec),
-        }
         environment = {
             'BEZR_SIDECAR_OWNER_ID': owner_id,
             'BEZR_SIDECAR_PUBLIC_ORIGIN': control_ui_origin,
@@ -1298,6 +1320,7 @@ class DockerEngine:
         if (type(image_info) is not dict or image_info.get('Id') != image_id
                 or type(image_config) is not dict):
             raise DockerEngineError('Sidecar image verification failed')
+        labels = self._proxy_sidecar_labels(instance_id, spec, image_info)
         inherited = image_config.get('Env')
         if inherited is None:
             inherited = []
@@ -1861,12 +1884,7 @@ class DockerEngine:
                 sidecar_id = self._object(sidecar.get('Id'))
                 sidecar_labels = sidecar['Config']['Labels']
                 old_spec = json.loads(sidecar_labels[self.SIDECAR_SPEC_LABEL])
-                expected_label_names = {
-                    self.INSTANCE_LABEL, self.SIDECAR_ROLE_LABEL,
-                    self.SIDECAR_SPEC_LABEL, self.SIDECAR_CONFIG_LABEL,
-                }
-                if (set(sidecar_labels) != expected_label_names
-                        or type(old_spec) is not dict
+                if (type(old_spec) is not dict
                         or set(old_spec) != {
                             'version', 'image_id', 'owner_id', 'control_ui_origin',
                             'gateway_ip', 'listen_ip', 'host_path', 'agent', 'frontend'}
@@ -1886,6 +1904,9 @@ class DockerEngine:
                     'frontend': self._proxy_network_id(instance_id, 'frontend', plan['frontend']),
                 }
                 old_image_info = self._proxy_sidecar_image_info(old_spec['image_id'], web)
+                if sidecar_labels != self._proxy_sidecar_labels(
+                        instance_id, old_spec, old_image_info):
+                    raise DockerEngineError('Sidecar labels differ from image and BEZR identity')
                 old_payload = self._proxy_sidecar_payload(
                     instance_id, owner_id=owner_id,
                     control_ui_origin=gateway_spec['control_ui_origin'],
@@ -2422,8 +2443,8 @@ class DockerEngine:
             config = observed['Config']
             host = observed['HostConfig']
             labels = config['Labels']
-            if (observed.get('Image') != expected['Image']
-                    or any(labels.get(key) != value for key, value in expected['Labels'].items())):
+            if (type(labels) is not dict or observed.get('Image') != expected['Image']
+                    or labels != expected['Labels']):
                 raise ValueError
             for key in ('User', 'Entrypoint', 'Cmd', 'WorkingDir', 'StopTimeout'):
                 if config.get(key) != expected.get(key):
@@ -2613,7 +2634,7 @@ class DockerEngine:
         return observed
 
     def _list_proxy_sidecars(self):
-        """Return the globally labelled Sidecars only after exact label/spec validation."""
+        """Return sidecars only when image and merged Docker labels match exactly."""
         filters = {'label': [self.SIDECAR_ROLE_LABEL + '=' + self.SIDECAR_ROLE]}
         rows = self._request('GET', '/containers/json?' + urlencode(
             {'all': 'true', 'filters': self._json(filters)}))
@@ -2637,17 +2658,23 @@ class DockerEngine:
                 spec = json.loads(labels[self.SIDECAR_SPEC_LABEL])
             except (KeyError, TypeError, ValueError):
                 raise DockerEngineError('Proxy sidecar identity is invalid') from None
-            expected_label_names = {
-                self.INSTANCE_LABEL, self.SIDECAR_ROLE_LABEL,
-                self.SIDECAR_SPEC_LABEL, self.SIDECAR_CONFIG_LABEL,
-            }
             if (labels.get(self.SIDECAR_ROLE_LABEL) != self.SIDECAR_ROLE
-                    or set(labels) != expected_label_names
                     or names != ['/pa-proxy-' + instance_id]
                     or type(spec) is not dict
                     or labels.get(self.SIDECAR_CONFIG_LABEL) != self._hash(spec)
+                    or observed.get('Image') != spec.get('image_id')
                     or instance_id in result):
                 raise DockerEngineError('Proxy sidecar identity is ambiguous')
+            image_id = spec.get('image_id')
+            if (type(image_id) is not str
+                    or re.fullmatch(r'sha256:[0-9a-f]{64}', image_id) is None):
+                raise DockerEngineError('Proxy sidecar image identity is invalid')
+            image_info = self._request(
+                'GET', '/images/' + quote(image_id, safe='') + '/json')
+            if (type(image_info) is not dict or image_info.get('Id') != image_id
+                    or type(image_info.get('Config')) is not dict
+                    or labels != self._proxy_sidecar_labels(instance_id, spec, image_info)):
+                raise DockerEngineError('Proxy sidecar labels or image identity are invalid')
             result[instance_id] = observed
         return result
 

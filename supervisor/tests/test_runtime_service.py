@@ -950,14 +950,19 @@ class OllamaModelChangeTests(unittest.TestCase):
                     result = service.change_ollama_model({
                         'expected_model_id': old_policy['default_model_id'],
                         'new_model_id': new_model,
+                        'expected_context_tokens': old_policy['context_tokens'],
+                        'new_context_tokens': 65536,
                     })
 
                 self.assertEqual(result['updated_instances'], 1)
                 self.assertEqual(service.ollama_config['default_model_id'], new_model)
+                self.assertEqual(service.ollama_config['context_tokens'], 65536)
                 self.assertEqual(state['config']['models']['providers']['ollama']['models'][0]['id'], new_model)
                 self.assertTrue(ollama_policy_matches_config(state['config'], service.ollama_config))
                 self.assertEqual(result['model_id'], new_model)
+                self.assertEqual(result['context_tokens'], 65536)
                 self.assertEqual(store.ollama_model_id(), new_model)
+                self.assertEqual(store.ollama_context_tokens(), 65536)
                 current = store.current('alice')
                 assert current is not None
                 self.assertEqual(current['desired_state'], 'running')
@@ -973,6 +978,7 @@ class OllamaModelChangeTests(unittest.TestCase):
                         disk_floor_bytes=0, clock=lambda: 100, ollama_config=old_policy)
                     assert restarted.ollama_config is not None
                     self.assertEqual(restarted.ollama_config['default_model_id'], new_model)
+                    self.assertEqual(restarted.ollama_config['context_tokens'], 65536)
 
                 with self.assertRaises(ServiceError) as stale:
                     service.change_ollama_model({

@@ -306,6 +306,64 @@ class SupervisorClient:
             request['settings'] = {'name': draft['name'], 'instructions': draft['instructions']}
         return self._request('/v1/actions', request)
 
+    def ollama_model_status(self):
+        from supervisor.ollama_config import MODEL_NAMES, SUPPORTED_CONTEXT_TOKENS
+        data = self._request('/v1/admin/ollama/model', {'action': 'status'},
+                             response_kind='json')
+        model_id = data.get('model_id')
+        context_tokens = data.get('context_tokens')
+        if (set(data) != {'model_id', 'context_tokens'}
+                or type(model_id) is not str or model_id not in MODEL_NAMES
+                or type(context_tokens) is not int
+                or context_tokens not in SUPPORTED_CONTEXT_TOKENS):
+            raise RuntimeUnavailable('Invalid administrator model response')
+        return {'model_id': model_id, 'context_tokens': context_tokens}
+
+    def change_ollama_model(self, expected_model_id, new_model_id,
+                            expected_context_tokens=None, new_context_tokens=None):
+        from supervisor.ollama_config import MODEL_NAMES, SUPPORTED_CONTEXT_TOKENS
+        if (type(expected_model_id) is not str or expected_model_id not in MODEL_NAMES
+                or type(new_model_id) is not str or new_model_id not in MODEL_NAMES):
+            raise RuntimeUnavailable('Invalid administrator model request')
+        payload = {
+            'expected_model_id': expected_model_id,
+            'new_model_id': new_model_id,
+        }
+        if expected_context_tokens is not None or new_context_tokens is not None:
+            if (type(expected_context_tokens) is not int
+                    or expected_context_tokens not in SUPPORTED_CONTEXT_TOKENS
+                    or type(new_context_tokens) is not int
+                    or new_context_tokens not in SUPPORTED_CONTEXT_TOKENS):
+                raise RuntimeUnavailable('Invalid administrator context request')
+            payload['expected_context_tokens'] = expected_context_tokens
+            payload['new_context_tokens'] = new_context_tokens
+        data = self._request('/v1/admin/ollama/model', payload, response_kind='json')
+        status = data.get('status')
+        expected_fields = ({'status', 'model_id', 'updated_instances', 'restart_pending'}
+                           if status == 'unchanged' else
+                           {'status', 'previous_model_id', 'model_id',
+                            'updated_instances', 'restart_pending'})
+        expected_fields |= {'context_tokens'}
+        if status == 'updated':
+            expected_fields.add('previous_context_tokens')
+        if (set(data) != expected_fields or status not in {'updated', 'unchanged'}
+                or data.get('model_id') != new_model_id
+                or type(data.get('context_tokens')) is not int
+                or data['context_tokens'] not in SUPPORTED_CONTEXT_TOKENS
+                or (new_context_tokens is not None
+                    and data.get('context_tokens') != new_context_tokens)
+                or type(data.get('updated_instances')) is not int
+                or type(data.get('restart_pending')) is not int):
+            raise RuntimeUnavailable('Invalid administrator model response')
+        if status == 'updated' and (
+                data.get('previous_model_id') != expected_model_id
+                or type(data.get('previous_context_tokens')) is not int
+                or data['previous_context_tokens'] not in SUPPORTED_CONTEXT_TOKENS
+                or (expected_context_tokens is not None
+                    and data['previous_context_tokens'] != expected_context_tokens)):
+            raise RuntimeUnavailable('Invalid administrator model response')
+        return data
+
 
 def configured_client():
     path = os.environ.get('AGENT_PLATFORM_SUPERVISOR_SOCKET')

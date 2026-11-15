@@ -34,7 +34,7 @@ from .config_lock import (
 from .metrics import HostMetrics, MetricsUnavailable
 from .openclaw_config import build_gateway_config
 from .ollama_config import (
-    MODEL_NAMES, ollama_policy_matches_config,
+    MODEL_NAMES, SUPPORTED_CONTEXT_TOKENS, ollama_policy_matches_config,
     replace_ollama_policy_in_config, validate_ollama_config,
 )
 from .ollama_firewall import validate_ollama_route_inputs
@@ -345,8 +345,13 @@ class RuntimeService:
             if selected_model is None:
                 selected_model = self.store.seed_ollama_model_id(
                     self.ollama_config['default_model_id'])
+            selected_context = self.store.ollama_context_tokens()
+            if selected_context is None:
+                selected_context = self.store.seed_ollama_context_tokens(
+                    self.ollama_config['context_tokens'])
             self.ollama_config = {**self.ollama_config,
-                                  'default_model_id': selected_model}
+                                  'default_model_id': selected_model,
+                                  'context_tokens': selected_context}
         self.model_status_cache = CachedModelStatus(model_status)
         self.lock = threading.RLock()
         self._boot_candidates = {}
@@ -971,15 +976,18 @@ class RuntimeService:
             raise ServiceError('runtime_unavailable', 503)
         try:
             model_id = self.store.ollama_model_id()
+            context_tokens = self.store.ollama_context_tokens()
         except StoreError as error:
             raise ServiceError(error.code, 503) from None
-        if model_id is None:
+        if model_id is None or context_tokens is None:
             raise ServiceError('admin_config_uninitialized', 503)
-        return {'model_id': model_id}
+        return {'model_id': model_id, 'context_tokens': context_tokens}
 
     def change_ollama_model(self, payload):
-        """Root-only model switch; rewrite locked config and retain every data volume."""
-        if (type(payload) is not dict or set(payload) != {'expected_model_id', 'new_model_id'}
+        """Switch model/context, rewrite locked configs, and retain every data volume."""
+        model_fields = {'expected_model_id', 'new_model_id'}
+        context_fields = model_fields | {'expected_context_tokens', 'new_context_tokens'}
+        if (type(payload) is not dict or set(payload) not in (model_fields, context_fields)
                 or type(payload.get('expected_model_id')) is not str
                 or payload['expected_model_id'] not in MODEL_NAMES
                 or type(payload.get('new_model_id')) is not str
@@ -1000,12 +1008,18 @@ class RuntimeService:
 
             try:
                 current_id = self.store.ollama_model_id()
+                current_context = self.store.ollama_context_tokens()
             except StoreError as error:
                 raise ServiceError(error.code, 503) from None
-            if current_id is None:
+            if current_id is None or current_context is None:
                 raise ServiceError('admin_config_uninitialized', 503)
             new_id = payload['new_model_id']
-            if new_id == current_id:
+            expected_context = payload.get('expected_context_tokens', current_context)
+            new_context = payload.get('new_context_tokens', current_context)
+            if (type(expected_context) is not int or expected_context not in SUPPORTED_CONTEXT_TOKENS
+                    or type(new_context) is not int or new_context not in SUPPORTED_CONTEXT_TOKENS):
+                raise ServiceError('invalid_request', 400)
+            if new_id == current_id and new_context == current_context:
                 for instance in self.store.all_instances():
                     if (not instance.get('initialized') or not instance.get('storage')
                             or instance.get('state') == 'purged'):
@@ -1017,14 +1031,17 @@ class RuntimeService:
                             or saved[1] != (canonical(saved[0]) + '\n').encode('utf-8')):
                         raise ServiceError('model_policy_unverified', 503)
                 return {'status': 'unchanged', 'model_id': current_id,
+                        'context_tokens': current_context,
                         'updated_instances': 0, 'restart_pending': 0}
-            if payload['expected_model_id'] != current_id:
+            if (payload['expected_model_id'] != current_id
+                    or expected_context != current_context):
                 raise ServiceError('admin_config_conflict', 409)
 
             old_policy = dict(self.ollama_config)
             try:
                 new_policy = asdict(validate_ollama_config(
-                    {**old_policy, 'default_model_id': new_id}))
+                    {**old_policy, 'default_model_id': new_id,
+                     'context_tokens': new_context}))
             except ValueError:
                 raise ServiceError('invalid_admin_model', 400) from None
 
@@ -1098,8 +1115,10 @@ class RuntimeService:
                     if type(saved) is not tuple or len(saved) != 2 or saved[1] != plan['new_blob']:
                         raise ServiceError('model_policy_unverified', 503)
                 db_attempted = True
-                self.store.update_ollama_model_id(current_id, new_id)
-                if self.store.ollama_model_id() != new_id:
+                self.store.update_ollama_selection(
+                    current_id, new_id, current_context, new_context)
+                if (self.store.ollama_model_id() != new_id
+                        or self.store.ollama_context_tokens() != new_context):
                     raise StoreError('admin_config_conflict')
                 for plan in plans:
                     saved = self._read_managed_gateway_config(
@@ -1162,7 +1181,9 @@ class RuntimeService:
                     except Exception:
                         restart_pending += 1
             return {'status': 'updated', 'previous_model_id': current_id,
+                    'previous_context_tokens': current_context,
                     'model_id': new_id,
+                    'context_tokens': new_context,
                     'updated_instances': sum(1 for item in plans if item['needs_update']),
                     'restart_pending': restart_pending}
 
@@ -1861,6 +1882,12 @@ class APIHandler(BaseHTTPRequestHandler):
             else:
                 allowed_paths = {'/v1/me', '/v1/actions', '/v1/replay',
                                  '/v1/retained/workspace', '/v1/control-ui/target'}
+                # The WebUI backend is the trusted authentication gateway for
+                # its signed-in administrators. The operation remains limited
+                # to the closed, root-managed model catalogue and never exposes
+                # the root-only maintenance socket to the container.
+                if getattr(self.controller, 'ollama_config', None) is not None:
+                    allowed_paths.add('/v1/admin/ollama/model')
             if self.path not in allowed_paths:
                 raise ServiceError('not_found', 404)
             lengths = self.headers.get_all('Content-Length', [])

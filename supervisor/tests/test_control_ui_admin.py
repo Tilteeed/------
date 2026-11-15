@@ -61,7 +61,7 @@ class ControlUiMaintenanceHandlerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, {'action': 'plan', 'status': 'ok'})
 
-    def test_model_change_endpoint_is_root_admin_only_and_not_public(self):
+    def test_model_change_has_narrow_webui_path_and_root_only_maintenance_path(self):
         class OllamaController:
             ollama_config = {'default_model_id': 'qwen3.5:9b'}
             def me(self, _payload):
@@ -71,9 +71,13 @@ class ControlUiMaintenanceHandlerTests(unittest.TestCase):
             def replay(self, _payload):
                 return {}
             def change_ollama_model(self, payload):
-                return {'status': 'updated', 'model_id': payload['new_model_id']}
+                return {'status': 'updated', 'previous_model_id': 'qwen3.5:9b',
+                        'previous_context_tokens': 16384,
+                        'model_id': payload['new_model_id'],
+                        'context_tokens': payload.get('new_context_tokens', 16384),
+                        'updated_instances': 0, 'restart_pending': 0}
             def ollama_model_status(self):
-                return {'model_id': 'qwen3.5:9b'}
+                return {'model_id': 'qwen3.5:9b', 'context_tokens': 16384}
 
         controller = OllamaController()
         selected = 'hf.co/DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF:Q4_K_M'
@@ -82,7 +86,7 @@ class ControlUiMaintenanceHandlerTests(unittest.TestCase):
             status, body = self._request(
                 create_admin_handler, '/v1/admin/ollama/model', {'action': 'status'}, controller=controller)
         self.assertEqual(status, 200)
-        self.assertEqual(body, {'model_id': 'qwen3.5:9b'})
+        self.assertEqual(body, {'model_id': 'qwen3.5:9b', 'context_tokens': 16384})
         with patch('supervisor.service._unix_peer_uid', return_value=0):
             status, body = self._request(
                 create_admin_handler, '/v1/admin/ollama/model', payload, controller=controller)
@@ -90,9 +94,19 @@ class ControlUiMaintenanceHandlerTests(unittest.TestCase):
         self.assertEqual(body['model_id'], selected)
 
         status, body = self._request(
-            create_handler, '/v1/admin/ollama/model', payload, controller=controller)
+            create_handler, '/v1/admin/ollama/model', {'action': 'status'}, controller=controller)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {'model_id': 'qwen3.5:9b', 'context_tokens': 16384})
+
+        status, body = self._request(
+            create_handler, '/v1/admin/control-ui/sidecars', {'action': 'plan'}, controller=controller)
         self.assertEqual(status, 404)
         self.assertEqual(body['code'], 'not_found')
+
+        status, body = self._request(
+            create_handler, '/v1/admin/ollama/model', payload, controller=controller)
+        self.assertEqual(status, 200)
+        self.assertEqual(body['model_id'], selected)
 
     def test_peer_uid_helper_distinguishes_root_from_nonroot(self):
         class Peer:

@@ -23,6 +23,7 @@ class ModelChangeImmutableTests(unittest.TestCase):
         service.sidecar_migration = None
         service.store = Mock()
         service.store.ollama_model_id.return_value = OLD['default_model_id']
+        service.store.ollama_context_tokens.return_value = OLD['context_tokens']
         instance = {'id': 'x', 'initialized': True, 'storage': True, 'state': 'stopped',
                     'active': False, 'desired_state': 'stopped'}
         service.store.all_instances.return_value = [instance]
@@ -47,7 +48,7 @@ class ModelChangeImmutableTests(unittest.TestCase):
         service, state = self.setup_service(already_new=True)
         with self.assertRaises(ServiceError):
             service.change_ollama_model({'expected_model_id': OLD['default_model_id'], 'new_model_id': NEW})
-        service.store.update_ollama_model_id.assert_not_called()
+        service.store.update_ollama_selection.assert_not_called()
         service.reconcile.assert_not_called()
 
     def test_replacement_returning_unlocked_new_bytes_never_commits(self):
@@ -58,17 +59,18 @@ class ModelChangeImmutableTests(unittest.TestCase):
         with patch('supervisor.service.replace_locked_config_at', side_effect=replace):
             with self.assertRaises(ServiceError):
                 service.change_ollama_model({'expected_model_id': OLD['default_model_id'], 'new_model_id': NEW})
-        service.store.update_ollama_model_id.assert_not_called()
+        service.store.update_ollama_selection.assert_not_called()
         service.reconcile.assert_not_called()
 
     def test_lock_lost_during_db_commit_does_not_restart_or_report_success(self):
         service, state = self.setup_service()
         def replace(_fd, _expected, replacement):
             state['blob'] = replacement
-        def commit(*_args):
+        def commit(_expected_model, new_model, _expected_context, new_context):
             state['immutable'] = False
-            service.store.ollama_model_id.return_value = NEW
-        service.store.update_ollama_model_id.side_effect = commit
+            service.store.ollama_model_id.return_value = new_model
+            service.store.ollama_context_tokens.return_value = new_context
+        service.store.update_ollama_selection.side_effect = commit
         with patch('supervisor.service.replace_locked_config_at', side_effect=replace):
             with self.assertRaises(ServiceError):
                 service.change_ollama_model({'expected_model_id': OLD['default_model_id'], 'new_model_id': NEW})
@@ -83,5 +85,5 @@ class ModelChangeImmutableTests(unittest.TestCase):
             with self.assertRaises(ServiceError) as caught:
                 service.change_ollama_model({'expected_model_id': OLD['default_model_id'], 'new_model_id': NEW})
         self.assertEqual(caught.exception.code, 'model_policy_unverified')
-        service.store.update_ollama_model_id.assert_not_called()
+        service.store.update_ollama_selection.assert_not_called()
         service.reconcile.assert_not_called()

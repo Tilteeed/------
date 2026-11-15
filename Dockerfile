@@ -26,10 +26,11 @@ RUN python -m unittest discover -s supervisor/tests -v
 FROM ghcr.io/open-webui/open-webui:v0.12.5-slim@sha256:9a4db3e6c8d6174d4ed8952304115e90dcc36e9a8b98c2f8984eab321f29505e AS runtime
 WORKDIR /app/backend
 COPY --from=backend-tests /app/backend/control_plane/ ./control_plane/
+COPY supervisor/ollama_config.py ./supervisor/ollama_config.py
 COPY --from=frontend-tests /src/web/agent/ ./control_plane/static/
 COPY scripts/install_integration.py /tmp/install_agent_integration.py
 RUN python /tmp/install_agent_integration.py /app/backend/open_webui/main.py \
-    && python -m compileall -q /app/backend/control_plane \
+    && python -m compileall -q /app/backend/control_plane /app/backend/supervisor \
     && mkdir -p /app/backend/data \
     && chown -R 1000:0 /app/backend/data /app/backend/control_plane
 ENV HOME=/app/backend/data

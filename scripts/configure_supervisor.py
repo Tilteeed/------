@@ -36,10 +36,10 @@ def amount(value):
 
 
 def build_ollama_policy(base_url, default_model_id, max_tokens,
-                        context_tokens=8192, think=False):
+                        context_tokens=65536, think=False):
     """Build an optional trusted model policy; no endpoint means LLM stays disabled."""
     if (base_url is None and default_model_id is None and max_tokens is None
-            and context_tokens == 8192 and think is False):
+            and context_tokens in {8192, 65536} and think is False):
         return None
     if base_url is None or default_model_id is None or max_tokens is None:
         raise ValueError('Ollama URL, admin-selected model and max tokens are required together')
@@ -109,7 +109,7 @@ def main(argv=None):
                         help='Private IPv4 Ollama API address; enables the native provider')
     parser.add_argument('--ollama-default-model-id', choices=sorted(MODEL_NAMES), default=None,
                         help='Operator-selected default from the fixed approved model catalog')
-    parser.add_argument('--ollama-context-tokens', type=amount, default=8192)
+    parser.add_argument('--ollama-context-tokens', type=amount, default=65536)
     parser.add_argument('--ollama-max-tokens', type=amount, default=None)
     parser.add_argument('--ollama-think', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--ollama-network-pool', default=None,

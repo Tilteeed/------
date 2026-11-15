@@ -170,7 +170,7 @@ class ServiceConfigTests(unittest.TestCase):
                 policy | {'base_url': 'http://127.0.0.1:11434'},
                 policy | {'base_url': 'http://192.0.2.10:11434'},
                 policy | {'context_tokens': True},
-                policy | {'context_tokens': 32768},
+                policy | {'context_tokens': 65537},
                 policy | {'max_tokens': 8193},
                 policy | {'think': 0},
             ):
@@ -184,6 +184,9 @@ class OllamaAdminConfigTests(unittest.TestCase):
     def test_site_policy_requires_all_values_and_is_disabled_when_unset(self):
         from scripts.configure_supervisor import build_ollama_policy
         self.assertIsNone(build_ollama_policy(None, None, None, 8192, False))
+        self.assertIsNone(build_ollama_policy(None, None, None, 65536, False))
+        with self.assertRaises(ValueError):
+            build_ollama_policy(None, None, None, 32768, False)
         with self.assertRaises(ValueError):
             build_ollama_policy('http://10.99.0.10:11434', None, None, 8192, False)
         config = build_ollama_policy(

@@ -59,6 +59,16 @@
             <div class="lifecycle" role="group" aria-label="Управление агентом" aria-describedby="lifecycle-help"><button data-action="create" disabled>Создать</button><button data-action="start" disabled>Запустить</button><button data-action="stop" disabled>Остановить</button><button data-action="restart" disabled>Перезапустить</button><button data-action="remove" disabled>Удалить, сохранить данные</button><button data-action="restore" disabled hidden>Продолжить восстановление</button><button data-action="purge" disabled>Удалить данные и квоту</button></div>
             <button type="button" id="refresh-runtime">Обновить состояние</button><p class="field-help" id="lifecycle-help">Создание и запуск требуют готовых метрик и проверенной квоты. Модель, чат с агентом и Telegram пока не подключены. Инструкции применяются при первоначальном создании; последующие сохранения остаются черновиком.</p>
           </section>
+          <section class="panel" id="ollama-admin-panel" aria-labelledby="ollama-admin-title" hidden>
+            <p class="eyebrow">Администрирование</p><h2 id="ollama-admin-title">Модель Ollama</h2>
+            <p>Модель и контекст применяются ко всем агентам. Работающие агенты перезапустятся; их файлы и история сохранятся. Размер контекста расходует память GPU.</p>
+            <label for="ollama-admin-model">Модель по умолчанию</label>
+            <select id="ollama-admin-model" disabled></select>
+            <label for="ollama-admin-context">Контекст на агента</label>
+            <select id="ollama-admin-context" disabled></select>
+            <button class="primary" type="button" id="ollama-admin-apply" disabled>Применить для всех агентов</button>
+            <p class="field-help" id="ollama-admin-status" role="status" aria-live="polite">Загрузка настройки…</p>
+          </section>
           <section class="panel" id="retained-panel" aria-labelledby="retained-title" hidden><div class="panel-heading"><h2 id="retained-title">Сохранённые данные</h2></div><p>Только рабочая папка агента. Скрытые файлы, credentials, секреты и служебное состояние не показываются. UTF-8 текст до 256 КиБ можно просматривать; файлы до 16 МиБ — скачивать. Восстановление запускает тот же экземпляр с сохранёнными данными; черновик настроек не применяется.</p><ul id="retained-list"></ul></section>
           <section class="panel" aria-labelledby="telegram-title"><div class="panel-heading"><h2 id="telegram-title">Telegram</h2><span class="tag">Не подключён</span></div><p id="telegram-help">Интеграция пока недоступна. Добавлять токен бота не нужно.</p><button disabled aria-describedby="telegram-help">Подключить Telegram</button></section>
         </div>

@@ -4,6 +4,7 @@ import unittest
 from supervisor.openclaw_config import build_gateway_config
 from supervisor.ollama_config import (
     ollama_policy_matches_config, replace_ollama_policy_in_config,
+    validate_ollama_config,
 )
 
 
@@ -111,6 +112,16 @@ class GatewayConfigTests(unittest.TestCase):
         self.assertEqual(models[0]['contextTokens'], 8192)
         self.assertEqual(models[0]['maxTokens'], 512)
         self.assertEqual(models[0]['params'], {'num_ctx': 8192, 'think': False})
+
+    def test_measured_64k_context_is_supported(self):
+        value = validate_ollama_config({
+            'base_url': 'http://10.99.0.10:11434',
+            'default_model_id': 'qwen3.5:9b',
+            'context_tokens': 65536,
+            'max_tokens': 2048,
+            'think': False,
+        })
+        self.assertEqual(value.context_tokens, 65536)
 
     def test_ollama_catalog_is_static_and_discovery_tools_are_disabled_without_dropping_proxy_plugin(self):
         instance = self.instance()
