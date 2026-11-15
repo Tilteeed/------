@@ -72,7 +72,8 @@ class PlatformApiTests(unittest.TestCase):
             return {'status': 'updated', 'previous_model_id': 'qwen3.5:9b',
                     'previous_context_tokens': 16384,
                     'model_id': 'qwen3.5:9b', 'context_tokens': 65536,
-                    'updated_instances': 2, 'restart_pending': 0}
+                    'updated_instances': 2, 'restart_pending': 0,
+                    'runner_status': 'ready'}
         client._request = response
         self.assertEqual(client.ollama_model_status(), {
             'model_id': 'qwen3.5:9b', 'context_tokens': 16384})
@@ -132,7 +133,8 @@ class PlatformApiTests(unittest.TestCase):
                 return {'status': 'updated', 'previous_model_id': previous,
                         'previous_context_tokens': previous_context,
                         'model_id': new, 'context_tokens': new_context,
-                        'updated_instances': 2, 'restart_pending': 0}
+                        'updated_instances': 2, 'restart_pending': 0,
+                        'runner_status': 'ready'}
 
         runtime = Runtime()
         app = FastAPI()

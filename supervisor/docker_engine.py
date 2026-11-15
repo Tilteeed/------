@@ -16,6 +16,7 @@ import re
 import secrets
 import socket
 import stat
+import sys
 import time
 from typing import Callable
 from urllib.parse import quote, urlencode, urlsplit
@@ -3861,41 +3862,62 @@ class DockerEngine:
         return state
 
     def start(self, instance_id):
+        stage = 'container_lookup'
         instance_id = self._instance(instance_id)
         observed = self._find(instance_id)
         if observed is None:
+            print('Managed proxy start failed: stage=container_lookup condition=container_absent',
+                  file=sys.stderr, flush=True)
             raise DockerEngineError('Managed container is absent')
         labels = observed.get('Config', {}).get('Labels', {})
         try:
             spec = json.loads(labels[self.SPEC_LABEL])
-        except Exception:
+        except Exception as error:
+            print('Managed proxy start failed: stage=spec_read exception='
+                  + type(error).__name__, file=sys.stderr, flush=True)
             raise DockerEngineError('Managed container configuration verification failed') from None
         if type(spec) is not dict or spec.get('version') != 3:
             return self._action(instance_id, 'start')
+        stage = 'identity_verification'
         try:
             gateway_id = self._verify(instance_id, observed)
-        except Exception:
+        except Exception as error:
+            error_type = type(error).__name__
+            if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', error_type) is None:
+                error_type = 'Error'
+            print('Managed proxy start failed: stage=identity_verification exception='
+                  + error_type, file=sys.stderr, flush=True)
             if not self._stop_proxy_containers(instance_id):
                 raise DockerEngineError(
                     'Gateway verification failed and proxy stop could not be verified') from None
             raise
+        stage = 'proxy_preflight'
         if not self._proxy_firewall_ready(instance_id, spec):
+            print('Managed proxy start failed: stage=proxy_preflight condition=checks_not_ready',
+                  file=sys.stderr, flush=True)
             if not self._stop_proxy_containers(instance_id):
+                print('Managed proxy start rollback failed: stage=proxy_preflight',
+                      file=sys.stderr, flush=True)
                 raise DockerEngineError(
                     'Per-agent firewall policy is not ready and proxy stop could not be verified')
             raise DockerEngineError('Per-agent firewall policy is not ready')
         try:
+            stage = 'ollama_route_setup'
             if self.ollama_config is not None:
                 self.ensure_ollama_route(instance_id)
             gateway_state = observed.get('State') or {}
             if gateway_state.get('Status') != 'running':
+                stage = 'gateway_start'
                 self._action(instance_id, 'start')
+            stage = 'sidecar_lookup'
             sidecar = self._find_proxy_sidecar(instance_id)
             if sidecar is None:
                 raise DockerEngineError('Proxy sidecar is absent')
             sidecar_id = self._object(sidecar.get('Id'))
             if (sidecar.get('State') or {}).get('Status') != 'running':
+                stage = 'sidecar_start'
                 self._request('POST', f'/containers/{sidecar_id}/start', ok=(204, 304))
+            stage = 'post_start_isolation'
             latest_gateway = self._find(instance_id)
             latest_sidecar = self._find_proxy_sidecar(instance_id)
             if (latest_gateway is None or latest_gateway.get('Id') != gateway_id
@@ -3904,6 +3926,7 @@ class DockerEngine:
                     or (latest_sidecar.get('State') or {}).get('Status') != 'running'
                     or not self._proxy_firewall_ready(instance_id, spec)):
                 raise DockerEngineError('Post-start proxy isolation verification failed')
+            stage = 'post_start_inspect'
             result = self.inspect(instance_id)
             if result.get('container_id') != gateway_id or result.get('state') != 'running':
                 raise DockerEngineError('Post-start Gateway verification failed')
@@ -3920,8 +3943,18 @@ class DockerEngine:
                         and sidecar_health.get('Status') == 'healthy'):
                     raise DockerEngineError('Control UI target failed after healthy startup')
             return result
-        except Exception:
+        except Exception as error:
+            error_type = type(error).__name__
+            if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', error_type) is None:
+                error_type = 'Error'
+            log_line = ('Managed proxy start failed: stage=' + stage
+                        + ' exception=' + error_type)
+            if type(error) is _HTTPError and type(error.status) is int:
+                log_line += ' http_status=' + str(error.status)
+            print(log_line, file=sys.stderr, flush=True)
             if not self._stop_proxy_containers(instance_id):
+                print('Managed proxy start rollback failed: stage=' + stage,
+                      file=sys.stderr, flush=True)
                 raise DockerEngineError(
                     'Proxy start failed and container stop could not be verified') from None
             raise

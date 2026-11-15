@@ -38,7 +38,7 @@ from .ollama_config import (
     replace_ollama_policy_in_config, validate_ollama_config,
 )
 from .ollama_firewall import validate_ollama_route_inputs
-from .model_readiness import CachedModelStatus, model_status
+from .model_readiness import CachedModelStatus, model_status, warm_ollama_model
 from .policy import evaluate_admission
 from .runtime_store import RuntimeStore, StoreError, canonical
 from .workspace_files import RetainedWorkspace, WorkspaceFileError
@@ -307,7 +307,8 @@ class RuntimeService:
                  disk_floor_bytes, clock=time.monotonic, initialize=initialize_files,
                  network_profile_default=RuntimeStore.NETWORK_PROFILE_LEGACY,
                  control_ui_domain=None, agent_network_pool=None,
-                 frontend_network_pool=None, ollama_config=None):
+                 frontend_network_pool=None, ollama_config=None,
+                 model_warmer=None):
         fingerprint = hashlib.sha256(canonical(asdict(profile)).encode('ascii')).hexdigest()
         if (store.profile_version, store.profile_hash) != (profile.profile_version, fingerprint):
             raise StoreError('profile_drift')
@@ -340,6 +341,7 @@ class RuntimeService:
         self.frontend_network_pool = frontend_network_pool
         self.ollama_config = (None if ollama_config is None else
                               asdict(validate_ollama_config(ollama_config)))
+        self.model_warmer = model_warmer
         if self.ollama_config is not None:
             selected_model = self.store.ollama_model_id()
             if selected_model is None:
@@ -540,6 +542,16 @@ class RuntimeService:
                 raise ServiceError('runtime_unavailable', 503) from None
         raise ServiceError('model_policy_unverified', 503)
 
+    def _warm_ollama_runner(self):
+        """Best-effort preload using the exact local-chat runner settings."""
+        if self.ollama_config is None or not callable(getattr(self, 'model_warmer', None)):
+            return 'unavailable'
+        try:
+            result = self.model_warmer(self.ollama_config)
+        except Exception:
+            result = 'unavailable'
+        return result if result in {'ready', 'unavailable'} else 'unavailable'
+
     def _view(self, instance=None, operation=None, info=None):
         state = instance['state'] if instance else 'not_created'
         runtime = dict(state=state,
@@ -715,7 +727,9 @@ class RuntimeService:
 
     def action(self, payload):
         payload = validate_action(payload)
+        action = payload['action']
         operation = None
+        stage = 'request_intent'
         migration = getattr(self, 'sidecar_migration', None)
         with self.lock:
             if migration is not None:
@@ -763,7 +777,9 @@ class RuntimeService:
                 evidence = None
                 prepared_instance = instance
                 if action in {'create', 'start', 'restart', 'restore'}:
+                    stage = 'storage_verification'
                     evidence = self._storage(instance, prepare=action == 'create')
+                    stage = 'control_ui_preparation'
                     prepared_instance = self._prepare_control_ui_instance(
                         instance, action=action,
                         host_path=evidence.get('host_path') if evidence else None)
@@ -771,9 +787,11 @@ class RuntimeService:
                         self.initialize(prepared_instance, evidence, self.ollama_config)
                         self.store.initialized(instance_id)
                     # Re-observe AFTER real quota verification. Intent is not a permit.
+                    stage = 'resource_admission'
                     self._admit(quota=evidence['disk_quota_verified'],
                                 requested_disk_bytes=0 if action == 'restore' else None,
                                 network_profile=instance['network_profile'])
+                stage = 'runtime_inspection'
                 info = self._inspect(instance_id)
                 if action in {'create', 'restore'}:
                     assert evidence is not None
@@ -791,16 +809,25 @@ class RuntimeService:
                     self._admit(quota=evidence['disk_quota_verified'],
                                 requested_disk_bytes=0 if action == 'restore' else None,
                                 network_profile=instance['network_profile'])
+                    stage = 'model_policy_verification'
                     self._require_ollama_policy(instance, evidence, info)
+                    stage = 'model_warmup'
+                    self._warm_ollama_runner()
+                    stage = 'docker_start'
                     if info['state'] != 'running':
                         self.engine.start(instance_id)
                 elif action == 'start':
                     assert evidence is not None
                     if self._absent(info):
                         raise ServiceError('runtime_unavailable', 503)
+                    stage = 'resource_admission'
                     self._admit(quota=evidence['disk_quota_verified'],
                                 network_profile=instance['network_profile'])
+                    stage = 'model_policy_verification'
                     self._require_ollama_policy(instance, evidence, info)
+                    stage = 'model_warmup'
+                    self._warm_ollama_runner()
+                    stage = 'docker_start'
                     if info['state'] != 'running':
                         self.engine.start(instance_id)
                 elif action == 'restart':
@@ -809,15 +836,22 @@ class RuntimeService:
                         raise ServiceError('runtime_unavailable', 503)
                     self._admit(quota=evidence['disk_quota_verified'],
                                 network_profile=instance['network_profile'])
+                    stage = 'model_policy_verification'
                     self._require_ollama_policy(instance, evidence, info)
+                    stage = 'model_warmup'
+                    self._warm_ollama_runner()
+                    stage = 'docker_restart'
                     self.engine.restart(instance_id)
                 elif action == 'stop':
+                    stage = 'docker_stop'
                     if not self._absent(info) and info['state'] not in {'stopped', 'exited', 'created'}:
                         self.engine.stop(instance_id)
                 elif action == 'remove':
+                    stage = 'docker_remove'
                     if not self._absent(info):
                         self._remove_engine_instance(instance, action=action)
                 elif action == 'purge':
+                    stage = 'docker_purge'
                     if not self._absent(info):
                         self._remove_engine_instance(instance, action=action)
                     info = self._inspect(instance_id)
@@ -833,6 +867,7 @@ class RuntimeService:
                     if current is not None:
                         return self._view(current, operation, self._inspect(current['id']))
                     return self._view(self.store.instance(instance_id), operation, info)
+                stage = 'post_action_verification'
                 info = self._inspect(instance_id)
                 if action in {'create', 'start', 'restart', 'restore'} and info['state'] != 'running':
                     raise ServiceError('runtime_unavailable', 503)
@@ -849,6 +884,16 @@ class RuntimeService:
                 raise ServiceError(error.code if error.code in MESSAGES else 'internal_error', status) from None
             except Exception as error:
                 safe = error if isinstance(error, ServiceError) else ServiceError('runtime_unavailable', 503)
+                error_type = type(error).__name__
+                if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', error_type) is None:
+                    error_type = 'Error'
+                error_code = safe.code
+                if type(error_code) is not str or re.fullmatch(r'[a-z][a-z0-9_]{0,63}', error_code) is None:
+                    error_code = 'runtime_unavailable'
+                print('Lifecycle action failed: action=' + action
+                      + ' stage=' + stage + ' exception=' + error_type
+                      + ' code=' + error_code,
+                      file=sys.stderr, flush=True)
                 if operation:
                     if payload['action'] in {'create', 'restore'}:
                         try:
@@ -1032,7 +1077,8 @@ class RuntimeService:
                         raise ServiceError('model_policy_unverified', 503)
                 return {'status': 'unchanged', 'model_id': current_id,
                         'context_tokens': current_context,
-                        'updated_instances': 0, 'restart_pending': 0}
+                        'updated_instances': 0, 'restart_pending': 0,
+                        'runner_status': self._warm_ollama_runner()}
             if (payload['expected_model_id'] != current_id
                     or expected_context != current_context):
                 raise ServiceError('admin_config_conflict', 409)
@@ -1165,6 +1211,7 @@ class RuntimeService:
                 raise ServiceError('runtime_unavailable', 503) from None
 
             self.ollama_config = new_policy
+            runner_status = self._warm_ollama_runner()
             try:
                 self.reconcile(recover_ids={plan['instance']['id'] for plan in plans
                                             if plan['was_live']})
@@ -1185,7 +1232,8 @@ class RuntimeService:
                     'model_id': new_id,
                     'context_tokens': new_context,
                     'updated_instances': sum(1 for item in plans if item['needs_update']),
-                    'restart_pending': restart_pending}
+                    'restart_pending': restart_pending,
+                    'runner_status': runner_status}
 
     def control_ui_target(self, payload):
         """Return an owner-bound sidecar target only after live Docker verification."""
@@ -1616,7 +1664,8 @@ class RuntimeApplication(RuntimeService):
                          control_ui_domain=config.get('control_ui_domain'),
                          agent_network_pool=config.get('agent_network_pool'),
                          frontend_network_pool=config.get('frontend_network_pool'),
-                         ollama_config=config.get('ollama'))
+                         ollama_config=config.get('ollama'),
+                         model_warmer=warm_ollama_model)
 
     def close(self):
         self.model_status_cache.close()
@@ -2057,7 +2106,8 @@ def serve(config):
                                     control_ui_domain=config['control_ui_domain'],
                                     agent_network_pool=config['agent_network_pool'],
                                     frontend_network_pool=config['frontend_network_pool'],
-                                    ollama_config=config.get('ollama'))
+                                    ollama_config=config.get('ollama'),
+                                    model_warmer=warm_ollama_model)
         if type(config.get('control_ui_domain')) is str:
             from .control_ui_migration import ControlUiSidecarMigration
             controller.sidecar_migration = ControlUiSidecarMigration(

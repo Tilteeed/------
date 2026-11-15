@@ -317,9 +317,24 @@ Drop-in уже установлен на GPU-сервере, служба пер
 в `/agent/` под администратором, в панели «Модель Ollama» выберите модель и
 64K, затем подтвердите перезапуск. Supervisor атомарно обновит настройки всех
 существующих агентов, сохранит выбранные модель/контекст в SQLite и данные.
-Эта операция не меняет systemd
-параметры Ollama. На GPU-сервере Qwen3.5 9B проверен с короткими запросами;
-другую модель и длительную генерацию следует отдельно измерить.
+После выбора Supervisor заранее загружает модель пустым запросом `/api/chat` с
+теми же `num_ctx`, `think` и `shift=false`, что использует OpenClaw. При создании,
+запуске или восстановлении агента выполняется та же проверка загрузки до старта
+контейнера. Это прогревает общий Ollama runner: у отдельных агентов нет своих
+процессов Ollama. Несколько агентов используют один выбранный runner и
+настроенные слоты параллельности; разные модели не фиксируются за отдельными
+PID. При смене модели прежний runner заменяется один раз, а новая модель
+загружается до возобновления агентов.
+
+Удержание runner на 24 часа не предотвращает его замену, если новый запрос
+запрашивает несовместимые параметры. BEZR проверяет ответ загрузки и в панели
+администратора показывает, подтвердил ли Ollama готовность runner. Если проверка
+загрузки недоступна, настройка модели сохраняется, но первый запрос может
+выполнять холодную загрузку.
+
+Эта операция не меняет systemd параметры Ollama. На GPU-сервере Qwen3.5 9B
+проверен с короткими запросами; другую модель и длительную генерацию следует
+отдельно измерить.
 
 Создание и перенос receipts, state и runtime — не миграция существующих
 пользователей. Не удаляйте SQLite, данные, токены, существующие контейнеры и
@@ -404,13 +419,26 @@ journalctl -u bezr-supervisor.service -n 100 --no-pager
 Для подключения действующего WebUI потребуется аккуратное обновление его
 контейнера с сохранением существующих данных и секретов.
 
+**При каждом создании или пересоздании WebUI обязательно передавайте оба
+Compose-файла.** Запуск только с `compose.yaml` удаляет из контейнера mount
+Supervisor socket и credential; сам WebUI остаётся healthy, но управление
+агентами и моделью перестаёт работать.
+
 ```bash
 cd /opt/bezr
 export SUPERVISOR_SOCKET_DIR=/run/personal-agent-supervisor
 export SUPERVISOR_TOKEN_FILE=/var/lib/personal-agent-supervisor/service.token
 docker compose -f compose.yaml -f compose.supervisor.yaml config --quiet
 # Только после проверки образа, volume, .env и наличия резервной копии:
-# docker compose -f compose.yaml -f compose.supervisor.yaml up -d
+sudo env SUPERVISOR_SOCKET_DIR=/run/personal-agent-supervisor \
+  SUPERVISOR_TOKEN_FILE=/var/lib/personal-agent-supervisor/service.token \
+  docker compose --project-directory /opt/bezr --env-file /opt/bezr/.env \
+  -f /opt/bezr/compose.yaml -f /opt/bezr/compose.supervisor.yaml \
+  up -d --no-build --force-recreate --no-deps web
+
+# Прочитать ограниченный статус модели через реальное соединение с Supervisor:
+sudo docker exec --user 1000:0 personal-agent-platform-web-1 python -c \
+  'from control_plane.runtime import configured_client; print(configured_client().ollama_model_status())'
 ```
 
 ## 8. Приёмка первого агента и восстановление

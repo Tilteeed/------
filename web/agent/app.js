@@ -845,7 +845,9 @@ async function applyAdminModel() {
     if (!authenticated || epoch !== identityEpoch) return;
     $('ollama-admin-status').textContent = result.restart_pending > 0
       ? `Выбор сохранён; ${result.restart_pending} агент(а) ожидают восстановления.`
-      : 'Модель применена; при первом запросе она может загрузиться в память.';
+      : result.runner_status === 'ready'
+        ? 'Модель применена и загружена в память GPU; агенты используют общий Ollama runner.'
+        : 'Модель применена, но загрузку runner подтвердить не удалось. Первый запрос может ждать загрузку модели.';
     adminCurrentModel = result.model_id;
     adminCurrentContext = result.context_tokens;
     $('ollama-admin-model').value = result.model_id;

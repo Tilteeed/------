@@ -75,7 +75,8 @@ class ControlUiMaintenanceHandlerTests(unittest.TestCase):
                         'previous_context_tokens': 16384,
                         'model_id': payload['new_model_id'],
                         'context_tokens': payload.get('new_context_tokens', 16384),
-                        'updated_instances': 0, 'restart_pending': 0}
+                        'updated_instances': 0, 'restart_pending': 0,
+                        'runner_status': 'ready'}
             def ollama_model_status(self):
                 return {'model_id': 'qwen3.5:9b', 'context_tokens': 16384}
 

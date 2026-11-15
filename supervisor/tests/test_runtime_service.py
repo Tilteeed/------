@@ -159,6 +159,8 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             service = RuntimeService(profile, store, volumes, engine, Metrics(),
                                      capacities=(10**14, 1000000, 10**14), disk_floor_bytes=0,
                                      clock=lambda: 100, initialize=lambda *args: initialized.append(args))
+            warmed_states = []
+            service._warm_ollama_runner = lambda: warmed_states.append(engine.state) or 'ready'
             payload = dict(actor_id='alice', action='create', idempotency_key='key',
                            settings_revision=0, settings=dict(name='Agent', instructions='Hello'))
             with self.assertRaises(ServiceError):
@@ -171,6 +173,7 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             self.assertEqual(result['runtime']['instance_id'], instance_id)
             self.assertEqual(result['runtime']['network_profile'], 'legacy_none')
             self.assertEqual(engine.network_profiles[-1], 'legacy_none')
+            self.assertEqual(warmed_states, ['stopped'])
             self.assertIsNone(initialized[0][2])
             engine.network_profiles[-1] = 'agent_internal_v1'
             with self.assertRaises(ServiceError):
@@ -189,6 +192,7 @@ class ServiceWorkflowSmoke(unittest.TestCase):
                                settings={'name': 'Agent', 'instructions': instructions})
                 service.action(request)
                 action_payloads.append(request)
+            self.assertEqual(warmed_states, ['stopped', 'running'])
             remove_request = dict(payload, action='remove', idempotency_key='remove',
                                   settings={'name': 'Agent', 'instructions': 'REMOVE_PRIVATE_INSTRUCTIONS'})
             service.action(remove_request)
@@ -221,6 +225,7 @@ class ServiceWorkflowSmoke(unittest.TestCase):
             restored = service.replay({key: value for key, value in restore_request.items() if key != 'settings'})
             self.assertEqual(restored['runtime']['state'], 'running')
             self.assertEqual(restored['runtime']['instance_id'], instance_id)
+            self.assertEqual(warmed_states, ['stopped', 'running', 'stopped'])
             self.assertEqual(engine.network_profiles[-1], 'legacy_none')
             restore_operation = store.operation('alice', 'restore-1')
             assert restore_operation is not None
@@ -930,9 +935,11 @@ class OllamaModelChangeTests(unittest.TestCase):
                 state = {'config': persisted_config,
                          'blob': (canonical(persisted_config) + '\n').encode('utf-8')}
                 engine = Engine()
+                warmed = []
                 service = RuntimeService(profile, store, Volumes(str(host_path)), engine, Metrics(),
                     capacities=(10**14, 1000000, 10**14), disk_floor_bytes=0, clock=lambda: 100,
-                    ollama_config=old_policy)
+                    ollama_config=old_policy,
+                    model_warmer=lambda config: warmed.append(dict(config)) or 'ready')
                 self.assertEqual(store.ollama_model_id(), old_policy['default_model_id'])
                 self.assertEqual(service.ollama_config['default_model_id'], old_policy['default_model_id'])
 
@@ -961,6 +968,10 @@ class OllamaModelChangeTests(unittest.TestCase):
                 self.assertTrue(ollama_policy_matches_config(state['config'], service.ollama_config))
                 self.assertEqual(result['model_id'], new_model)
                 self.assertEqual(result['context_tokens'], 65536)
+                self.assertEqual(result['runner_status'], 'ready')
+                self.assertEqual(len(warmed), 1)
+                self.assertEqual(warmed[0]['default_model_id'], new_model)
+                self.assertEqual(warmed[0]['context_tokens'], 65536)
                 self.assertEqual(store.ollama_model_id(), new_model)
                 self.assertEqual(store.ollama_context_tokens(), 65536)
                 current = store.current('alice')

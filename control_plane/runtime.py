@@ -346,10 +346,12 @@ class SupervisorClient:
         expected_fields |= {'context_tokens'}
         if status == 'updated':
             expected_fields.add('previous_context_tokens')
+        expected_fields.add('runner_status')
         if (set(data) != expected_fields or status not in {'updated', 'unchanged'}
                 or data.get('model_id') != new_model_id
                 or type(data.get('context_tokens')) is not int
                 or data['context_tokens'] not in SUPPORTED_CONTEXT_TOKENS
+                or data.get('runner_status') not in {'ready', 'unavailable'}
                 or (new_context_tokens is not None
                     and data.get('context_tokens') != new_context_tokens)
                 or type(data.get('updated_instances')) is not int

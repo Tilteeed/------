@@ -8,6 +8,80 @@ from urllib.parse import urlsplit
 
 MAX_BYTES = 1024 * 1024
 TIMEOUT_SECONDS = 5
+WARMUP_TIMEOUT_SECONDS = 90
+WARMUP_MAX_BYTES = 64 * 1024
+
+
+def warm_ollama_model(value):
+    """Load the selected model using the same runner policy as OpenClaw.
+
+    An empty Ollama chat request schedules/loads the runner without generating
+    tokens. Explicit shift=False matters: Ollama treats a runner started with
+    context shifting enabled as incompatible and replaces it on the first
+    OpenClaw request, even when the model and context size are unchanged.
+    """
+    from .ollama_config import validate_ollama_config
+
+    connection = None
+    timer = None
+    try:
+        config = validate_ollama_config(value)
+        address = urlsplit(config.base_url)
+        deadline = time.monotonic() + WARMUP_TIMEOUT_SECONDS
+        connection = http.client.HTTPConnection(
+            address.hostname, address.port, timeout=WARMUP_TIMEOUT_SECONDS)
+        connection.connect()
+        sock = connection.sock
+
+        def abort():
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        timer = threading.Timer(WARMUP_TIMEOUT_SECONDS, abort)
+        timer.daemon = True
+        timer.start()
+        request = json.dumps({
+            'model': config.default_model_id,
+            'messages': [],
+            'stream': False,
+            'keep_alive': '24h',
+            'options': {'num_ctx': config.context_tokens},
+            'think': config.think,
+            'shift': False,
+            'truncate': False,
+        }, separators=(',', ':')).encode('utf-8')
+        connection.request('POST', '/api/chat', body=request, headers={
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Connection': 'close',
+        })
+        response = connection.getresponse()
+        if response.status != 200:
+            return 'unavailable'
+        body = bytearray()
+        while True:
+            chunk = response.read1(min(4096, WARMUP_MAX_BYTES + 1 - len(body)))
+            if time.monotonic() >= deadline or not chunk:
+                break
+            body.extend(chunk)
+            if len(body) > WARMUP_MAX_BYTES:
+                return 'unavailable'
+        if time.monotonic() >= deadline:
+            return 'unavailable'
+        result = json.loads(body)
+        if (type(result) is dict and result.get('model') == config.default_model_id
+                and result.get('done') is True and result.get('done_reason') == 'load'):
+            return 'ready'
+        return 'unavailable'
+    except (OSError, ValueError, TypeError, http.client.HTTPException, RecursionError):
+        return 'unavailable'
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if connection is not None:
+            connection.close()
 
 
 def model_status(base_url, model_id):

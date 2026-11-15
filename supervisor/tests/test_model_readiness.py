@@ -1,10 +1,83 @@
 import unittest
 from unittest.mock import patch
 
-from supervisor.model_readiness import model_status
+from supervisor.model_readiness import model_status, warm_ollama_model
 
 
 class ModelReadinessTests(unittest.TestCase):
+    def test_warmup_uses_empty_chat_and_matches_openclaw_runner_policy(self):
+        import json
+
+        config = {
+            'base_url': 'http://10.0.0.1:11434',
+            'default_model_id': 'qwen3.5:9b',
+            'context_tokens': 65536,
+            'max_tokens': 4096,
+            'think': True,
+        }
+        seen = {}
+
+        class Response:
+            status = 200
+            def __init__(self):
+                self.body = json.dumps({
+                    'model': 'qwen3.5:9b', 'done': True, 'done_reason': 'load',
+                }).encode()
+            def read1(self, size):
+                chunk, self.body = self.body[:size], self.body[size:]
+                return chunk
+
+        class Connection:
+            sock = object()
+            def __init__(self, host, port, timeout):
+                seen['endpoint'] = (host, port, timeout)
+            def connect(self): pass
+            def request(self, method, path, body, headers):
+                seen['method_path'] = (method, path)
+                seen['body'] = json.loads(body)
+                seen['headers'] = headers
+            def getresponse(self): return Response()
+            def close(self): pass
+
+        with (patch('supervisor.model_readiness.http.client.HTTPConnection', Connection),
+              patch('supervisor.model_readiness.threading.Timer') as timer):
+            self.assertEqual(warm_ollama_model(config), 'ready')
+        self.assertEqual(seen['method_path'], ('POST', '/api/chat'))
+        self.assertEqual(seen['body'], {
+            'model': 'qwen3.5:9b', 'messages': [], 'stream': False,
+            'keep_alive': '24h', 'options': {'num_ctx': 65536},
+            'think': True, 'shift': False, 'truncate': False,
+        })
+        self.assertTrue(timer.return_value.start.called)
+        self.assertTrue(timer.return_value.cancel.called)
+
+    def test_warmup_sanitizes_upstream_errors_and_invalid_config(self):
+        config = {
+            'base_url': 'http://10.0.0.1:11434',
+            'default_model_id': 'qwen3.5:9b',
+            'context_tokens': 65536,
+            'max_tokens': 4096,
+            'think': False,
+        }
+
+        class Response:
+            status = 503
+            def read1(self, _size): return b'secret upstream message'
+
+        class Connection:
+            sock = object()
+            def __init__(self, *args, **kwargs): pass
+            def connect(self): pass
+            def request(self, *args, **kwargs): pass
+            def getresponse(self): return Response()
+            def close(self): pass
+
+        with (patch('supervisor.model_readiness.http.client.HTTPConnection', Connection),
+              patch('supervisor.model_readiness.threading.Timer')):
+            self.assertEqual(warm_ollama_model(config), 'unavailable')
+            self.assertEqual(warm_ollama_model({**config, 'default_model_id': 'untrusted'}),
+                             'unavailable')
+
     def test_truncated_content_length_rejects_valid_json(self):
         from http.client import HTTPResponse
         from io import BytesIO
