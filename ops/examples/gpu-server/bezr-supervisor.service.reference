@@ -1,0 +1,23 @@
+# Template only: render and review all @...@ values before installation.
+# Do not enable this unit until the trusted runtime config and mount paths are verified.
+[Unit]
+Description=BEZR privileged Supervisor (firewall-first instance recovery)
+Requires=docker.service
+After=local-fs.target docker.service nftables.service
+RequiresMountsFor=/mnt/xfs_data
+ConditionPathExists=/var/lib/personal-agent-supervisor/runtime.json
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/bezr
+UMask=0077
+ExecStart=/opt/bezr-python/cpython-3.12.16-linux-x86_64-gnu/bin/python3.12 -m supervisor.service --config /var/lib/personal-agent-supervisor/runtime.json --enable-host-runtime
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

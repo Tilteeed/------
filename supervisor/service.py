@@ -779,7 +779,6 @@ class RuntimeService:
                 if action in {'create', 'start', 'restart', 'restore'}:
                     stage = 'storage_verification'
                     evidence = self._storage(instance, prepare=action == 'create')
-                    stage = 'control_ui_preparation'
                     prepared_instance = self._prepare_control_ui_instance(
                         instance, action=action,
                         host_path=evidence.get('host_path') if evidence else None)
@@ -787,7 +786,6 @@ class RuntimeService:
                         self.initialize(prepared_instance, evidence, self.ollama_config)
                         self.store.initialized(instance_id)
                     # Re-observe AFTER real quota verification. Intent is not a permit.
-                    stage = 'resource_admission'
                     self._admit(quota=evidence['disk_quota_verified'],
                                 requested_disk_bytes=0 if action == 'restore' else None,
                                 network_profile=instance['network_profile'])
@@ -820,7 +818,6 @@ class RuntimeService:
                     assert evidence is not None
                     if self._absent(info):
                         raise ServiceError('runtime_unavailable', 503)
-                    stage = 'resource_admission'
                     self._admit(quota=evidence['disk_quota_verified'],
                                 network_profile=instance['network_profile'])
                     stage = 'model_policy_verification'
@@ -851,7 +848,6 @@ class RuntimeService:
                     if not self._absent(info):
                         self._remove_engine_instance(instance, action=action)
                 elif action == 'purge':
-                    stage = 'docker_purge'
                     if not self._absent(info):
                         self._remove_engine_instance(instance, action=action)
                     info = self._inspect(instance_id)
@@ -892,8 +888,7 @@ class RuntimeService:
                     error_code = 'runtime_unavailable'
                 print('Lifecycle action failed: action=' + action
                       + ' stage=' + stage + ' exception=' + error_type
-                      + ' code=' + error_code,
-                      file=sys.stderr, flush=True)
+                      + ' code=' + error_code, file=sys.stderr, flush=True)
                 if operation:
                     if payload['action'] in {'create', 'restore'}:
                         try:

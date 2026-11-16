@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "profile_version": "bezr-gpu-v1",
+  "mode": "final",
+  "storage": {
+    "backend": "xfs_project_quota",
+    "mountpoint": "/mnt/xfs_data",
+    "expected_uuid": "334df01f-93c4-4ab4-b24f-543ba05cf3df"
+  },
+  "agent_limits": {
+    "ram_bytes": 4294967296,
+    "cpu_millicores": 2000,
+    "pids_limit": 512,
+    "disk_bytes": 10737418240
+  }
+}

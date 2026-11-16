@@ -1,0 +1,3 @@
+# Snapshot from sbergigachat. Verify each UUID and filesystem before using.
+UUID=413bc50f-23d1-43de-a6a3-9a0c67d25cf6 /mnt/sdd ext4 defaults 0 2
+UUID=334df01f-93c4-4ab4-b24f-543ba05cf3df /mnt/xfs_data xfs defaults,prjquota 0 0
